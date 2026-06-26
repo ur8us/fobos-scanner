@@ -68,20 +68,20 @@
             #waterfall {
                 display: block;
                 width: 100%;
-                height: 400px;
+                height: 600px;
                 cursor: crosshair;
             }
-            .wf-overlay {
-                position: absolute;
-                bottom: 0;
-                left: 0;
-                right: 0;
+            .freq-scale {
+                position: relative;
                 height: 34px;
+                margin: -4px 0 8px 0;
+                border: 1px solid #1a2030;
+                border-radius: 6px;
+                background: #07090d;
                 font-size: 10px;
                 color: #8090a0;
-                background: rgba(0, 0, 0, 0.6);
                 font-family: monospace;
-                pointer-events: none;
+                overflow: hidden;
             }
             .wf-tick {
                 position: absolute;
@@ -227,12 +227,12 @@
                 border: 1px solid #1a2030;
                 border-radius: 6px;
                 overflow: hidden;
-                margin-bottom: 12px;
+                margin-bottom: 8px;
             }
             #scope {
                 display: block;
                 width: 100%;
-                height: 90px;
+                height: 135px;
                 cursor: crosshair;
             }
 
@@ -288,22 +288,22 @@
                     />
                 </div>
                 <div class="ctrl-group">
-                    <label>Converter (MHz)</label>
+                    <label>End (MHz)</label>
                     <input
                         type="number"
-                        id="converterFreq"
-                        value="0"
+                        id="freqEnd"
+                        value="2000"
                         min="0"
                         max="6000"
                         step="0.1"
                     />
                 </div>
                 <div class="ctrl-group">
-                    <label>End (MHz)</label>
+                    <label>Converter (MHz)</label>
                     <input
                         type="number"
-                        id="freqEnd"
-                        value="2000"
+                        id="converterFreq"
+                        value="0"
                         min="0"
                         max="6000"
                         step="0.1"
@@ -322,8 +322,8 @@
                     <select id="bwRatio">
                         <option value="0.5">0.5</option>
                         <option value="0.7">0.7</option>
-                        <option value="0.8">0.8</option>
-                        <option value="0.9" selected>0.9</option>
+                        <option value="0.8" selected>0.8</option>
+                        <option value="0.9">0.9</option>
                         <option value="1.0">1.0</option>
                     </select>
                 </div>
@@ -338,28 +338,28 @@
             <div class="controls">
                 <div class="ctrl-group">
                     <label
-                        >LNA Gain
+                        >LNA (dB)
                         <span class="range-val" id="lnaVal">0</span></label
                     >
                     <input
                         type="range"
                         id="lnaGain"
-                        min="0"
-                        max="2"
+                        min="-2"
+                        max="0"
                         value="0"
                         step="1"
                     />
                 </div>
                 <div class="ctrl-group">
                     <label
-                        >VGA Gain
+                        >VGA (dB)
                         <span class="range-val" id="vgaVal">0</span></label
                     >
                     <input
                         type="range"
                         id="vgaGain"
-                        min="0"
-                        max="15"
+                        min="-15"
+                        max="0"
                         value="0"
                         step="1"
                     />
@@ -405,9 +405,10 @@
                 <canvas id="scope"></canvas>
             </div>
 
+            <div class="freq-scale" id="freqScale"></div>
+
             <div class="waterfall-wrap">
                 <canvas id="waterfall"></canvas>
-                <div class="wf-overlay" id="wfLabels"></div>
             </div>
             <div class="hover-readout" id="hoverReadout"></div>
         </div>
@@ -434,10 +435,10 @@
                 const w = Math.floor(rect.width);
 
                 wfCanvas.width = w;
-                wfCanvas.height = 400;
+                wfCanvas.height = 600;
 
                 if (!wfImageData || wfImageData.width !== w) {
-                    wfImageData = wfCtx.createImageData(w, 400);
+                    wfImageData = wfCtx.createImageData(w, 600);
                     for (let i = 0; i < wfImageData.data.length; i += 4) {
                         wfImageData.data[i] = 0;
                         wfImageData.data[i + 1] = 0;
@@ -449,7 +450,7 @@
                 }
 
                 scCanvas.width = w;
-                scCanvas.height = 90;
+                scCanvas.height = 135;
             }
 
             window.addEventListener("resize", resizeCanvases);
@@ -514,20 +515,14 @@
             //  Draw one complete waterfall line from uint8 array
             // ===================================================================
             function getFrequencyAxis(freqStart, freqEnd, steps) {
-                if (steps > 1 && freqEnd > freqStart) {
-                    const step = (freqEnd - freqStart) / (steps - 1);
-                    return {
-                        left: freqStart - step / 2,
-                        right: freqEnd + step / 2,
-                        center: (freqStart + freqEnd) / 2,
-                        step,
-                    };
-                }
                 return {
                     left: freqStart,
                     right: freqEnd,
                     center: (freqStart + freqEnd) / 2,
-                    step: 0,
+                    step:
+                        steps > 0 && freqEnd > freqStart
+                            ? (freqEnd - freqStart) / steps
+                            : 0,
                 };
             }
 
@@ -537,7 +532,7 @@
 
             function updateFrequencyLabels(freqStart, freqEnd, steps) {
                 const axis = getFrequencyAxis(freqStart, freqEnd, steps);
-                const overlay = document.getElementById("wfLabels");
+                const overlay = document.getElementById("freqScale");
                 const span = axis.right - axis.left;
                 const ticks = [
                     { pos: 0, freq: axis.left },
@@ -563,7 +558,10 @@
 
             function frequencyAt(canvas, clientX) {
                 const rect = canvas.getBoundingClientRect();
-                const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+                const x = Math.max(
+                    0,
+                    Math.min(rect.width, clientX - rect.left),
+                );
                 const axis = getFrequencyAxis(
                     currentFreq0,
                     currentFreq1,
@@ -701,19 +699,6 @@
                 scCtx.beginPath();
                 scCtx.arc(px, py, 3, 0, 2 * Math.PI);
                 scCtx.fill();
-
-                // Frequency labels
-                scCtx.fillStyle = "#506070";
-                scCtx.font = "10px monospace";
-                scCtx.textAlign = "center";
-                const axis = getFrequencyAxis(freqStart, freqEnd, steps);
-                scCtx.fillText((axis.left / 1e6).toFixed(1) + "M", 40, h - 2);
-                scCtx.fillText(
-                    (axis.center / 1e6).toFixed(1) + "M",
-                    w / 2,
-                    h - 2,
-                );
-                scCtx.fillText((axis.right / 1e6).toFixed(1) + "M", w - 40, h - 2);
             }
 
             // ===================================================================
@@ -858,6 +843,47 @@
                 }
             }
 
+            function sampleRateLabel(rate) {
+                const mhz = rate / 1e6;
+                const text = Number.isInteger(mhz)
+                    ? mhz.toFixed(0)
+                    : mhz.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+                return text + " MHz";
+            }
+
+            function syncSampleRateOptions(rates, selected) {
+                const sel = document.getElementById("samplerate");
+                const values = Array.isArray(rates)
+                    ? [...new Set(rates.map(Number).filter((rate) => rate > 0))]
+                    : [];
+
+                if (values.length) {
+                    sel.replaceChildren(
+                        ...values.map((rate) => {
+                            const opt = document.createElement("option");
+                            opt.value = String(rate);
+                            opt.textContent = sampleRateLabel(rate);
+                            return opt;
+                        }),
+                    );
+                }
+
+                if (selected) {
+                    const selectedText = String(selected);
+                    if (
+                        ![...sel.options].some(
+                            (opt) => opt.value === selectedText,
+                        )
+                    ) {
+                        const opt = document.createElement("option");
+                        opt.value = selectedText;
+                        opt.textContent = sampleRateLabel(selected);
+                        sel.appendChild(opt);
+                    }
+                    sel.value = selectedText;
+                }
+            }
+
             // ===================================================================
             //  UI
             // ===================================================================
@@ -877,22 +903,22 @@
                 gainUpdateTimer = setTimeout(async function () {
                     gainUpdateTimer = null;
                     const result = await apiPost("/api/gain", {
-                        lna_gain: parseInt(
+                        lna_gain: -parseInt(
                             document.getElementById("lnaGain").value,
                         ),
-                        vga_gain: parseInt(
+                        vga_gain: -parseInt(
                             document.getElementById("vgaGain").value,
                         ),
                     });
                     if (result && result.status === "ok") {
                         document.getElementById("lnaGain").value =
-                            result.lna_gain;
+                            -result.lna_gain;
                         document.getElementById("lnaVal").textContent =
-                            result.lna_gain;
+                            -result.lna_gain;
                         document.getElementById("vgaGain").value =
-                            result.vga_gain;
+                            -result.vga_gain;
                         document.getElementById("vgaVal").textContent =
-                            result.vga_gain;
+                            -result.vga_gain;
                     }
                 }, 80);
             }
@@ -916,10 +942,10 @@
                         bw_ratio: parseFloat(
                             document.getElementById("bwRatio").value,
                         ),
-                        lna_gain: parseInt(
+                        lna_gain: -parseInt(
                             document.getElementById("lnaGain").value,
                         ),
-                        vga_gain: parseInt(
+                        vga_gain: -parseInt(
                             document.getElementById("vgaGain").value,
                         ),
                         direct_sampling: parseInt(
@@ -981,10 +1007,14 @@
 
             document
                 .getElementById("wfMin")
-                .addEventListener("input", () => syncWaterfallBrightness("min"));
+                .addEventListener("input", () =>
+                    syncWaterfallBrightness("min"),
+                );
             document
                 .getElementById("wfMax")
-                .addEventListener("input", () => syncWaterfallBrightness("max"));
+                .addEventListener("input", () =>
+                    syncWaterfallBrightness("max"),
+                );
 
             // ===================================================================
             //  Init
@@ -1023,14 +1053,10 @@
                     if (status.converter_freq !== undefined)
                         document.getElementById("converterFreq").value =
                             status.converter_freq / 1e6;
-                    if (status.samplerate) {
-                        const sel = document.getElementById("samplerate");
-                        for (let opt of sel.options)
-                            if (parseFloat(opt.value) === status.samplerate) {
-                                sel.value = opt.value;
-                                break;
-                            }
-                    }
+                    syncSampleRateOptions(
+                        status.sample_rates,
+                        status.samplerate,
+                    );
                     if (status.bw_ratio) {
                         const sel = document.getElementById("bwRatio");
                         for (let opt of sel.options)
@@ -1041,15 +1067,15 @@
                     }
                     if (status.lna_gain !== undefined) {
                         document.getElementById("lnaGain").value =
-                            status.lna_gain;
+                            -status.lna_gain;
                         document.getElementById("lnaVal").textContent =
-                            status.lna_gain;
+                            -status.lna_gain;
                     }
                     if (status.vga_gain !== undefined) {
                         document.getElementById("vgaGain").value =
-                            status.vga_gain;
+                            -status.vga_gain;
                         document.getElementById("vgaVal").textContent =
-                            status.vga_gain;
+                            -status.vga_gain;
                     }
                     if (status.direct_sampling !== undefined)
                         document.getElementById("directSampling").value =

@@ -2,6 +2,8 @@
 
 Browser-based spectrum and waterfall scanner for RigExpert Fobos SDR using the agile Fobos SDR API.
 
+![Fobos SDR Scanner screenshot](images/screenshot01.png)
+
 The program runs a small C HTTP server on `localhost:8080`, controls the SDR through `libfobos_sdr`, and streams waterfall lines to the browser with Server-Sent Events. The scanner uses the Fobos hardware scan API to sweep a frequency list, compute FFT magnitudes, and render the current spectrum and waterfall in `index.html`.
 
 ## Features
@@ -10,6 +12,7 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Live spectrum and top-to-bottom waterfall display
 - Hover readout for frequency and spectrum level
 - Adjustable LNA/VGA gain while scanning
+- Converter frequency offset for upconverter use
 - Waterfall brightness window controls
 - Configurable frequency range, sample rate, bandwidth ratio, and direct sampling mode
 
