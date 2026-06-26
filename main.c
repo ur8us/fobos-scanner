@@ -4,9 +4,10 @@
  * Scanning algorithm:
  *   Build a frequency table from freq_start to freq_end.
  *   Let the Fobos SDR firmware scan that table in hardware.
- *   For each indexed scan buffer, compute FFT magnitude and store it in
- *   that frequency slot. One horizontal waterfall line is published after
- *   every frequency slot has contributed.
+ *   The SDR callback only copies each indexed scan buffer into a bounded
+ *   queue. A worker thread computes FFT magnitude, stores it in that
+ *   frequency slot, and publishes one horizontal waterfall line after every
+ *   frequency slot has contributed.
  */
 
 #define _USE_MATH_DEFINES
@@ -46,6 +47,7 @@
 #define FFT_SIZE_MAX        4096
 #define FFTS_PER_STEP       32
 #define SCAN_BUF_LEN        65536
+#define PROCESS_QUEUE_LEN   8
 #define DB_FLOOR            -100.0f
 #define DB_CEIL             -20.0f
 
@@ -304,17 +306,35 @@ static void format_sample_rates_json(char *buf, size_t len)
 /* Hardware scan context                                              */
 /* ------------------------------------------------------------------ */
 typedef struct {
+    float *samples;
+    uint32_t buf_len;
+    int channel;
+    int ready;
+} sample_queue_item_t;
+
+typedef struct {
     int total_steps;
     int bins_per_step;
     int last_bins;
     int line_bins;
     int steps_seen;
     int line_num;
+    int fft_size;
     double freq_start;
     double freq_end;
+    float window[FFT_SIZE_MAX];
     float *line_buf;
     uint8_t *line_packed;
     uint8_t step_seen[MAX_FREQS];
+    sample_queue_item_t queue[PROCESS_QUEUE_LEN];
+    int queue_head;
+    int queue_tail;
+    int queue_len;
+    int worker_stop;
+    uint64_t queue_dropped;
+    pthread_mutex_t queue_mutex;
+    pthread_cond_t queue_cond;
+    pthread_t worker_thread;
 } scan_ctx_t;
 
 static int build_scan_frequencies(double *freqs, double *out_step)
@@ -427,9 +447,9 @@ static int scan_bins_per_step(void)
     return scan_bins_per_step_for_width(g_samplerate * g_bw_ratio);
 }
 
-static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step, float *out)
+static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step,
+                                 int fft_size, const float *window, float *out)
 {
-    int fft_size = g_fft_size;
     float local_fft[fft_size * 2];
     int fft_count = 0;
     int shifted_start = (fft_size - bins_per_step) / 2;
@@ -438,7 +458,7 @@ static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step
 
     for (uint32_t pos = 0; pos + (uint32_t)fft_size <= buf_len && fft_count < FFTS_PER_STEP; pos += (uint32_t)fft_size) {
         for (int i = 0; i < fft_size; i++) {
-            float w = g_window[i];
+            float w = window[i];
             local_fft[2*i]   = buf[2*(pos+i)]   * w;
             local_fft[2*i+1] = buf[2*(pos+i)+1] * w;
         }
@@ -470,7 +490,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
     if (bin_count <= 0) return;
 
     for (int i = 0; i < bin_count; i++) {
-        float mag = ctx->line_buf[i] / (float)g_fft_size;
+        float mag = ctx->line_buf[i] / (float)ctx->fft_size;
         float db = 20.0f * log10f(mag + 1e-20f);
         float v = (db - DB_FLOOR) * (255.0f / (DB_CEIL - DB_FLOOR));
         if (v < 0.0f) v = 0.0f;
@@ -493,25 +513,17 @@ static void publish_scan_line(scan_ctx_t *ctx)
     free(json);
 }
 
-static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *dev, void *user)
+static void process_scan_buffer(scan_ctx_t *ctx, float *buf, uint32_t buf_len, int channel)
 {
-    scan_ctx_t *ctx = (scan_ctx_t *)user;
-    int channel;
     int channel_bins;
     float *slot;
 
-    if (!g_scanning) {
-        fobos_sdr_cancel_async(dev);
-        return;
-    }
-
-    channel = fobos_sdr_get_scan_index(dev);
     if (channel < 0 || channel >= ctx->total_steps)
         return;
 
     channel_bins = (channel == ctx->total_steps - 1) ? ctx->last_bins : ctx->bins_per_step;
     slot = ctx->line_buf + (size_t)channel * ctx->bins_per_step;
-    if (average_fft_magnitude(buf, buf_len, channel_bins, slot) <= 0)
+    if (average_fft_magnitude(buf, buf_len, channel_bins, ctx->fft_size, ctx->window, slot) <= 0)
         return;
 
     if (!ctx->step_seen[channel]) {
@@ -527,6 +539,124 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
     }
 }
 
+static int scan_queue_init(scan_ctx_t *ctx)
+{
+    if (pthread_mutex_init(&ctx->queue_mutex, NULL) != 0)
+        return -1;
+    if (pthread_cond_init(&ctx->queue_cond, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->queue_mutex);
+        return -1;
+    }
+
+    for (int i = 0; i < PROCESS_QUEUE_LEN; i++) {
+        ctx->queue[i].samples = malloc((size_t)SCAN_BUF_LEN * 2 * sizeof(float));
+        if (!ctx->queue[i].samples) {
+            for (int j = 0; j < i; j++) {
+                free(ctx->queue[j].samples);
+                ctx->queue[j].samples = NULL;
+            }
+            pthread_cond_destroy(&ctx->queue_cond);
+            pthread_mutex_destroy(&ctx->queue_mutex);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void scan_queue_destroy(scan_ctx_t *ctx)
+{
+    for (int i = 0; i < PROCESS_QUEUE_LEN; i++) {
+        free(ctx->queue[i].samples);
+        ctx->queue[i].samples = NULL;
+    }
+    pthread_cond_destroy(&ctx->queue_cond);
+    pthread_mutex_destroy(&ctx->queue_mutex);
+}
+
+static void scan_queue_stop(scan_ctx_t *ctx)
+{
+    pthread_mutex_lock(&ctx->queue_mutex);
+    ctx->worker_stop = 1;
+    pthread_cond_broadcast(&ctx->queue_cond);
+    pthread_mutex_unlock(&ctx->queue_mutex);
+}
+
+static void scan_queue_push(scan_ctx_t *ctx, int channel, float *buf, uint32_t buf_len)
+{
+    sample_queue_item_t *item;
+
+    if (buf_len > SCAN_BUF_LEN)
+        buf_len = SCAN_BUF_LEN;
+
+    pthread_mutex_lock(&ctx->queue_mutex);
+    if (ctx->queue_len >= PROCESS_QUEUE_LEN) {
+        ctx->queue_dropped++;
+        pthread_mutex_unlock(&ctx->queue_mutex);
+        return;
+    }
+
+    item = &ctx->queue[ctx->queue_tail];
+    item->ready = 0;
+    ctx->queue_tail = (ctx->queue_tail + 1) % PROCESS_QUEUE_LEN;
+    ctx->queue_len++;
+    pthread_mutex_unlock(&ctx->queue_mutex);
+
+    memcpy(item->samples, buf, (size_t)buf_len * 2 * sizeof(float));
+
+    pthread_mutex_lock(&ctx->queue_mutex);
+    item->buf_len = buf_len;
+    item->channel = channel;
+    item->ready = 1;
+    pthread_cond_signal(&ctx->queue_cond);
+    pthread_mutex_unlock(&ctx->queue_mutex);
+}
+
+static void *scan_worker_thread(void *arg)
+{
+    scan_ctx_t *ctx = (scan_ctx_t *)arg;
+
+    for (;;) {
+        sample_queue_item_t *item;
+
+        pthread_mutex_lock(&ctx->queue_mutex);
+        while (ctx->queue_len == 0 || !ctx->queue[ctx->queue_head].ready) {
+            if (ctx->worker_stop) {
+                pthread_mutex_unlock(&ctx->queue_mutex);
+                return NULL;
+            }
+            pthread_cond_wait(&ctx->queue_cond, &ctx->queue_mutex);
+        }
+        item = &ctx->queue[ctx->queue_head];
+        pthread_mutex_unlock(&ctx->queue_mutex);
+
+        process_scan_buffer(ctx, item->samples, item->buf_len, item->channel);
+
+        pthread_mutex_lock(&ctx->queue_mutex);
+        item->ready = 0;
+        ctx->queue_head = (ctx->queue_head + 1) % PROCESS_QUEUE_LEN;
+        ctx->queue_len--;
+        pthread_cond_signal(&ctx->queue_cond);
+        pthread_mutex_unlock(&ctx->queue_mutex);
+    }
+}
+
+static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *dev, void *user)
+{
+    scan_ctx_t *ctx = (scan_ctx_t *)user;
+    int channel;
+
+    if (!g_scanning) {
+        fobos_sdr_cancel_async(dev);
+        return;
+    }
+
+    channel = fobos_sdr_get_scan_index(dev);
+    if (channel < 0 || channel >= ctx->total_steps)
+        return;
+
+    scan_queue_push(ctx, channel, buf, buf_len);
+}
+
 /* ------------------------------------------------------------------ */
 /* Scanning thread                                                     */
 /* ------------------------------------------------------------------ */
@@ -539,6 +669,7 @@ static void *scan_thread_func(void *arg)
     int total_steps = build_scan_frequencies(air_freqs, &step);
     scan_ctx_t ctx;
     int ret;
+    int worker_started = 0;
     size_t bin_count;
 
     if (total_steps < FOBOS_MIN_FREQS_CNT) {
@@ -558,6 +689,8 @@ static void *scan_thread_func(void *arg)
     ctx.bins_per_step = scan_bins_per_step_for_width(step);
     ctx.last_bins = scan_bins_per_step_for_width(scan_last_width(total_steps, step));
     ctx.line_bins = (total_steps - 1) * ctx.bins_per_step + ctx.last_bins;
+    ctx.fft_size = g_fft_size;
+    memcpy(ctx.window, g_window, (size_t)ctx.fft_size * sizeof(float));
     ctx.freq_start = g_freq_start;
     ctx.freq_end = build_scan_effective_end(total_steps, step);
 
@@ -571,6 +704,24 @@ static void *scan_thread_func(void *arg)
         g_scanning = 0;
         return NULL;
     }
+
+    if (scan_queue_init(&ctx) != 0) {
+        fprintf(stderr, "[SDR] Out of memory\n");
+        free(ctx.line_buf);
+        free(ctx.line_packed);
+        g_scanning = 0;
+        return NULL;
+    }
+
+    if (pthread_create(&ctx.worker_thread, NULL, scan_worker_thread, &ctx) != 0) {
+        fprintf(stderr, "[SDR] Failed to start scan processing worker\n");
+        scan_queue_destroy(&ctx);
+        free(ctx.line_buf);
+        free(ctx.line_packed);
+        g_scanning = 0;
+        return NULL;
+    }
+    worker_started = 1;
 
     ret = fobos_sdr_set_samplerate(g_dev, g_samplerate);
     if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_samplerate failed: %d\n", ret);
@@ -600,7 +751,16 @@ static void *scan_thread_func(void *arg)
     }
 
     fobos_sdr_stop_scan(g_dev);
+    if (worker_started) {
+        scan_queue_stop(&ctx);
+        pthread_join(ctx.worker_thread, NULL);
+    }
+    if (ctx.queue_dropped > 0) {
+        fprintf(stderr, "[SDR] Dropped %llu scan buffers in processing queue\n",
+                (unsigned long long)ctx.queue_dropped);
+    }
     g_scanning = 0;
+    scan_queue_destroy(&ctx);
     free(ctx.line_buf);
     free(ctx.line_packed);
     printf("[SDR] Scan thread stopped\n");
