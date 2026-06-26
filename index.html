@@ -17,11 +17,11 @@
                 padding: 20px;
                 display: flex;
                 flex-direction: column;
-                align-items: center;
+                align-items: stretch;
                 min-height: 100vh;
             }
             .container {
-                max-width: 1100px;
+                max-width: none;
                 width: 100%;
             }
             h1 {
@@ -133,6 +133,7 @@
                 text-transform: uppercase;
                 letter-spacing: 1px;
                 color: #607080;
+                margin-top: -10px;
             }
             .ctrl-group input,
             .ctrl-group select {
@@ -254,7 +255,7 @@
                 background: rgba(8, 10, 14, 0.92);
                 color: #d8e0e8;
                 font: 11px/1.2 monospace;
-                white-space: nowrap;
+                white-space: pre-line;
             }
         </style>
     </head>
@@ -283,7 +284,6 @@
                         id="freqStart"
                         value="50"
                         min="50"
-                        max="6000"
                         step="0.1"
                     />
                 </div>
@@ -294,7 +294,6 @@
                         id="freqEnd"
                         value="2000"
                         min="0"
-                        max="6000"
                         step="0.1"
                     />
                 </div>
@@ -304,8 +303,6 @@
                         type="number"
                         id="converterFreq"
                         value="0"
-                        min="0"
-                        max="6000"
                         step="0.1"
                     />
                 </div>
@@ -320,6 +317,10 @@
                 <div class="ctrl-group">
                     <label>BW Ratio</label>
                     <select id="bwRatio">
+                        <option value="0.1">0.1</option>
+                        <option value="0.2">0.2</option>
+                        <option value="0.3">0.3</option>
+                        <option value="0.4">0.4</option>
                         <option value="0.5">0.5</option>
                         <option value="0.7">0.7</option>
                         <option value="0.8" selected>0.8</option>
@@ -338,28 +339,28 @@
             <div class="controls">
                 <div class="ctrl-group">
                     <label
-                        >LNA (dB)
-                        <span class="range-val" id="lnaVal">0</span></label
+                        >LNA <span class="range-val" id="lnaVal">0</span></label
+                    >
                     >
                     <input
                         type="range"
                         id="lnaGain"
-                        min="-2"
-                        max="0"
+                        min="0"
+                        max="2"
                         value="0"
                         step="1"
                     />
                 </div>
                 <div class="ctrl-group">
                     <label
-                        >VGA (dB)
-                        <span class="range-val" id="vgaVal">0</span></label
+                        >VGA <span class="range-val" id="vgaVal">0</span></label
+                    >
                     >
                     <input
                         type="range"
                         id="vgaGain"
-                        min="-15"
-                        max="0"
+                        min="0"
+                        max="15"
                         value="0"
                         step="1"
                     />
@@ -372,6 +373,17 @@
                     </select>
                 </div>
                 <div class="ctrl-group">
+                    <label>FFT</label>
+                    <select id="fftSize" disabled>
+                        <option value="128">128</option>
+                        <option value="256">256</option>
+                        <option value="512">512</option>
+                        <option value="1024" selected>1024</option>
+                        <option value="2048">2048</option>
+                        <option value="4096">4096</option>
+                    </select>
+                </div>
+                <div class="ctrl-group">
                     <label
                         >WF Min
                         <span class="range-val" id="wfMinVal">0</span></label
@@ -380,7 +392,7 @@
                         type="range"
                         id="wfMin"
                         min="0"
-                        max="254"
+                        max="300"
                         value="0"
                         step="1"
                     />
@@ -394,7 +406,7 @@
                         type="range"
                         id="wfMax"
                         min="1"
-                        max="255"
+                        max="300"
                         value="15"
                         step="1"
                     />
@@ -527,7 +539,11 @@
             }
 
             function formatMHz(freq) {
-                return (freq / 1e6).toFixed(3) + " MHz";
+                const mhz = freq / 1e6;
+                if (Number.isInteger(mhz)) return mhz.toFixed(0) + " MHz";
+                if (Math.abs(mhz - Math.round(mhz)) < 0.0005)
+                    return Math.round(mhz).toFixed(0) + " MHz";
+                return mhz.toFixed(3) + " MHz";
             }
 
             function updateFrequencyLabels(freqStart, freqEnd, steps) {
@@ -569,6 +585,13 @@
                 );
                 if (axis.right <= axis.left || rect.width <= 0) return null;
                 return axis.left + (x / rect.width) * (axis.right - axis.left);
+            }
+
+            function receiverFrequencyFromRadio(freq) {
+                if (currentConverterFreq >= 0) {
+                    return freq - currentConverterFreq;
+                }
+                return Math.abs(-currentConverterFreq - freq);
             }
 
             function mapWaterfallValue(value) {
@@ -707,7 +730,8 @@
             let eventSource = null;
             let currentFreq0 = 0,
                 currentFreq1 = 0,
-                currentSteps = 0;
+                currentSteps = 0,
+                currentConverterFreq = 0;
 
             function connectSSE() {
                 if (eventSource) eventSource.close();
@@ -783,6 +807,9 @@
                 }
 
                 let text = formatMHz(freq);
+                if (currentConverterFreq !== 0) {
+                    text += "\n" + formatMHz(receiverFrequencyFromRadio(freq));
+                }
                 if (includeLevel && currentBins && currentBins.length) {
                     const rect = canvas.getBoundingClientRect();
                     const x = Math.max(
@@ -796,7 +823,7 @@
                             Math.floor((x / rect.width) * currentBins.length),
                         ),
                     );
-                    text += "  " + (currentBins[idx] | 0);
+                    text += "\n" + (currentBins[idx] | 0);
                 }
 
                 hoverReadout.textContent = text;
@@ -888,7 +915,6 @@
             //  UI
             // ===================================================================
             function updateUI(running) {
-                document.getElementById("btnStart").disabled = running;
                 document.getElementById("btnStop").disabled = !running;
                 const dot = document.getElementById("statusDot");
                 dot.className = "status-dot " + (running ? "running" : "idle");
@@ -897,28 +923,72 @@
                     : "idle";
             }
 
+            function mhzInputValue(freq) {
+                return (freq / 1e6)
+                    .toFixed(6)
+                    .replace(/0+$/, "")
+                    .replace(/\.$/, "");
+            }
+
+            function applyScanPlan(plan) {
+                if (!plan) return;
+
+                if (plan.freq_start !== undefined) {
+                    currentFreq0 = plan.freq_start;
+                    document.getElementById("freqStart").value =
+                        mhzInputValue(plan.freq_start);
+                }
+                if (plan.freq_end !== undefined) {
+                    currentFreq1 = plan.freq_end;
+                    document.getElementById("freqEnd").value =
+                        mhzInputValue(plan.freq_end);
+                }
+                if (plan.steps !== undefined) {
+                    currentSteps = plan.steps;
+                    document.getElementById("infoSteps").textContent =
+                        plan.steps;
+                }
+                if (plan.converter_freq !== undefined) {
+                    currentConverterFreq = plan.converter_freq;
+                    document.getElementById("converterFreq").value =
+                        mhzInputValue(plan.converter_freq);
+                }
+                if (currentFreq0 && currentFreq1 && currentSteps) {
+                    updateFrequencyLabels(
+                        currentFreq0,
+                        currentFreq1,
+                        currentSteps,
+                    );
+                    document.getElementById("infoRange").textContent =
+                        (currentFreq0 / 1e6).toFixed(0) +
+                        " - " +
+                        (currentFreq1 / 1e6).toFixed(0) +
+                        " MHz";
+                }
+            }
+
             let gainUpdateTimer = null;
             function scheduleGainUpdate() {
                 if (gainUpdateTimer) clearTimeout(gainUpdateTimer);
                 gainUpdateTimer = setTimeout(async function () {
                     gainUpdateTimer = null;
                     const result = await apiPost("/api/gain", {
-                        lna_gain: -parseInt(
+                        lna_gain: parseInt(
                             document.getElementById("lnaGain").value,
                         ),
-                        vga_gain: -parseInt(
+                        vga_gain: parseInt(
                             document.getElementById("vgaGain").value,
                         ),
                     });
                     if (result && result.status === "ok") {
                         document.getElementById("lnaGain").value =
-                            -result.lna_gain;
+                            result.lna_gain;
                         document.getElementById("lnaVal").textContent =
-                            -result.lna_gain;
+                            result.lna_gain;
                         document.getElementById("vgaGain").value =
-                            -result.vga_gain;
+                            result.vga_gain;
                         document.getElementById("vgaVal").textContent =
-                            -result.vga_gain;
+                            result.vga_gain;
                     }
                 }, 80);
             }
@@ -942,18 +1012,22 @@
                         bw_ratio: parseFloat(
                             document.getElementById("bwRatio").value,
                         ),
-                        lna_gain: -parseInt(
+                        lna_gain: parseInt(
                             document.getElementById("lnaGain").value,
                         ),
-                        vga_gain: -parseInt(
+                        vga_gain: parseInt(
                             document.getElementById("vgaGain").value,
                         ),
                         direct_sampling: parseInt(
                             document.getElementById("directSampling").value,
                         ),
+                        fft_size: parseInt(
+                            document.getElementById("fftSize").value,
+                        ),
                     };
                     const result = await apiPost("/api/start", body);
                     if (result && result.status === "ok") {
+                        applyScanPlan(result);
                         updateUI(true);
                         linesCount = 0;
                         wfRows = [];
@@ -993,7 +1067,7 @@
 
                 if (minVal >= maxVal) {
                     if (changed === "min") minVal = Math.max(0, maxVal - 1);
-                    else maxVal = Math.min(255, minVal + 1);
+                    else maxVal = Math.min(300, minVal + 1);
                 }
 
                 waterfallMin = minVal;
@@ -1002,6 +1076,8 @@
                 maxEl.value = maxVal;
                 document.getElementById("wfMinVal").textContent = minVal;
                 document.getElementById("wfMaxVal").textContent = maxVal;
+                localStorage.setItem("wfMin", minVal);
+                localStorage.setItem("wfMax", maxVal);
                 redrawWaterfallHistory();
             }
 
@@ -1015,6 +1091,12 @@
                 .addEventListener("input", () =>
                     syncWaterfallBrightness("max"),
                 );
+
+            document
+                .getElementById("fftSize")
+                .addEventListener("change", function () {
+                    localStorage.setItem("fftSize", this.value);
+                });
 
             // ===================================================================
             //  Init
@@ -1040,19 +1122,17 @@
                             currentFreq1,
                             currentSteps,
                         );
-                    if (status.scanning) {
-                        updateUI(true);
-                        connectSSE();
-                    }
                     if (status.freq_start)
                         document.getElementById("freqStart").value =
                             status.freq_start / 1e6;
                     if (status.freq_end)
                         document.getElementById("freqEnd").value =
                             status.freq_end / 1e6;
-                    if (status.converter_freq !== undefined)
+                    if (status.converter_freq !== undefined) {
+                        currentConverterFreq = status.converter_freq;
                         document.getElementById("converterFreq").value =
                             status.converter_freq / 1e6;
+                    }
                     syncSampleRateOptions(
                         status.sample_rates,
                         status.samplerate,
@@ -1067,19 +1147,85 @@
                     }
                     if (status.lna_gain !== undefined) {
                         document.getElementById("lnaGain").value =
-                            -status.lna_gain;
+                            status.lna_gain;
                         document.getElementById("lnaVal").textContent =
-                            -status.lna_gain;
+                            status.lna_gain;
                     }
                     if (status.vga_gain !== undefined) {
                         document.getElementById("vgaGain").value =
-                            -status.vga_gain;
+                            status.vga_gain;
                         document.getElementById("vgaVal").textContent =
-                            -status.vga_gain;
+                            status.vga_gain;
                     }
                     if (status.direct_sampling !== undefined)
                         document.getElementById("directSampling").value =
                             status.direct_sampling;
+                }
+
+                /* Restore waterfall brightness from localStorage */
+                const savedWfMin = localStorage.getItem("wfMin");
+                const savedWfMax = localStorage.getItem("wfMax");
+                if (savedWfMin !== null) {
+                    document.getElementById("wfMin").value = savedWfMin;
+                    document.getElementById("wfMinVal").textContent =
+                        savedWfMin;
+                    waterfallMin = parseInt(savedWfMin, 10);
+                }
+                if (savedWfMax !== null) {
+                    document.getElementById("wfMax").value = savedWfMax;
+                    document.getElementById("wfMaxVal").textContent =
+                        savedWfMax;
+                    waterfallMax = parseInt(savedWfMax, 10);
+                }
+
+                /* Restore FFT size from localStorage, then let backend status override */
+                const savedFft = localStorage.getItem("fftSize");
+                if (savedFft !== null) {
+                    document.getElementById("fftSize").value = savedFft;
+                }
+                if (status.fft_size) {
+                    document.getElementById("fftSize").value = status.fft_size;
+                }
+
+                /* Auto-start scanning immediately */
+                const body = {
+                    freq_start: parseFloat(
+                        document.getElementById("freqStart").value,
+                    ),
+                    freq_end: parseFloat(
+                        document.getElementById("freqEnd").value,
+                    ),
+                    converter_freq: parseFloat(
+                        document.getElementById("converterFreq").value,
+                    ),
+                    samplerate: parseFloat(
+                        document.getElementById("samplerate").value,
+                    ),
+                    bw_ratio: parseFloat(
+                        document.getElementById("bwRatio").value,
+                    ),
+                    lna_gain: parseInt(
+                        document.getElementById("lnaGain").value,
+                    ),
+                    vga_gain: parseInt(
+                        document.getElementById("vgaGain").value,
+                    ),
+                    direct_sampling: parseInt(
+                        document.getElementById("directSampling").value,
+                    ),
+                    fft_size: parseInt(
+                        document.getElementById("fftSize").value,
+                    ),
+                };
+                const startResult = await apiPost("/api/start", body);
+                if (startResult && startResult.status === "ok") {
+                    applyScanPlan(startResult);
+                    updateUI(true);
+                    linesCount = 0;
+                    wfRows = [];
+                    clearWaterfallPixels();
+                    if (wfImageData) wfCtx.putImageData(wfImageData, 0, 0);
+                    connectSSE();
                 }
             })();
         </script>
