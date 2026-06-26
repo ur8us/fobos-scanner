@@ -44,12 +44,12 @@
 /* FFT: 1024 complex samples per read (~32 us at 50 MHz) */
 #define FFT_SIZE            1024
 #define FFT_LOG2            10
-#define BINS_PER_STEP       (FFT_SIZE / 2)
+#define MAX_BINS_PER_STEP   FFT_SIZE
 #define FFTS_PER_STEP       32
 #define SCAN_BUF_LEN        65536
 
-/* Max total bins per line (256 freq steps * 512 bins) */
-#define MAX_BINS_PER_LINE   (MAX_FREQS * BINS_PER_STEP)
+/* Max total bins per line (256 freq steps * 1024 bins) */
+#define MAX_BINS_PER_LINE   (MAX_FREQS * MAX_BINS_PER_STEP)
 
 /* ------------------------------------------------------------------ */
 /* Global state                                                       */
@@ -61,6 +61,7 @@ static volatile int g_scanning = 0;
 /* Scan parameters */
 static double g_freq_start   = MIN_FREQ_START_HZ;
 static double g_freq_end     = 2000.0e6;
+static double g_converter_freq = 0.0;
 static double g_samplerate   = 50.0e6;
 static double g_bw_ratio     = 0.9;
 static uint32_t g_lna_gain   = 0;
@@ -203,6 +204,7 @@ static void url_decode(char *s)
 /* ------------------------------------------------------------------ */
 typedef struct {
     int total_steps;
+    int bins_per_step;
     int steps_seen;
     int line_num;
     double freq_start;
@@ -232,12 +234,33 @@ static int build_scan_frequencies(double *freqs, double *out_step)
     return count;
 }
 
-static int average_fft_magnitude(float *buf, uint32_t buf_len, float *out)
+static int build_device_scan_frequencies(const double *air_freqs, int count, double *device_freqs)
+{
+    for (int i = 0; i < count; i++) {
+        device_freqs[i] = air_freqs[i] - g_converter_freq;
+        if (device_freqs[i] < 0.0)
+            return -1;
+    }
+
+    return 0;
+}
+
+static int scan_bins_per_step(void)
+{
+    int bins = (int)lrint(g_bw_ratio * (double)FFT_SIZE);
+
+    if (bins < 1) bins = 1;
+    if (bins > FFT_SIZE) bins = FFT_SIZE;
+    return bins;
+}
+
+static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step, float *out)
 {
     float local_fft[FFT_SIZE * 2];
     int fft_count = 0;
+    int shifted_start = (FFT_SIZE - bins_per_step) / 2;
 
-    memset(out, 0, (size_t)BINS_PER_STEP * sizeof(float));
+    memset(out, 0, (size_t)bins_per_step * sizeof(float));
 
     for (uint32_t pos = 0; pos + FFT_SIZE <= buf_len && fft_count < FFTS_PER_STEP; pos += FFT_SIZE) {
         for (int i = 0; i < FFT_SIZE; i++) {
@@ -248,9 +271,11 @@ static int average_fft_magnitude(float *buf, uint32_t buf_len, float *out)
 
         fft_c2c(local_fft, FFT_SIZE);
 
-        for (int i = 0; i < BINS_PER_STEP; i++) {
-            float re = local_fft[2*i];
-            float im = local_fft[2*i+1];
+        for (int i = 0; i < bins_per_step; i++) {
+            int shifted_bin = shifted_start + i;
+            int fft_bin = (shifted_bin + FFT_SIZE / 2) % FFT_SIZE;
+            float re = local_fft[2*fft_bin];
+            float im = local_fft[2*fft_bin+1];
             out[i] += sqrtf(re*re + im*im);
         }
         fft_count++;
@@ -259,7 +284,7 @@ static int average_fft_magnitude(float *buf, uint32_t buf_len, float *out)
     if (fft_count <= 0) return 0;
 
     float inv = 1.0f / (float)fft_count;
-    for (int i = 0; i < BINS_PER_STEP; i++)
+    for (int i = 0; i < bins_per_step; i++)
         out[i] *= inv;
 
     return fft_count;
@@ -267,7 +292,7 @@ static int average_fft_magnitude(float *buf, uint32_t buf_len, float *out)
 
 static void publish_scan_line(scan_ctx_t *ctx)
 {
-    int bin_count = ctx->total_steps * BINS_PER_STEP;
+    int bin_count = ctx->total_steps * ctx->bins_per_step;
 
     float mag_max = 1e-15f;
     for (int i = 0; i < bin_count; i++)
@@ -309,8 +334,8 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
     if (channel < 0 || channel >= ctx->total_steps)
         return;
 
-    slot = ctx->line_buf + (size_t)channel * BINS_PER_STEP;
-    if (average_fft_magnitude(buf, buf_len, slot) <= 0)
+    slot = ctx->line_buf + (size_t)channel * ctx->bins_per_step;
+    if (average_fft_magnitude(buf, buf_len, ctx->bins_per_step, slot) <= 0)
         return;
 
     if (!ctx->step_seen[channel]) {
@@ -332,9 +357,10 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
 static void *scan_thread_func(void *arg)
 {
     (void)arg;
-    double freqs[MAX_FREQS];
+    double air_freqs[MAX_FREQS];
+    double device_freqs[MAX_FREQS];
     double step = 0.0;
-    int total_steps = build_scan_frequencies(freqs, &step);
+    int total_steps = build_scan_frequencies(air_freqs, &step);
     scan_ctx_t ctx;
     int ret;
     size_t bin_count;
@@ -345,12 +371,19 @@ static void *scan_thread_func(void *arg)
         return NULL;
     }
 
+    if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) {
+        fprintf(stderr, "[SDR] Converter frequency makes hardware scan frequency negative\n");
+        g_scanning = 0;
+        return NULL;
+    }
+
     memset(&ctx, 0, sizeof(ctx));
     ctx.total_steps = total_steps;
-    ctx.freq_start = freqs[0];
-    ctx.freq_end = freqs[total_steps - 1];
+    ctx.bins_per_step = scan_bins_per_step();
+    ctx.freq_start = air_freqs[0];
+    ctx.freq_end = air_freqs[total_steps - 1];
 
-    bin_count = (size_t)total_steps * BINS_PER_STEP;
+    bin_count = (size_t)total_steps * ctx.bins_per_step;
     ctx.line_buf = malloc(bin_count * sizeof(float));
     ctx.line_packed = malloc(bin_count);
     if (!ctx.line_buf || !ctx.line_packed) {
@@ -372,10 +405,11 @@ static void *scan_thread_func(void *arg)
     ret = fobos_sdr_set_direct_sampling(g_dev, g_direct_sampling);
     if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_direct_sampling failed: %d\n", ret);
 
-    printf("[SDR] Hardware scan: %.0f - %.0f Hz, requested step %.0f Hz (%d freqs)\n",
-           ctx.freq_start, ctx.freq_end, step, total_steps);
+    printf("[SDR] Hardware scan: air %.0f - %.0f Hz, converter %.0f Hz, SDR %.0f - %.0f Hz, requested step %.0f Hz (%d freqs)\n",
+           ctx.freq_start, ctx.freq_end, g_converter_freq,
+           device_freqs[0], device_freqs[total_steps - 1], step, total_steps);
 
-    ret = fobos_sdr_start_scan(g_dev, freqs, (unsigned int)total_steps);
+    ret = fobos_sdr_start_scan(g_dev, device_freqs, (unsigned int)total_steps);
     if (ret != FOBOS_ERR_OK) {
         fprintf(stderr, "[SDR] fobos_sdr_start_scan failed: %d\n", ret);
         g_scanning = 0;
@@ -400,10 +434,14 @@ static void *scan_thread_func(void *arg)
 /* ------------------------------------------------------------------ */
 static int start_scan(void)
 {
-    double freqs[MAX_FREQS];
+    double air_freqs[MAX_FREQS];
+    double device_freqs[MAX_FREQS];
+    int total_steps;
 
     if (g_scanning) return 0;
-    if (build_scan_frequencies(freqs, NULL) < FOBOS_MIN_FREQS_CNT) return -1;
+    total_steps = build_scan_frequencies(air_freqs, NULL);
+    if (total_steps < FOBOS_MIN_FREQS_CNT) return -1;
+    if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) return -1;
 
     if (!g_dev) {
         if (fobos_sdr_get_device_count() <= 0) return -1;
@@ -500,13 +538,14 @@ static void handle_request(int client_fd, const char *req)
         double freqs[MAX_FREQS];
         double step = 0.0;
         int total_steps = build_scan_frequencies(freqs, &step);
+        int bins_per_step = scan_bins_per_step();
 
         int n = snprintf(body, sizeof(body),
             "{\"device\":\"Fobos SDR\","
             "\"hardware\":\"%s\",\"firmware\":\"%s\",\"serial\":\"%s\","
             "\"manufacturer\":\"%s\",\"product\":\"%s\","
             "\"scanning\":%d,"
-            "\"freq_start\":%.0f,\"freq_end\":%.0f,"
+            "\"freq_start\":%.0f,\"freq_end\":%.0f,\"converter_freq\":%.0f,"
             "\"samplerate\":%.0f,\"bw_ratio\":%.2f,"
             "\"step_hz\":%.0f,\"steps\":%d,"
             "\"bins_per_step\":%d,\"fft_size\":%d,"
@@ -514,10 +553,10 @@ static void handle_request(int client_fd, const char *req)
             g_hw_rev, g_fw_ver, g_serial,
             g_manufacturer, g_product,
             g_scanning,
-            g_freq_start, g_freq_end,
+            g_freq_start, g_freq_end, g_converter_freq,
             g_samplerate, g_bw_ratio,
             step, total_steps,
-            BINS_PER_STEP, FFT_SIZE,
+            bins_per_step, FFT_SIZE,
             g_lna_gain, g_vga_gain, g_direct_sampling);
 
         char resp[4096];
@@ -574,6 +613,7 @@ static void handle_request(int client_fd, const char *req)
 
         GET_DOUBLE("\"freq_start\"", g_freq_start, 1.0e6, 1.0);
         GET_DOUBLE("\"freq_end\"", g_freq_end, 1.0e6, 1.0);
+        GET_DOUBLE("\"converter_freq\"", g_converter_freq, 1.0e6, 0.0);
         GET_DOUBLE("\"samplerate\"", g_samplerate, 1.0, 1.0);
         GET_DOUBLE("\"bw_ratio\"", g_bw_ratio, 1.0, 0.000001);
         GET_UINT("\"lna_gain\"", g_lna_gain);
@@ -713,12 +753,17 @@ int main(void)
         perror("listen"); close(server_fd); return 1;
     }
 
-    printf("\n");
-    printf("╔══════════════════════════════════════════╗\n");
-    printf("║   Fobos SDR Scanner                     ║\n");
-    printf("║   http://localhost:%d              ║\n", PORT);
-    printf("╚══════════════════════════════════════════╝\n");
-    printf("\n");
+    {
+        char url[64];
+        snprintf(url, sizeof(url), "http://localhost:%d", PORT);
+
+        printf("\n");
+        printf("╔══════════════════════════════════════════╗\n");
+        printf("║ %-40s ║\n", "Fobos SDR Scanner");
+        printf("║ %-40s ║\n", url);
+        printf("╚══════════════════════════════════════════╝\n");
+        printf("\n");
+    }
 
     while (!g_exit) {
         struct sockaddr_in client_addr;
