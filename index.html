@@ -1,0 +1,1044 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Fobos SDR Scanner</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                background: #0a0a0f;
+                color: #c8d0d8;
+                font-family: "Segoe UI", system-ui, sans-serif;
+                padding: 20px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                min-height: 100vh;
+            }
+            .container {
+                max-width: 1100px;
+                width: 100%;
+            }
+            h1 {
+                font-size: 1.4rem;
+                font-weight: 300;
+                letter-spacing: 2px;
+                text-transform: uppercase;
+                color: #40a0e0;
+                margin-bottom: 16px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            h1 small {
+                font-size: 0.8rem;
+                color: #607080;
+                font-weight: 400;
+                letter-spacing: 0;
+                text-transform: none;
+            }
+            .status-dot {
+                display: inline-block;
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                margin-right: 6px;
+            }
+            .status-dot.idle {
+                background: #505050;
+            }
+            .status-dot.running {
+                background: #40c040;
+                box-shadow: 0 0 8px #40c04088;
+            }
+
+            .waterfall-wrap {
+                position: relative;
+                background: #000;
+                border: 1px solid #1a2030;
+                border-radius: 6px;
+                overflow: hidden;
+                margin-bottom: 12px;
+            }
+            #waterfall {
+                display: block;
+                width: 100%;
+                height: 400px;
+                cursor: crosshair;
+            }
+            .wf-overlay {
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                height: 34px;
+                font-size: 10px;
+                color: #8090a0;
+                background: rgba(0, 0, 0, 0.6);
+                font-family: monospace;
+                pointer-events: none;
+            }
+            .wf-tick {
+                position: absolute;
+                bottom: 0;
+                width: 1px;
+                height: 12px;
+                background: #506070;
+                transform: translateX(-0.5px);
+            }
+            .wf-tick-label {
+                position: absolute;
+                bottom: 14px;
+                left: 50%;
+                transform: translateX(-50%);
+                color: #90a0b0;
+                text-shadow: 0 1px 2px #000;
+                white-space: nowrap;
+            }
+            .wf-tick:first-child .wf-tick-label {
+                left: 0;
+                transform: none;
+            }
+            .wf-tick:last-child .wf-tick-label {
+                right: 0;
+                left: auto;
+                transform: none;
+            }
+
+            .controls {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px 16px;
+                background: #10141e;
+                border: 1px solid #1a2030;
+                border-radius: 6px;
+                padding: 14px 16px;
+                margin-bottom: 12px;
+                align-items: end;
+            }
+            .ctrl-group {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                flex: 1 0 80px;
+                min-width: 70px;
+            }
+            .ctrl-group label {
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: #607080;
+            }
+            .ctrl-group input,
+            .ctrl-group select {
+                background: #181e2a;
+                border: 1px solid #2a3040;
+                color: #c8d0d8;
+                padding: 5px 8px;
+                border-radius: 4px;
+                font-size: 13px;
+                outline: none;
+                width: 100%;
+            }
+            .ctrl-group input:focus,
+            .ctrl-group select:focus {
+                border-color: #40a0e0;
+            }
+            .ctrl-group input[type="range"] {
+                padding: 0;
+                height: 6px;
+                -webkit-appearance: none;
+                appearance: none;
+                background: #2a3040;
+                border-radius: 3px;
+                border: none;
+            }
+            .ctrl-group input[type="range"]::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                width: 14px;
+                height: 14px;
+                border-radius: 50%;
+                background: #40a0e0;
+                cursor: pointer;
+            }
+            .range-val {
+                font-size: 11px;
+                color: #8098b0;
+                text-align: right;
+            }
+
+            .btn-group {
+                display: flex;
+                gap: 6px;
+                align-items: end;
+                flex: 0 0 auto;
+            }
+            .btn {
+                padding: 6px 18px;
+                border: none;
+                border-radius: 4px;
+                font-size: 13px;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.15s;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .btn-start {
+                background: #1a6a30;
+                color: #a0e0b0;
+            }
+            .btn-start:hover:not(:disabled) {
+                background: #208040;
+                box-shadow: 0 0 12px #20804044;
+            }
+            .btn-stop {
+                background: #6a2020;
+                color: #e0a0a0;
+            }
+            .btn-stop:hover:not(:disabled) {
+                background: #802828;
+            }
+            .btn:disabled {
+                opacity: 0.4;
+                cursor: not-allowed;
+            }
+
+            .info-bar {
+                display: flex;
+                justify-content: space-between;
+                font-size: 11px;
+                color: #607080;
+                padding: 4px 4px 8px 4px;
+                flex-wrap: wrap;
+                gap: 2px 16px;
+            }
+            .info-bar .val {
+                color: #90a8c0;
+            }
+
+            .scope-wrap {
+                background: #000;
+                border: 1px solid #1a2030;
+                border-radius: 6px;
+                overflow: hidden;
+                margin-bottom: 12px;
+            }
+            #scope {
+                display: block;
+                width: 100%;
+                height: 90px;
+                cursor: crosshair;
+            }
+
+            .info-row {
+                text-align: center;
+                font-size: 11px;
+                color: #506070;
+                padding: 4px 0;
+            }
+
+            .hover-readout {
+                position: fixed;
+                z-index: 10;
+                display: none;
+                pointer-events: none;
+                padding: 4px 7px;
+                border: 1px solid #2a3040;
+                border-radius: 4px;
+                background: rgba(8, 10, 14, 0.92);
+                color: #d8e0e8;
+                font: 11px/1.2 monospace;
+                white-space: nowrap;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>
+                <span class="status-dot idle" id="statusDot"></span>
+                Fobos SDR Scanner
+                <small id="statusText">disconnected</small>
+            </h1>
+
+            <div class="info-bar">
+                <span>HW: <span class="val" id="infoHw">---</span></span>
+                <span>FW: <span class="val" id="infoFw">---</span></span>
+                <span>S/N: <span class="val" id="infoSn">---</span></span>
+                <span>Scan: <span class="val" id="infoRange">---</span></span>
+                <span>Steps: <span class="val" id="infoSteps">---</span></span>
+                <span>Lines: <span class="val" id="infoLines">0</span></span>
+            </div>
+
+            <div class="controls">
+                <div class="ctrl-group">
+                    <label>Start (MHz)</label>
+                    <input
+                        type="number"
+                        id="freqStart"
+                        value="50"
+                        min="50"
+                        max="6000"
+                        step="0.1"
+                    />
+                </div>
+                <div class="ctrl-group">
+                    <label>End (MHz)</label>
+                    <input
+                        type="number"
+                        id="freqEnd"
+                        value="2000"
+                        min="0"
+                        max="6000"
+                        step="0.1"
+                    />
+                </div>
+                <div class="ctrl-group">
+                    <label>Sample Rate</label>
+                    <select id="samplerate">
+                        <option value="25000000">25 MHz</option>
+                        <option value="50000000" selected>50 MHz</option>
+                        <option value="64000000">64 MHz</option>
+                    </select>
+                </div>
+                <div class="ctrl-group">
+                    <label>BW Ratio</label>
+                    <select id="bwRatio">
+                        <option value="0.5">0.5</option>
+                        <option value="0.7">0.7</option>
+                        <option value="0.8">0.8</option>
+                        <option value="0.9" selected>0.9</option>
+                        <option value="1.0">1.0</option>
+                    </select>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-start" id="btnStart">Start</button>
+                    <button class="btn btn-stop" id="btnStop" disabled>
+                        Stop
+                    </button>
+                </div>
+            </div>
+
+            <div class="controls">
+                <div class="ctrl-group">
+                    <label
+                        >LNA Gain
+                        <span class="range-val" id="lnaVal">0</span></label
+                    >
+                    <input
+                        type="range"
+                        id="lnaGain"
+                        min="0"
+                        max="2"
+                        value="0"
+                        step="1"
+                    />
+                </div>
+                <div class="ctrl-group">
+                    <label
+                        >VGA Gain
+                        <span class="range-val" id="vgaVal">0</span></label
+                    >
+                    <input
+                        type="range"
+                        id="vgaGain"
+                        min="0"
+                        max="15"
+                        value="0"
+                        step="1"
+                    />
+                </div>
+                <div class="ctrl-group">
+                    <label>Direct Sampling</label>
+                    <select id="directSampling">
+                        <option value="0">Off (RF)</option>
+                        <option value="1">On (HF)</option>
+                    </select>
+                </div>
+                <div class="ctrl-group">
+                    <label
+                        >WF Min
+                        <span class="range-val" id="wfMinVal">0</span></label
+                    >
+                    <input
+                        type="range"
+                        id="wfMin"
+                        min="0"
+                        max="254"
+                        value="0"
+                        step="1"
+                    />
+                </div>
+                <div class="ctrl-group">
+                    <label
+                        >WF Max
+                        <span class="range-val" id="wfMaxVal">15</span></label
+                    >
+                    <input
+                        type="range"
+                        id="wfMax"
+                        min="1"
+                        max="255"
+                        value="15"
+                        step="1"
+                    />
+                </div>
+            </div>
+
+            <div class="scope-wrap">
+                <canvas id="scope"></canvas>
+            </div>
+
+            <div class="waterfall-wrap">
+                <canvas id="waterfall"></canvas>
+                <div class="wf-overlay" id="wfLabels"></div>
+            </div>
+            <div class="hover-readout" id="hoverReadout"></div>
+        </div>
+
+        <script>
+            // ===================================================================
+            //  Canvases
+            // ===================================================================
+            const wfCanvas = document.getElementById("waterfall");
+            const wfCtx = wfCanvas.getContext("2d");
+            const scCanvas = document.getElementById("scope");
+            const scCtx = scCanvas.getContext("2d");
+
+            let wfImageData = null;
+            let linesCount = 0;
+            let currentBins = null;
+            let wfRows = [];
+            let waterfallMin = 0;
+            let waterfallMax = 15;
+            let lutReady = false;
+
+            function resizeCanvases() {
+                const rect = wfCanvas.parentElement.getBoundingClientRect();
+                const w = Math.floor(rect.width);
+
+                wfCanvas.width = w;
+                wfCanvas.height = 400;
+
+                if (!wfImageData || wfImageData.width !== w) {
+                    wfImageData = wfCtx.createImageData(w, 400);
+                    for (let i = 0; i < wfImageData.data.length; i += 4) {
+                        wfImageData.data[i] = 0;
+                        wfImageData.data[i + 1] = 0;
+                        wfImageData.data[i + 2] = 0;
+                        wfImageData.data[i + 3] = 255;
+                    }
+                    wfCtx.putImageData(wfImageData, 0, 0);
+                    if (lutReady) redrawWaterfallHistory();
+                }
+
+                scCanvas.width = w;
+                scCanvas.height = 90;
+            }
+
+            window.addEventListener("resize", resizeCanvases);
+            resizeCanvases();
+
+            // ===================================================================
+            //  Color map: 0..255 -> RGB
+            // ===================================================================
+            const colorLUT = new Uint8Array(256 * 3);
+            (function buildLUT() {
+                for (let v = 0; v < 256; v++) {
+                    const t = v / 255;
+                    let r, g, b;
+                    if (t < 0.125) {
+                        r = 0;
+                        g = 0;
+                        b = t * 8 * 0.5;
+                    } else if (t < 0.25) {
+                        let u = (t - 0.125) * 8;
+                        r = 0;
+                        g = u * 0.3;
+                        b = 0.5 + u * 0.5;
+                    } else if (t < 0.375) {
+                        let u = (t - 0.25) * 8;
+                        r = 0;
+                        g = 0.3 + u * 0.7;
+                        b = 1.0;
+                    } else if (t < 0.5) {
+                        let u = (t - 0.375) * 8;
+                        r = u;
+                        g = 1.0;
+                        b = 1.0 - u;
+                    } else if (t < 0.625) {
+                        let u = (t - 0.5) * 8;
+                        r = 1.0;
+                        g = 1.0 - u * 0.3;
+                        b = 0;
+                    } else if (t < 0.75) {
+                        let u = (t - 0.625) * 8;
+                        r = 1.0;
+                        g = 0.7 - u * 0.5;
+                        b = 0;
+                    } else if (t < 0.875) {
+                        let u = (t - 0.75) * 8;
+                        r = 1.0;
+                        g = 0.2 + u * 0.5;
+                        b = u * 0.4;
+                    } else {
+                        let u = (t - 0.875) * 8;
+                        r = 1.0;
+                        g = 0.7 + u * 0.3;
+                        b = 0.4 + u * 0.6;
+                    }
+                    colorLUT[v * 3] = Math.min(255, Math.floor(r * 255));
+                    colorLUT[v * 3 + 1] = Math.min(255, Math.floor(g * 255));
+                    colorLUT[v * 3 + 2] = Math.min(255, Math.floor(b * 255));
+                }
+            })();
+            lutReady = true;
+
+            // ===================================================================
+            //  Draw one complete waterfall line from uint8 array
+            // ===================================================================
+            function getFrequencyAxis(freqStart, freqEnd, steps) {
+                if (steps > 1 && freqEnd > freqStart) {
+                    const step = (freqEnd - freqStart) / (steps - 1);
+                    return {
+                        left: freqStart - step / 2,
+                        right: freqEnd + step / 2,
+                        center: (freqStart + freqEnd) / 2,
+                        step,
+                    };
+                }
+                return {
+                    left: freqStart,
+                    right: freqEnd,
+                    center: (freqStart + freqEnd) / 2,
+                    step: 0,
+                };
+            }
+
+            function formatMHz(freq) {
+                return (freq / 1e6).toFixed(3) + " MHz";
+            }
+
+            function updateFrequencyLabels(freqStart, freqEnd, steps) {
+                const axis = getFrequencyAxis(freqStart, freqEnd, steps);
+                const overlay = document.getElementById("wfLabels");
+                const span = axis.right - axis.left;
+                const ticks = [
+                    { pos: 0, freq: axis.left },
+                    { pos: 25, freq: axis.left + span * 0.25 },
+                    { pos: 50, freq: axis.center },
+                    { pos: 75, freq: axis.left + span * 0.75 },
+                    { pos: 100, freq: axis.right },
+                ];
+
+                overlay.replaceChildren(
+                    ...ticks.map((tick) => {
+                        const mark = document.createElement("div");
+                        const label = document.createElement("div");
+                        mark.className = "wf-tick";
+                        mark.style.left = tick.pos + "%";
+                        label.className = "wf-tick-label";
+                        label.textContent = formatMHz(tick.freq);
+                        mark.appendChild(label);
+                        return mark;
+                    }),
+                );
+            }
+
+            function frequencyAt(canvas, clientX) {
+                const rect = canvas.getBoundingClientRect();
+                const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+                const axis = getFrequencyAxis(
+                    currentFreq0,
+                    currentFreq1,
+                    currentSteps,
+                );
+                if (axis.right <= axis.left || rect.width <= 0) return null;
+                return axis.left + (x / rect.width) * (axis.right - axis.left);
+            }
+
+            function mapWaterfallValue(value) {
+                const span = Math.max(1, waterfallMax - waterfallMin);
+                const scaled = ((value - waterfallMin) * 255) / span;
+                return Math.max(0, Math.min(255, Math.round(scaled)));
+            }
+
+            function writeWaterfallPixel(pix, offset, rawValue) {
+                const val = mapWaterfallValue(rawValue | 0);
+                pix[offset] = colorLUT[val * 3];
+                pix[offset + 1] = colorLUT[val * 3 + 1];
+                pix[offset + 2] = colorLUT[val * 3 + 2];
+                pix[offset + 3] = 255;
+            }
+
+            function clearWaterfallPixels() {
+                if (!wfImageData) return;
+                const pix = wfImageData.data;
+                for (let i = 0; i < pix.length; i += 4) {
+                    pix[i] = 0;
+                    pix[i + 1] = 0;
+                    pix[i + 2] = 0;
+                    pix[i + 3] = 255;
+                }
+            }
+
+            function redrawWaterfallHistory() {
+                if (!wfImageData) return;
+
+                const pix = wfImageData.data;
+                const w = wfImageData.width;
+                const h = wfImageData.height;
+                clearWaterfallPixels();
+
+                const rows = Math.min(wfRows.length, h);
+                for (let y = 0; y < rows; y++) {
+                    const row = wfRows[y];
+                    const n = row.length;
+                    const rowOffset = y * w * 4;
+                    for (let x = 0; x < w; x++) {
+                        const idx = Math.floor((x / w) * n);
+                        writeWaterfallPixel(pix, rowOffset + x * 4, row[idx]);
+                    }
+                }
+
+                wfCtx.putImageData(wfImageData, 0, 0);
+            }
+
+            function drawWaterfallLine(data, freqStart, freqEnd, steps) {
+                if (!wfImageData) return;
+                const pix = wfImageData.data;
+                const w = wfImageData.width;
+                const h = wfImageData.height;
+
+                wfRows.unshift(data.slice());
+                if (wfRows.length > h) wfRows.length = h;
+
+                // Scroll down by 1 pixel; newest scan line is written at the top.
+                pix.copyWithin(4 * w, 0, 4 * w * (h - 1));
+
+                const topRow = 0;
+
+                // Map data bins to canvas pixels
+                const n = data.length;
+                for (let x = 0; x < w; x++) {
+                    const idx = Math.floor((x / w) * n);
+                    const bi = topRow + x * 4;
+                    writeWaterfallPixel(pix, bi, data[idx]);
+                }
+
+                wfCtx.putImageData(wfImageData, 0, 0);
+
+                // Update frequency labels
+                updateFrequencyLabels(freqStart, freqEnd, steps);
+            }
+
+            // ===================================================================
+            //  Draw spectrum scope (most recent line)
+            // ===================================================================
+            const scopeHistory = [];
+
+            function drawScope(data, freqStart, freqEnd, steps) {
+                const w = scCanvas.width;
+                const h = scCanvas.height;
+                scCtx.fillStyle = "#000";
+                scCtx.fillRect(0, 0, w, h);
+
+                const n = data.length;
+                if (n < 2) return;
+
+                // Grid lines
+                scCtx.strokeStyle = "#1a2030";
+                scCtx.lineWidth = 1;
+                for (let i = 0; i < 5; i++) {
+                    const y = h * 0.2 * i;
+                    scCtx.beginPath();
+                    scCtx.moveTo(0, y);
+                    scCtx.lineTo(w, y);
+                    scCtx.stroke();
+                }
+
+                // The data is magnitude 0-255; draw the curve
+                scCtx.strokeStyle = "#40c0a0";
+                scCtx.lineWidth = 1.5;
+                scCtx.beginPath();
+                for (let x = 0; x < w; x++) {
+                    const idx = Math.floor((x / w) * n);
+                    const v = (data[idx] | 0) / 255;
+                    const y = h - 5 - v * (h - 10);
+                    if (x === 0) scCtx.moveTo(x, y);
+                    else scCtx.lineTo(x, y);
+                }
+                scCtx.stroke();
+
+                // Peak dot
+                let maxVal = 0,
+                    maxX = 0;
+                for (let i = 0; i < n; i++) {
+                    if (data[i] > maxVal) {
+                        maxVal = data[i];
+                        maxX = i;
+                    }
+                }
+                const px = (maxX / n) * w;
+                const py = h - 5 - (maxVal / 255) * (h - 10);
+                scCtx.fillStyle = "#ff8040";
+                scCtx.beginPath();
+                scCtx.arc(px, py, 3, 0, 2 * Math.PI);
+                scCtx.fill();
+
+                // Frequency labels
+                scCtx.fillStyle = "#506070";
+                scCtx.font = "10px monospace";
+                scCtx.textAlign = "center";
+                const axis = getFrequencyAxis(freqStart, freqEnd, steps);
+                scCtx.fillText((axis.left / 1e6).toFixed(1) + "M", 40, h - 2);
+                scCtx.fillText(
+                    (axis.center / 1e6).toFixed(1) + "M",
+                    w / 2,
+                    h - 2,
+                );
+                scCtx.fillText((axis.right / 1e6).toFixed(1) + "M", w - 40, h - 2);
+            }
+
+            // ===================================================================
+            //  SSE connection
+            // ===================================================================
+            let eventSource = null;
+            let currentFreq0 = 0,
+                currentFreq1 = 0,
+                currentSteps = 0;
+
+            function connectSSE() {
+                if (eventSource) eventSource.close();
+                eventSource = new EventSource("/api/waterfall");
+
+                eventSource.addEventListener("line", function (e) {
+                    try {
+                        const data = JSON.parse(e.data);
+                        const bins = data.d; // uint8 array
+                        const f0 = data.f0 || 0; // start freq
+                        const f1 = data.f1 || 0; // end freq
+                        if (f0) currentFreq0 = f0;
+                        if (f1) currentFreq1 = f1;
+                        if (data.b) currentSteps = data.b;
+                        currentBins = bins;
+
+                        drawWaterfallLine(
+                            bins,
+                            currentFreq0,
+                            currentFreq1,
+                            currentSteps,
+                        );
+                        drawScope(
+                            bins,
+                            currentFreq0,
+                            currentFreq1,
+                            currentSteps,
+                        );
+
+                        linesCount++;
+                        document.getElementById("infoLines").textContent =
+                            linesCount;
+                        document.getElementById("infoRange").textContent =
+                            (currentFreq0 / 1e6).toFixed(0) +
+                            " - " +
+                            (currentFreq1 / 1e6).toFixed(0) +
+                            " MHz";
+                        if (data.b)
+                            document.getElementById("infoSteps").textContent =
+                                data.b;
+                    } catch (e) {
+                        /* ignore parse errors */
+                    }
+                });
+
+                eventSource.onerror = function () {
+                    /* auto-reconnect */
+                };
+            }
+
+            function disconnectSSE() {
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                }
+            }
+
+            // ===================================================================
+            //  Hover readout
+            // ===================================================================
+            const hoverReadout = document.getElementById("hoverReadout");
+
+            function showHoverReadout(canvas, evt, includeLevel) {
+                if (!currentFreq0 || !currentFreq1 || !currentSteps) {
+                    hoverReadout.style.display = "none";
+                    return;
+                }
+
+                const freq = frequencyAt(canvas, evt.clientX);
+                if (freq === null) {
+                    hoverReadout.style.display = "none";
+                    return;
+                }
+
+                let text = formatMHz(freq);
+                if (includeLevel && currentBins && currentBins.length) {
+                    const rect = canvas.getBoundingClientRect();
+                    const x = Math.max(
+                        0,
+                        Math.min(rect.width - 1, evt.clientX - rect.left),
+                    );
+                    const idx = Math.max(
+                        0,
+                        Math.min(
+                            currentBins.length - 1,
+                            Math.floor((x / rect.width) * currentBins.length),
+                        ),
+                    );
+                    text += "  " + (currentBins[idx] | 0);
+                }
+
+                hoverReadout.textContent = text;
+                hoverReadout.style.left = evt.clientX + 12 + "px";
+                hoverReadout.style.top = evt.clientY + 12 + "px";
+                hoverReadout.style.display = "block";
+            }
+
+            function hideHoverReadout() {
+                hoverReadout.style.display = "none";
+            }
+
+            wfCanvas.addEventListener("mousemove", (evt) =>
+                showHoverReadout(wfCanvas, evt, false),
+            );
+            scCanvas.addEventListener("mousemove", (evt) =>
+                showHoverReadout(scCanvas, evt, true),
+            );
+            wfCanvas.addEventListener("mouseleave", hideHoverReadout);
+            scCanvas.addEventListener("mouseleave", hideHoverReadout);
+
+            // ===================================================================
+            //  API calls
+            // ===================================================================
+            async function apiPost(url, body) {
+                try {
+                    const resp = await fetch(url, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body),
+                    });
+                    return await resp.json();
+                } catch (e) {
+                    return { status: "error" };
+                }
+            }
+
+            async function apiGet(url) {
+                try {
+                    const resp = await fetch(url);
+                    return await resp.json();
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            // ===================================================================
+            //  UI
+            // ===================================================================
+            function updateUI(running) {
+                document.getElementById("btnStart").disabled = running;
+                document.getElementById("btnStop").disabled = !running;
+                const dot = document.getElementById("statusDot");
+                dot.className = "status-dot " + (running ? "running" : "idle");
+                document.getElementById("statusText").textContent = running
+                    ? "scanning"
+                    : "idle";
+            }
+
+            let gainUpdateTimer = null;
+            function scheduleGainUpdate() {
+                if (gainUpdateTimer) clearTimeout(gainUpdateTimer);
+                gainUpdateTimer = setTimeout(async function () {
+                    gainUpdateTimer = null;
+                    const result = await apiPost("/api/gain", {
+                        lna_gain: parseInt(
+                            document.getElementById("lnaGain").value,
+                        ),
+                        vga_gain: parseInt(
+                            document.getElementById("vgaGain").value,
+                        ),
+                    });
+                    if (result && result.status === "ok") {
+                        document.getElementById("lnaGain").value =
+                            result.lna_gain;
+                        document.getElementById("lnaVal").textContent =
+                            result.lna_gain;
+                        document.getElementById("vgaGain").value =
+                            result.vga_gain;
+                        document.getElementById("vgaVal").textContent =
+                            result.vga_gain;
+                    }
+                }, 80);
+            }
+
+            document
+                .getElementById("btnStart")
+                .addEventListener("click", async function () {
+                    const body = {
+                        freq_start: parseFloat(
+                            document.getElementById("freqStart").value,
+                        ),
+                        freq_end: parseFloat(
+                            document.getElementById("freqEnd").value,
+                        ),
+                        samplerate: parseFloat(
+                            document.getElementById("samplerate").value,
+                        ),
+                        bw_ratio: parseFloat(
+                            document.getElementById("bwRatio").value,
+                        ),
+                        lna_gain: parseInt(
+                            document.getElementById("lnaGain").value,
+                        ),
+                        vga_gain: parseInt(
+                            document.getElementById("vgaGain").value,
+                        ),
+                        direct_sampling: parseInt(
+                            document.getElementById("directSampling").value,
+                        ),
+                    };
+                    const result = await apiPost("/api/start", body);
+                    if (result && result.status === "ok") {
+                        updateUI(true);
+                        linesCount = 0;
+                        wfRows = [];
+                        clearWaterfallPixels();
+                        if (wfImageData) wfCtx.putImageData(wfImageData, 0, 0);
+                        connectSSE();
+                    }
+                });
+
+            document
+                .getElementById("btnStop")
+                .addEventListener("click", async function () {
+                    const result = await apiPost("/api/stop", {});
+                    if (result && result.status === "ok") {
+                        updateUI(false);
+                        disconnectSSE();
+                    }
+                });
+
+            document
+                .getElementById("lnaGain")
+                .addEventListener("input", function () {
+                    document.getElementById("lnaVal").textContent = this.value;
+                    scheduleGainUpdate();
+                });
+            document
+                .getElementById("vgaGain")
+                .addEventListener("input", function () {
+                    document.getElementById("vgaVal").textContent = this.value;
+                    scheduleGainUpdate();
+                });
+            function syncWaterfallBrightness(changed) {
+                const minEl = document.getElementById("wfMin");
+                const maxEl = document.getElementById("wfMax");
+                let minVal = parseInt(minEl.value, 10);
+                let maxVal = parseInt(maxEl.value, 10);
+
+                if (minVal >= maxVal) {
+                    if (changed === "min") minVal = Math.max(0, maxVal - 1);
+                    else maxVal = Math.min(255, minVal + 1);
+                }
+
+                waterfallMin = minVal;
+                waterfallMax = maxVal;
+                minEl.value = minVal;
+                maxEl.value = maxVal;
+                document.getElementById("wfMinVal").textContent = minVal;
+                document.getElementById("wfMaxVal").textContent = maxVal;
+                redrawWaterfallHistory();
+            }
+
+            document
+                .getElementById("wfMin")
+                .addEventListener("input", () => syncWaterfallBrightness("min"));
+            document
+                .getElementById("wfMax")
+                .addEventListener("input", () => syncWaterfallBrightness("max"));
+
+            // ===================================================================
+            //  Init
+            // ===================================================================
+            (async function init() {
+                const status = await apiGet("/api/status");
+                if (status) {
+                    document.getElementById("infoHw").textContent =
+                        status.hardware || "---";
+                    document.getElementById("infoFw").textContent =
+                        status.firmware || "---";
+                    document.getElementById("infoSn").textContent =
+                        status.serial || "---";
+                    if (status.steps)
+                        document.getElementById("infoSteps").textContent =
+                            status.steps;
+                    currentSteps = status.steps || 0;
+                    currentFreq0 = status.freq_start || 0;
+                    currentFreq1 = status.freq_end || 0;
+                    if (currentFreq0 && currentFreq1 && currentSteps)
+                        updateFrequencyLabels(
+                            currentFreq0,
+                            currentFreq1,
+                            currentSteps,
+                        );
+                    if (status.scanning) {
+                        updateUI(true);
+                        connectSSE();
+                    }
+                    if (status.freq_start)
+                        document.getElementById("freqStart").value =
+                            status.freq_start / 1e6;
+                    if (status.freq_end)
+                        document.getElementById("freqEnd").value =
+                            status.freq_end / 1e6;
+                    if (status.samplerate) {
+                        const sel = document.getElementById("samplerate");
+                        for (let opt of sel.options)
+                            if (parseFloat(opt.value) === status.samplerate) {
+                                sel.value = opt.value;
+                                break;
+                            }
+                    }
+                    if (status.bw_ratio) {
+                        const sel = document.getElementById("bwRatio");
+                        for (let opt of sel.options)
+                            if (parseFloat(opt.value) === status.bw_ratio) {
+                                sel.value = opt.value;
+                                break;
+                            }
+                    }
+                    if (status.lna_gain !== undefined) {
+                        document.getElementById("lnaGain").value =
+                            status.lna_gain;
+                        document.getElementById("lnaVal").textContent =
+                            status.lna_gain;
+                    }
+                    if (status.vga_gain !== undefined) {
+                        document.getElementById("vgaGain").value =
+                            status.vga_gain;
+                        document.getElementById("vgaVal").textContent =
+                            status.vga_gain;
+                    }
+                    if (status.direct_sampling !== undefined)
+                        document.getElementById("directSampling").value =
+                            status.direct_sampling;
+                }
+            })();
+        </script>
+    </body>
+</html>

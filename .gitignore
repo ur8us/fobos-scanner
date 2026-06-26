@@ -1,0 +1,9 @@
+fobos-scanner
+*.o
+*.so
+*.a
+*.d
+*.log
+core
+core.*
+scanner-deepseek
