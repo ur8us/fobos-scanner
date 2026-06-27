@@ -456,6 +456,12 @@
             let backendOnline = false;
             let scanRequestSerial = 0;
             let statusPollInFlight = false;
+            let redrawFrame = 0;
+            let waterfallRenderToken = 0;
+            let waterfallRenderActiveToken = 0;
+            let binRangeCache = null;
+            const MAX_WF_HISTORY_BINS = 12000000;
+            const WF_REDRAW_ROWS_PER_FRAME = 24;
 
             function resizeCanvases() {
                 const rect = wfCanvas.parentElement.getBoundingClientRect();
@@ -473,11 +479,12 @@
                         wfImageData.data[i + 3] = 255;
                     }
                     wfCtx.putImageData(wfImageData, 0, 0);
-                    if (lutReady) redrawWaterfallHistory();
+                    if (lutReady) scheduleCurrentViewRedraw();
                 }
 
                 scCanvas.width = w;
                 scCanvas.height = 135;
+                binRangeCache = null;
             }
 
             window.addEventListener("resize", resizeCanvases);
@@ -643,16 +650,96 @@
                     data.length,
                     zoomRange,
                 );
+                return dataPeakForBinRange(data, binRange.first, binRange.last);
+            }
+
+            function dataPeakForBinRange(data, first, last) {
+                if (last <= first + 1) return data[first] | 0;
                 let peak = 0;
-                for (let i = binRange.first; i < binRange.last; i++) {
+                for (let i = first; i < last; i++) {
                     if (data[i] > peak) peak = data[i];
                 }
                 return peak | 0;
             }
 
-            function redrawCurrentView() {
+            function buildCanvasBinRanges(width, binCount, zoomRange) {
+                const firstBins = new Uint32Array(width);
+                const lastBins = new Uint32Array(width);
+                if (!binCount || binCount <= 0 || width <= 0) {
+                    return { first: firstBins, last: lastBins };
+                }
+
+                const range = zoomRange || clampZoomRange(binCount);
+                const span = range.right - range.left;
+                for (let x = 0; x < width; x++) {
+                    const leftFrac = Math.max(0, Math.min(1, x / width));
+                    const rightFrac = Math.max(
+                        0,
+                        Math.min(1, (x + 1) / width),
+                    );
+                    let first = Math.floor(
+                        (range.left + leftFrac * span) * binCount,
+                    );
+                    let last = Math.ceil(
+                        (range.left + rightFrac * span) * binCount,
+                    );
+                    first = Math.max(0, Math.min(binCount - 1, first));
+                    last = Math.max(first + 1, Math.min(binCount, last));
+                    firstBins[x] = first;
+                    lastBins[x] = last;
+                }
+                return { first: firstBins, last: lastBins };
+            }
+
+            function getCanvasBinRanges(width, binCount, zoomRange) {
+                const left = zoomRange ? zoomRange.left : zoomLeft;
+                const right = zoomRange ? zoomRange.right : zoomRight;
+                if (
+                    binRangeCache &&
+                    binRangeCache.width === width &&
+                    binRangeCache.binCount === binCount &&
+                    binRangeCache.left === left &&
+                    binRangeCache.right === right
+                ) {
+                    return binRangeCache.ranges;
+                }
+
+                const ranges = buildCanvasBinRanges(width, binCount, zoomRange);
+                binRangeCache = { width, binCount, left, right, ranges };
+                return ranges;
+            }
+
+            function trimWaterfallHistory(rowLength) {
+                const h = wfImageData ? wfImageData.height : 600;
+                const maxRowsByBins = Math.max(
+                    1,
+                    Math.floor(MAX_WF_HISTORY_BINS / Math.max(1, rowLength)),
+                );
+                const maxRows = Math.max(1, Math.min(h, maxRowsByBins));
+                if (wfRows.length > maxRows) wfRows.length = maxRows;
+            }
+
+            function cancelCurrentViewRedraw() {
+                waterfallRenderToken++;
+                waterfallRenderActiveToken = 0;
+                if (redrawFrame) {
+                    cancelAnimationFrame(redrawFrame);
+                    redrawFrame = 0;
+                }
+            }
+
+            function scheduleCurrentViewRedraw() {
+                waterfallRenderToken++;
+                if (redrawFrame) return;
+                redrawFrame = requestAnimationFrame(() => {
+                    redrawFrame = 0;
+                    redrawCurrentView(waterfallRenderToken);
+                });
+            }
+
+            function redrawCurrentView(renderToken) {
                 if (currentBins && currentBins.length) {
-                    redrawWaterfallHistory();
+                    redrawWaterfallHistory(renderToken);
                     drawScope(
                         currentBins,
                         currentFreq0,
@@ -770,55 +857,110 @@
                 }
             }
 
-            function redrawWaterfallHistory() {
+            function redrawWaterfallHistory(renderToken) {
                 if (!wfImageData) return;
 
-                const pix = wfImageData.data;
                 const w = wfImageData.width;
                 const h = wfImageData.height;
-                clearWaterfallPixels();
-
+                const imageData = wfCtx.createImageData(w, h);
+                const pix = imageData.data;
                 const rows = Math.min(wfRows.length, h);
-                for (let y = 0; y < rows; y++) {
-                    const row = wfRows[y];
-                    const n = row.length;
-                    const range = clampZoomRange(n);
-                    const rowOffset = y * w * 4;
-                    for (let x = 0; x < w; x++) {
-                        writeWaterfallPixel(
-                            pix,
-                            rowOffset + x * 4,
-                            dataPeakForCanvasX(row, x, w, range),
-                        );
+                const sourceRows = wfRows.slice(0, rows);
+                let y = 0;
+                let cachedRanges = null;
+                let cachedBinCount = 0;
+
+                waterfallRenderActiveToken = renderToken;
+
+                function finishRender() {
+                    if (waterfallRenderActiveToken === renderToken) {
+                        waterfallRenderActiveToken = 0;
                     }
                 }
 
-                wfCtx.putImageData(wfImageData, 0, 0);
+                function drawChunk() {
+                    if (renderToken !== waterfallRenderToken || !wfImageData) {
+                        finishRender();
+                        return;
+                    }
+
+                    const stop = Math.min(rows, y + WF_REDRAW_ROWS_PER_FRAME);
+                    for (; y < stop; y++) {
+                        const row = sourceRows[y];
+                        const n = row.length;
+                        if (!n) continue;
+                        if (!cachedRanges || cachedBinCount !== n) {
+                            cachedBinCount = n;
+                            cachedRanges = getCanvasBinRanges(
+                                w,
+                                n,
+                                clampZoomRange(n),
+                            );
+                        }
+                        const rowOffset = y * w * 4;
+                        for (let x = 0; x < w; x++) {
+                            writeWaterfallPixel(
+                                pix,
+                                rowOffset + x * 4,
+                                dataPeakForBinRange(
+                                    row,
+                                    cachedRanges.first[x],
+                                    cachedRanges.last[x],
+                                ),
+                            );
+                        }
+                    }
+
+                    if (y < rows) {
+                        requestAnimationFrame(drawChunk);
+                        return;
+                    }
+
+                    if (
+                        renderToken === waterfallRenderToken &&
+                        wfImageData &&
+                        wfImageData.width === w &&
+                        wfImageData.height === h
+                    ) {
+                        wfImageData = imageData;
+                        wfCtx.putImageData(wfImageData, 0, 0);
+                    }
+                    finishRender();
+                }
+
+                drawChunk();
             }
 
             function drawWaterfallLine(data, freqStart, freqEnd, steps) {
                 if (!wfImageData) return;
+                const wasRendering = waterfallRenderActiveToken !== 0;
+                waterfallRenderToken++;
+
                 const pix = wfImageData.data;
                 const w = wfImageData.width;
-                const h = wfImageData.height;
 
-                wfRows.unshift(data.slice());
-                if (wfRows.length > h) wfRows.length = h;
+                wfRows.unshift(data);
+                trimWaterfallHistory(data.length);
 
                 // Scroll down by 1 pixel; newest scan line is written at the top.
-                pix.copyWithin(4 * w, 0, 4 * w * (h - 1));
+                pix.copyWithin(4 * w, 0, 4 * w * (wfImageData.height - 1));
 
                 const topRow = 0;
 
                 // Map data bins to canvas pixels
                 const n = data.length;
                 const range = clampZoomRange(n);
+                const binRanges = getCanvasBinRanges(w, n, range);
                 for (let x = 0; x < w; x++) {
                     const bi = topRow + x * 4;
                     writeWaterfallPixel(
                         pix,
                         bi,
-                        dataPeakForCanvasX(data, x, w, range),
+                        dataPeakForBinRange(
+                            data,
+                            binRanges.first[x],
+                            binRanges.last[x],
+                        ),
                     );
                 }
 
@@ -826,6 +968,7 @@
 
                 // Update frequency labels
                 updateFrequencyLabels(freqStart, freqEnd, steps);
+                if (wasRendering) scheduleCurrentViewRedraw();
             }
 
             // ===================================================================
@@ -858,8 +1001,14 @@
                 scCtx.lineWidth = 1.5;
                 scCtx.beginPath();
                 const range = clampZoomRange(n);
+                const binRanges = getCanvasBinRanges(w, n, range);
                 for (let x = 0; x < w; x++) {
-                    const v = dataPeakForCanvasX(data, x, w, range) / 255;
+                    const v =
+                        dataPeakForBinRange(
+                            data,
+                            binRanges.first[x],
+                            binRanges.last[x],
+                        ) / 255;
                     const y = h - 5 - v * (h - 10);
                     if (x === 0) scCtx.moveTo(x, y);
                     else scCtx.lineTo(x, y);
@@ -907,7 +1056,8 @@
                 eventSource.addEventListener("line", function (e) {
                     try {
                         const data = JSON.parse(e.data);
-                        const bins = data.d; // uint8 array
+                        const bins = Uint8Array.from(data.d || []);
+                        if (!bins.length) return;
                         const f0 = data.f0 || 0; // start freq
                         const f1 = data.f1 || 0; // end freq
                         if (f0) currentFreq0 = f0;
@@ -1063,7 +1213,7 @@
 
                 zoomLeft = Math.max(0, left);
                 zoomRight = Math.min(1, right);
-                redrawCurrentView();
+                scheduleCurrentViewRedraw();
             }
 
             function setZoomCursor(active) {
@@ -1268,6 +1418,7 @@
             }
 
             function clearScanDisplay() {
+                cancelCurrentViewRedraw();
                 linesCount = 0;
                 wfRows = [];
                 clearWaterfallPixels();
@@ -1388,7 +1539,7 @@
                 document.getElementById("wfMaxVal").textContent = maxVal;
                 localStorage.setItem("wfMin", minVal);
                 localStorage.setItem("wfMax", maxVal);
-                redrawWaterfallHistory();
+                scheduleCurrentViewRedraw();
             }
 
             document
