@@ -73,11 +73,17 @@
                 display: block;
                 width: 100%;
                 height: 600px;
-                cursor: crosshair;
+                cursor: grab;
+            }
+            #waterfall:active {
+                cursor: grabbing;
             }
             body.zoom-mode #waterfall,
             body.zoom-mode #scope {
                 cursor: zoom-in;
+            }
+            body.panning-mode #waterfall {
+                cursor: grabbing;
             }
             .freq-scale {
                 position: relative;
@@ -108,11 +114,11 @@
                 text-shadow: 0 1px 2px #000;
                 white-space: nowrap;
             }
-            .wf-tick:first-child .wf-tick-label {
+            .wf-tick.edge-start .wf-tick-label {
                 left: 0;
                 transform: none;
             }
-            .wf-tick:last-child .wf-tick-label {
+            .wf-tick.edge-end .wf-tick-label {
                 right: 0;
                 left: auto;
                 transform: none;
@@ -282,6 +288,7 @@
                 <span>Scan: <span class="val" id="infoRange">---</span></span>
                 <span>Steps: <span class="val" id="infoSteps">---</span></span>
                 <span>Lines: <span class="val" id="infoLines">0</span></span>
+                <span>Zoom (press SHIFT): <span class="val" id="infoZoom">1.00x</span></span>
             </div>
 
             <div class="controls">
@@ -446,6 +453,8 @@
             let wfImageData = null;
             let linesCount = 0;
             let currentBins = null;
+            let currentBinsFreq0 = 0;
+            let currentBinsFreq1 = 0;
             let wfRows = [];
             let waterfallMin = 0;
             let waterfallMax = 15;
@@ -456,10 +465,28 @@
             let backendOnline = false;
             let scanRequestSerial = 0;
             let statusPollInFlight = false;
+            let configuredFreq0 = 0;
+            let configuredFreq1 = 0;
+            let currentFreq0 = 0;
+            let currentFreq1 = 0;
+            let currentSteps = 0;
+            let currentConverterFreq = 0;
+            let currentViewId = 0;
+            let viewRequestSerial = 0;
+            let viewUpdateTimer = null;
+            let pendingViewChange = false;
+            let pendingView = null;
+            let panActive = false;
+            let panStartX = 0;
+            let panStartFreq0 = 0;
+            let panStartFreq1 = 0;
             let redrawFrame = 0;
             let waterfallRenderToken = 0;
             let waterfallRenderActiveToken = 0;
             let binRangeCache = null;
+            const MAX_ZOOM_FACTOR = 10000;
+            const TICK_MIN_COUNT = 5;
+            const TICK_MAX_COUNT = 13;
             const MAX_WF_HISTORY_BINS = 12000000;
             const WF_REDRAW_ROWS_PER_FRAME = 24;
 
@@ -485,10 +512,15 @@
                 scCanvas.width = w;
                 scCanvas.height = 135;
                 binRangeCache = null;
+                scheduleViewUpdate(currentFreq0, currentFreq1, false);
             }
 
             window.addEventListener("resize", resizeCanvases);
             resizeCanvases();
+
+            function displayBins() {
+                return Math.max(1, Math.floor(wfCanvas.width || 1));
+            }
 
             // ===================================================================
             //  Color map: 0..255 -> RGB
@@ -561,8 +593,8 @@
             }
 
             function minZoomSpan(binCount) {
-                if (!binCount || binCount <= 0) return 0.002;
-                return Math.min(1, Math.max(4 / binCount, 0.002));
+                if (!binCount || binCount <= 0) return 1 / MAX_ZOOM_FACTOR;
+                return Math.min(1, Math.max(1 / binCount, 1 / MAX_ZOOM_FACTOR));
             }
 
             function clampZoomRange(binCount) {
@@ -662,6 +694,72 @@
                 return peak | 0;
             }
 
+            function sameFrequencySpan(a0, a1, b0, b1) {
+                const span = Math.max(
+                    1,
+                    Math.abs(a1 - a0),
+                    Math.abs(b1 - b0),
+                );
+                const tol = Math.max(1, span * 1e-9);
+                return Math.abs(a0 - b0) <= tol && Math.abs(a1 - b1) <= tol;
+            }
+
+            function dataPeakForAxis(
+                data,
+                x,
+                width,
+                targetAxis,
+                sourceStart,
+                sourceEnd,
+            ) {
+                const n = data ? data.length : 0;
+                if (
+                    !n ||
+                    width <= 0 ||
+                    !targetAxis ||
+                    targetAxis.right <= targetAxis.left ||
+                    sourceEnd <= sourceStart
+                ) {
+                    return 0;
+                }
+
+                const targetStart = targetAxis.left;
+                const targetEnd = targetAxis.right;
+                const targetSpan = targetEnd - targetStart;
+                if (
+                    n === Math.floor(width) &&
+                    sameFrequencySpan(targetStart, targetEnd, sourceStart, sourceEnd)
+                ) {
+                    const px = Math.max(0, Math.min(n - 1, Math.floor(x)));
+                    return data[px] | 0;
+                }
+
+                const leftFrac = Math.max(0, Math.min(1, x / width));
+                const rightFrac = Math.max(0, Math.min(1, (x + 1) / width));
+                const binFreq0 = targetStart + leftFrac * targetSpan;
+                const binFreq1 = targetStart + rightFrac * targetSpan;
+                const overlapStart = Math.max(
+                    Math.min(binFreq0, binFreq1),
+                    sourceStart,
+                );
+                const overlapEnd = Math.min(
+                    Math.max(binFreq0, binFreq1),
+                    sourceEnd,
+                );
+                if (overlapEnd <= overlapStart) return 0;
+
+                const sourceSpan = sourceEnd - sourceStart;
+                let first = Math.floor(
+                    ((overlapStart - sourceStart) / sourceSpan) * n,
+                );
+                let last = Math.ceil(
+                    ((overlapEnd - sourceStart) / sourceSpan) * n,
+                );
+                first = Math.max(0, Math.min(n - 1, first));
+                last = Math.max(first + 1, Math.min(n, last));
+                return dataPeakForBinRange(data, first, last);
+            }
+
             function buildCanvasBinRanges(width, binCount, zoomRange) {
                 const firstBins = new Uint32Array(width);
                 const lastBins = new Uint32Array(width);
@@ -742,8 +840,8 @@
                     redrawWaterfallHistory(renderToken);
                     drawScope(
                         currentBins,
-                        currentFreq0,
-                        currentFreq1,
+                        currentBinsFreq0 || currentFreq0,
+                        currentBinsFreq1 || currentFreq1,
                         currentSteps,
                     );
                 }
@@ -778,35 +876,139 @@
                 );
             }
 
+            function tickTargetCount(width) {
+                const px = width || wfCanvas.width || 800;
+                return Math.max(
+                    TICK_MIN_COUNT,
+                    Math.min(TICK_MAX_COUNT, Math.floor(px / 80) + 1),
+                );
+            }
+
+            function countTicksForStep(left, right, step) {
+                if (step <= 0 || right <= left) return 0;
+                const eps = step * 1e-9;
+                const first = Math.ceil((left - eps) / step) * step;
+                const last = Math.floor((right + eps) / step) * step;
+                if (last < first) return 0;
+                return Math.floor((last - first) / step) + 1;
+            }
+
+            function niceFrequencySteps(span) {
+                const steps = [];
+                if (span <= 0) return steps;
+                const minPow = Math.floor(Math.log10(span)) - 6;
+                const maxPow = Math.floor(Math.log10(span)) + 1;
+                const bases = [1, 2, 2.5, 5, 10];
+                for (let pow = minPow; pow <= maxPow; pow++) {
+                    const scale = Math.pow(10, pow);
+                    for (const base of bases) {
+                        const step = base * scale;
+                        if (step >= 1000) steps.push(step);
+                    }
+                }
+                return [...new Set(steps)].sort((a, b) => a - b);
+            }
+
+            function chooseFrequencyStep(left, right, width) {
+                const span = right - left;
+                const target = tickTargetCount(width);
+                let best = null;
+                for (const step of niceFrequencySteps(span)) {
+                    const count = countTicksForStep(left, right, step);
+                    if (count < TICK_MIN_COUNT || count > TICK_MAX_COUNT) {
+                        continue;
+                    }
+                    const score = Math.abs(count - target);
+                    if (
+                        !best ||
+                        score < best.score ||
+                        (score === best.score && count > best.count)
+                    ) {
+                        best = { step, count, score };
+                    }
+                }
+                if (best) return best.step;
+
+                const fallback = span / Math.max(1, TICK_MIN_COUNT - 1);
+                return niceFrequencySteps(span).reduce((chosen, step) => {
+                    if (step <= fallback) return step;
+                    return chosen;
+                }, fallback);
+            }
+
+            function decimalsForFrequencyStep(stepHz) {
+                const stepMHz = stepHz / 1e6;
+                for (let decimals = 0; decimals <= 3; decimals++) {
+                    const scaled = stepMHz * Math.pow(10, decimals);
+                    if (Math.abs(scaled - Math.round(scaled)) < 1e-6)
+                        return decimals;
+                }
+                return 3;
+            }
+
+            function formatTickMHz(freq, stepHz) {
+                const decimals = decimalsForFrequencyStep(stepHz);
+                return (freq / 1e6).toFixed(decimals) + " MHz";
+            }
+
+            function buildFrequencyTicks(left, right, width) {
+                if (right <= left) return [];
+                const step = chooseFrequencyStep(left, right, width);
+                const ticks = [];
+                const eps = step * 1e-9;
+                let freq = Math.ceil((left - eps) / step) * step;
+                const end = Math.floor((right + eps) / step) * step;
+                while (freq <= end + eps && ticks.length <= TICK_MAX_COUNT) {
+                    const pos = ((freq - left) / (right - left)) * 100;
+                    ticks.push({
+                        pos: Math.max(0, Math.min(100, pos)),
+                        freq,
+                        step,
+                    });
+                    freq += step;
+                }
+                return ticks;
+            }
+
+            function updateZoomIndicator() {
+                const fullSpan = configuredFreq1 - configuredFreq0;
+                const viewSpan = currentFreq1 - currentFreq0;
+                let zoom = 1;
+                if (fullSpan > 0 && viewSpan > 0)
+                    zoom = Math.max(1, fullSpan / viewSpan);
+                document.getElementById("infoZoom").textContent =
+                    zoom < 10 ? zoom.toFixed(2) + "x" : zoom.toFixed(1) + "x";
+            }
+
             function updateFrequencyLabels(freqStart, freqEnd, steps) {
+                const overlay = document.getElementById("freqScale");
                 const axis = getZoomedFrequencyAxis(
                     freqStart,
                     freqEnd,
                     steps,
                     currentBins ? currentBins.length : 0,
                 );
-                const overlay = document.getElementById("freqScale");
-                const span = axis.right - axis.left;
-                const ticks = [
-                    { pos: 0, freq: axis.left },
-                    { pos: 25, freq: axis.left + span * 0.25 },
-                    { pos: 50, freq: axis.center },
-                    { pos: 75, freq: axis.left + span * 0.75 },
-                    { pos: 100, freq: axis.right },
-                ];
+                const ticks = buildFrequencyTicks(
+                    axis.left,
+                    axis.right,
+                    overlay.clientWidth || wfCanvas.width,
+                );
 
                 overlay.replaceChildren(
                     ...ticks.map((tick) => {
                         const mark = document.createElement("div");
                         const label = document.createElement("div");
                         mark.className = "wf-tick";
+                        if (tick.pos < 2) mark.classList.add("edge-start");
+                        if (tick.pos > 98) mark.classList.add("edge-end");
                         mark.style.left = tick.pos + "%";
                         label.className = "wf-tick-label";
-                        label.textContent = formatMHz(tick.freq);
+                        label.textContent = formatTickMHz(tick.freq, tick.step);
                         mark.appendChild(label);
                         return mark;
                     }),
                 );
+                updateZoomIndicator();
             }
 
             function frequencyAt(canvas, clientX) {
@@ -887,9 +1089,28 @@
                     const stop = Math.min(rows, y + WF_REDRAW_ROWS_PER_FRAME);
                     for (; y < stop; y++) {
                         const row = sourceRows[y];
-                        const n = row.length;
+                        const rowData = row.data || row;
+                        const n = rowData.length;
                         if (!n) continue;
-                        if (!cachedRanges || cachedBinCount !== n) {
+                        const sourceStart = row.f0 || currentFreq0;
+                        const sourceEnd = row.f1 || currentFreq1;
+                        const targetAxis = getZoomedFrequencyAxis(
+                            currentFreq0,
+                            currentFreq1,
+                            currentSteps,
+                            n,
+                        );
+                        const sameAxis = sameFrequencySpan(
+                            targetAxis.left,
+                            targetAxis.right,
+                            sourceStart,
+                            sourceEnd,
+                        );
+                        if (
+                            sameAxis &&
+                            n !== w &&
+                            (!cachedRanges || cachedBinCount !== n)
+                        ) {
                             cachedBinCount = n;
                             cachedRanges = getCanvasBinRanges(
                                 w,
@@ -899,14 +1120,27 @@
                         }
                         const rowOffset = y * w * 4;
                         for (let x = 0; x < w; x++) {
+                            const value =
+                                sameAxis && n === w
+                                    ? rowData[x]
+                                    : sameAxis
+                                      ? dataPeakForBinRange(
+                                            rowData,
+                                            cachedRanges.first[x],
+                                            cachedRanges.last[x],
+                                        )
+                                      : dataPeakForAxis(
+                                            rowData,
+                                            x,
+                                            w,
+                                            targetAxis,
+                                            sourceStart,
+                                            sourceEnd,
+                                        );
                             writeWaterfallPixel(
                                 pix,
                                 rowOffset + x * 4,
-                                dataPeakForBinRange(
-                                    row,
-                                    cachedRanges.first[x],
-                                    cachedRanges.last[x],
-                                ),
+                                value,
                             );
                         }
                     }
@@ -939,7 +1173,7 @@
                 const pix = wfImageData.data;
                 const w = wfImageData.width;
 
-                wfRows.unshift(data);
+                wfRows.unshift({ data, f0: freqStart, f1: freqEnd });
                 trimWaterfallHistory(data.length);
 
                 // Scroll down by 1 pixel; newest scan line is written at the top.
@@ -949,25 +1183,51 @@
 
                 // Map data bins to canvas pixels
                 const n = data.length;
-                const range = clampZoomRange(n);
-                const binRanges = getCanvasBinRanges(w, n, range);
+                const targetAxis = getZoomedFrequencyAxis(
+                    currentFreq0,
+                    currentFreq1,
+                    steps,
+                    n,
+                );
+                const sameAxis = sameFrequencySpan(
+                    targetAxis.left,
+                    targetAxis.right,
+                    freqStart,
+                    freqEnd,
+                );
+                const range = sameAxis ? clampZoomRange(n) : null;
+                const binRanges =
+                    sameAxis && n !== w ? getCanvasBinRanges(w, n, range) : null;
                 for (let x = 0; x < w; x++) {
                     const bi = topRow + x * 4;
+                    const value =
+                        sameAxis && n === w
+                            ? data[x]
+                            : sameAxis
+                              ? dataPeakForBinRange(
+                                    data,
+                                    binRanges.first[x],
+                                    binRanges.last[x],
+                                )
+                              : dataPeakForAxis(
+                                    data,
+                                    x,
+                                    w,
+                                    targetAxis,
+                                    freqStart,
+                                    freqEnd,
+                                );
                     writeWaterfallPixel(
                         pix,
                         bi,
-                        dataPeakForBinRange(
-                            data,
-                            binRanges.first[x],
-                            binRanges.last[x],
-                        ),
+                        value,
                     );
                 }
 
                 wfCtx.putImageData(wfImageData, 0, 0);
 
                 // Update frequency labels
-                updateFrequencyLabels(freqStart, freqEnd, steps);
+                updateFrequencyLabels(currentFreq0, currentFreq1, steps);
                 if (wasRendering) scheduleCurrentViewRedraw();
             }
 
@@ -1000,15 +1260,39 @@
                 scCtx.strokeStyle = "#40c0a0";
                 scCtx.lineWidth = 1.5;
                 scCtx.beginPath();
-                const range = clampZoomRange(n);
-                const binRanges = getCanvasBinRanges(w, n, range);
+                const targetAxis = getZoomedFrequencyAxis(
+                    currentFreq0,
+                    currentFreq1,
+                    steps,
+                    n,
+                );
+                const sameAxis = sameFrequencySpan(
+                    targetAxis.left,
+                    targetAxis.right,
+                    freqStart,
+                    freqEnd,
+                );
+                const range = sameAxis ? clampZoomRange(n) : null;
+                const binRanges =
+                    sameAxis && n !== w ? getCanvasBinRanges(w, n, range) : null;
                 for (let x = 0; x < w; x++) {
                     const v =
-                        dataPeakForBinRange(
-                            data,
-                            binRanges.first[x],
-                            binRanges.last[x],
-                        ) / 255;
+                        (sameAxis && n === w
+                            ? data[x]
+                            : sameAxis
+                              ? dataPeakForBinRange(
+                                    data,
+                                    binRanges.first[x],
+                                    binRanges.last[x],
+                                )
+                              : dataPeakForAxis(
+                                    data,
+                                    x,
+                                    w,
+                                    targetAxis,
+                                    freqStart,
+                                    freqEnd,
+                                )) / 255;
                     const y = h - 5 - v * (h - 10);
                     if (x === 0) scCtx.moveTo(x, y);
                     else scCtx.lineTo(x, y);
@@ -1018,10 +1302,23 @@
                 // Peak dot
                 let maxVal = 0,
                     maxX = 0;
-                const firstBin = Math.max(0, Math.floor(range.left * n));
+                const sourceStart = Math.max(freqStart, targetAxis.left);
+                const sourceEnd = Math.min(freqEnd, targetAxis.right);
+                if (sourceEnd <= sourceStart) return;
+                const sourceSpan = Math.max(1, freqEnd - freqStart);
+                const firstBin = Math.max(
+                    0,
+                    Math.min(
+                        n - 1,
+                        Math.floor(((sourceStart - freqStart) / sourceSpan) * n),
+                    ),
+                );
                 const lastBin = Math.min(
                     n,
-                    Math.max(firstBin + 1, Math.ceil(range.right * n)),
+                    Math.max(
+                        firstBin + 1,
+                        Math.ceil(((sourceEnd - freqStart) / sourceSpan) * n),
+                    ),
                 );
                 for (let i = firstBin; i < lastBin; i++) {
                     if (data[i] > maxVal) {
@@ -1029,9 +1326,10 @@
                         maxX = i;
                     }
                 }
+                const maxFreq = freqStart + ((maxX + 0.5) / n) * sourceSpan;
                 const px =
-                    ((maxX / n - range.left) /
-                        Math.max(0.000001, range.right - range.left)) *
+                    ((maxFreq - targetAxis.left) /
+                        Math.max(1, targetAxis.right - targetAxis.left)) *
                     w;
                 const py = h - 5 - (maxVal / 255) * (h - 10);
                 scCtx.fillStyle = "#ff8040";
@@ -1044,10 +1342,6 @@
             //  SSE connection
             // ===================================================================
             let eventSource = null;
-            let currentFreq0 = 0,
-                currentFreq1 = 0,
-                currentSteps = 0,
-                currentConverterFreq = 0;
 
             function connectSSE() {
                 if (eventSource) eventSource.close();
@@ -1058,12 +1352,33 @@
                         const data = JSON.parse(e.data);
                         const bins = Uint8Array.from(data.d || []);
                         if (!bins.length) return;
+                        const rowView =
+                            data.view !== undefined ? Number(data.view) : currentViewId;
+                        if (pendingViewChange && rowView === currentViewId) return;
+                        if (
+                            currentViewId &&
+                            rowView &&
+                            rowView !== currentViewId
+                        ) {
+                            if (rowView < currentViewId) return;
+                            currentViewId = rowView;
+                        }
+                        if (!currentViewId && rowView) currentViewId = rowView;
+                        if (data.full_f0 !== undefined)
+                            configuredFreq0 = Number(data.full_f0);
+                        if (data.full_f1 !== undefined)
+                            configuredFreq1 = Number(data.full_f1);
                         const f0 = data.f0 || 0; // start freq
                         const f1 = data.f1 || 0; // end freq
                         if (f0) currentFreq0 = f0;
                         if (f1) currentFreq1 = f1;
                         if (data.b) currentSteps = data.b;
+                        zoomLeft = 0;
+                        zoomRight = 1;
+                        pendingViewChange = false;
                         currentBins = bins;
+                        currentBinsFreq0 = currentFreq0;
+                        currentBinsFreq1 = currentFreq1;
 
                         drawWaterfallLine(
                             bins,
@@ -1116,7 +1431,19 @@
                 }
 
                 updateUI(!!status.scanning, true);
+                if (status.view_id !== undefined)
+                    currentViewId = Number(status.view_id);
+                if (status.configured_start_hz !== undefined)
+                    configuredFreq0 = Number(status.configured_start_hz);
+                if (status.configured_end_hz !== undefined)
+                    configuredFreq1 = Number(status.configured_end_hz);
+                if (status.visible_start_hz !== undefined)
+                    currentFreq0 = Number(status.visible_start_hz);
+                if (status.visible_end_hz !== undefined)
+                    currentFreq1 = Number(status.visible_end_hz);
                 if (status.scanning) {
+                    if (Number(status.display_bins) !== displayBins())
+                        scheduleViewUpdate(currentFreq0, currentFreq1, false);
                     if (!eventSource) connectSSE();
                 } else {
                     disconnectSSE();
@@ -1151,10 +1478,19 @@
                         0,
                         Math.min(rect.width - 1, evt.clientX - rect.left),
                     );
-                    const level = dataPeakForCanvasX(
+                    const axis = getZoomedFrequencyAxis(
+                        currentFreq0,
+                        currentFreq1,
+                        currentSteps,
+                        currentBins.length,
+                    );
+                    const level = dataPeakForAxis(
                         currentBins,
                         x,
                         rect.width,
+                        axis,
+                        currentBinsFreq0 || currentFreq0,
+                        currentBinsFreq1 || currentFreq1,
                     );
                     text += "\n" + level;
                 }
@@ -1179,7 +1515,7 @@
             scCanvas.addEventListener("mouseleave", hideHoverReadout);
 
             function handleZoomWheel(evt) {
-                if (!evt.shiftKey || !currentBins || !currentBins.length) {
+                if (!evt.shiftKey || !currentFreq0 || !currentFreq1) {
                     return;
                 }
 
@@ -1191,29 +1527,130 @@
                     0,
                     Math.min(1, (evt.clientX - rect.left) / rect.width),
                 );
-                const range = clampZoomRange(currentBins.length);
-                const anchor = range.left + cursor * (range.right - range.left);
+                const fullStart = configuredFreq0 || currentFreq0;
+                const fullEnd = configuredFreq1 || currentFreq1;
+                const fullSpan = fullEnd - fullStart;
+                if (fullSpan <= 0) return;
+
+                const currentSpan = currentFreq1 - currentFreq0;
+                const anchor = currentFreq0 + cursor * currentSpan;
                 const factor = evt.deltaY < 0 ? 1 / 1.25 : 1.25;
-                const minSpan = minZoomSpan(currentBins.length);
-                let span = Math.max(
-                    minSpan,
-                    Math.min(1, (range.right - range.left) * factor),
-                );
+                const minSpan = Math.max(1, fullSpan / MAX_ZOOM_FACTOR);
+                let span = Math.max(minSpan, Math.min(fullSpan, currentSpan * factor));
                 let left = anchor - cursor * span;
                 let right = left + span;
 
-                if (left < 0) {
-                    right -= left;
-                    left = 0;
+                if (left < fullStart) {
+                    right += fullStart - left;
+                    left = fullStart;
                 }
-                if (right > 1) {
-                    left -= right - 1;
-                    right = 1;
+                if (right > fullEnd) {
+                    left -= right - fullEnd;
+                    right = fullEnd;
+                }
+                left = Math.max(fullStart, left);
+                right = Math.min(fullEnd, right);
+                if (right <= left) return;
+
+                zoomLeft = 0;
+                zoomRight = 1;
+                currentFreq0 = left;
+                currentFreq1 = right;
+                pendingViewChange = true;
+                binRangeCache = null;
+                scheduleCurrentViewRedraw();
+                updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
+                document.getElementById("infoRange").textContent =
+                    formatScanRange(currentFreq0, currentFreq1);
+                scheduleViewUpdate(left, right, true);
+            }
+
+            function setPanningCursor(active) {
+                document.body.classList.toggle("panning-mode", active);
+            }
+
+            function clampPanWindow(left, right) {
+                const fullStart = configuredFreq0 || currentFreq0;
+                const fullEnd = configuredFreq1 || currentFreq1;
+                const fullSpan = fullEnd - fullStart;
+                const span = right - left;
+
+                if (fullSpan <= 0 || span >= fullSpan) {
+                    return { left: fullStart, right: fullEnd };
+                }
+                if (left < fullStart) {
+                    right += fullStart - left;
+                    left = fullStart;
+                }
+                if (right > fullEnd) {
+                    left -= right - fullEnd;
+                    right = fullEnd;
+                }
+                return {
+                    left: Math.max(fullStart, left),
+                    right: Math.min(fullEnd, right),
+                };
+            }
+
+            function startPan(evt) {
+                if (evt.button !== 0 || evt.shiftKey) return;
+                if (!currentFreq0 || !currentFreq1) return;
+
+                const fullStart = configuredFreq0 || currentFreq0;
+                const fullEnd = configuredFreq1 || currentFreq1;
+                if (currentFreq1 - currentFreq0 >= fullEnd - fullStart) return;
+
+                panActive = true;
+                panStartX = evt.clientX;
+                panStartFreq0 = currentFreq0;
+                panStartFreq1 = currentFreq1;
+                setPanningCursor(true);
+                wfCanvas.setPointerCapture(evt.pointerId);
+                evt.preventDefault();
+            }
+
+            function movePan(evt) {
+                if (!panActive) return;
+                const rect = wfCanvas.getBoundingClientRect();
+                const width = rect.width;
+                if (width <= 0) return;
+
+                const span = panStartFreq1 - panStartFreq0;
+                const dx = evt.clientX - panStartX;
+                const deltaFreq = -(dx / width) * span;
+                const clamped = clampPanWindow(
+                    panStartFreq0 + deltaFreq,
+                    panStartFreq1 + deltaFreq,
+                );
+
+                if (
+                    Math.abs(clamped.left - currentFreq0) < 1 &&
+                    Math.abs(clamped.right - currentFreq1) < 1
+                ) {
+                    return;
                 }
 
-                zoomLeft = Math.max(0, left);
-                zoomRight = Math.min(1, right);
+                currentFreq0 = clamped.left;
+                currentFreq1 = clamped.right;
+                pendingViewChange = true;
+                binRangeCache = null;
                 scheduleCurrentViewRedraw();
+                updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
+                document.getElementById("infoRange").textContent =
+                    formatScanRange(currentFreq0, currentFreq1);
+                scheduleViewUpdate(currentFreq0, currentFreq1, true);
+                evt.preventDefault();
+            }
+
+            function endPan(evt) {
+                if (!panActive) return;
+                panActive = false;
+                setPanningCursor(false);
+                try {
+                    wfCanvas.releasePointerCapture(evt.pointerId);
+                } catch (e) {
+                    /* pointer capture may already be gone */
+                }
             }
 
             function setZoomCursor(active) {
@@ -1231,6 +1668,11 @@
             wfCanvas.addEventListener("wheel", handleZoomWheel, {
                 passive: false,
             });
+            wfCanvas.addEventListener("pointerdown", startPan);
+            wfCanvas.addEventListener("pointermove", movePan);
+            wfCanvas.addEventListener("pointerup", endPan);
+            wfCanvas.addEventListener("pointercancel", endPan);
+            wfCanvas.addEventListener("lostpointercapture", endPan);
             scCanvas.addEventListener("wheel", handleZoomWheel, {
                 passive: false,
             });
@@ -1257,6 +1699,94 @@
                     return await resp.json();
                 } catch (e) {
                     return null;
+                }
+            }
+
+            function applyViewPlan(plan, clearOnViewChange) {
+                if (!plan) return;
+
+                const nextView =
+                    plan.view_id !== undefined ? Number(plan.view_id) : currentViewId;
+                const viewChanged = nextView && nextView !== currentViewId;
+                if (nextView) currentViewId = nextView;
+
+                if (plan.configured_start_hz !== undefined)
+                    configuredFreq0 = Number(plan.configured_start_hz);
+                else if (plan.freq_start !== undefined)
+                    configuredFreq0 = Number(plan.freq_start);
+                if (plan.configured_end_hz !== undefined)
+                    configuredFreq1 = Number(plan.configured_end_hz);
+                else if (plan.freq_end !== undefined)
+                    configuredFreq1 = Number(plan.freq_end);
+
+                if (plan.visible_start_hz !== undefined)
+                    currentFreq0 = Number(plan.visible_start_hz);
+                else if (plan.freq_start !== undefined)
+                    currentFreq0 = Number(plan.freq_start);
+                if (plan.visible_end_hz !== undefined)
+                    currentFreq1 = Number(plan.visible_end_hz);
+                else if (plan.freq_end !== undefined)
+                    currentFreq1 = Number(plan.freq_end);
+
+                if (plan.steps !== undefined) {
+                    currentSteps = Number(plan.steps);
+                    document.getElementById("infoSteps").textContent =
+                        plan.steps;
+                }
+
+                zoomLeft = 0;
+                zoomRight = 1;
+                pendingViewChange = false;
+                if (clearOnViewChange && viewChanged) scheduleCurrentViewRedraw();
+                if (currentFreq0 && currentFreq1 && currentSteps) {
+                    updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
+                    document.getElementById("infoRange").textContent =
+                        formatScanRange(currentFreq0, currentFreq1);
+                }
+            }
+
+            function scheduleViewUpdate(visibleStart, visibleEnd, visibleChanged) {
+                if (!backendOnline || !scanRunning) return;
+                if (!visibleStart || !visibleEnd || visibleEnd <= visibleStart)
+                    return;
+
+                pendingView = {
+                    visible_start_hz: visibleStart,
+                    visible_end_hz: visibleEnd,
+                    display_bins: displayBins(),
+                    visible_changed: !!visibleChanged,
+                };
+                if (viewUpdateTimer) clearTimeout(viewUpdateTimer);
+                viewUpdateTimer = setTimeout(sendViewUpdate, 220);
+            }
+
+            async function sendViewUpdate() {
+                const request = pendingView;
+                if (!request) return;
+                pendingView = null;
+                viewUpdateTimer = null;
+
+                const serial = ++viewRequestSerial;
+                const result = await apiPost("/api/view", {
+                    visible_start_hz: request.visible_start_hz,
+                    visible_end_hz: request.visible_end_hz,
+                    display_bins: request.display_bins,
+                    view_id: currentViewId,
+                });
+                if (serial !== viewRequestSerial) return;
+
+                if (!result) {
+                    updateUI(false, false);
+                    disconnectSSE();
+                    return;
+                }
+                if (result.status === "ok") {
+                    applyViewPlan(result, request.visible_changed);
+                    updateUI(!!result.scanning, true);
+                    if (result.scanning && !eventSource) connectSSE();
+                } else {
+                    pendingViewChange = false;
+                    updateUI(false, true);
                 }
             }
 
@@ -1356,16 +1886,35 @@
                 zoomLeft = 0;
                 zoomRight = 1;
 
-                if (plan.freq_start !== undefined) {
-                    currentFreq0 = plan.freq_start;
+                if (plan.configured_start_hz !== undefined)
+                    configuredFreq0 = Number(plan.configured_start_hz);
+                else if (plan.freq_start !== undefined)
+                    configuredFreq0 = Number(plan.freq_start);
+                if (plan.configured_end_hz !== undefined)
+                    configuredFreq1 = Number(plan.configured_end_hz);
+                else if (plan.freq_end !== undefined)
+                    configuredFreq1 = Number(plan.freq_end);
+
+                if (configuredFreq0) {
                     document.getElementById("freqStart").value =
-                        mhzInputValue(plan.freq_start);
+                        mhzInputValue(configuredFreq0);
                 }
-                if (plan.freq_end !== undefined) {
-                    currentFreq1 = plan.freq_end;
+                if (configuredFreq1) {
                     document.getElementById("freqEnd").value =
-                        mhzInputValue(plan.freq_end);
+                        mhzInputValue(configuredFreq1);
                 }
+
+                if (plan.visible_start_hz !== undefined)
+                    currentFreq0 = Number(plan.visible_start_hz);
+                else if (plan.freq_start !== undefined)
+                    currentFreq0 = Number(plan.freq_start);
+                if (plan.visible_end_hz !== undefined)
+                    currentFreq1 = Number(plan.visible_end_hz);
+                else if (plan.freq_end !== undefined)
+                    currentFreq1 = Number(plan.freq_end);
+
+                if (plan.view_id !== undefined)
+                    currentViewId = Number(plan.view_id);
                 if (plan.steps !== undefined) {
                     currentSteps = plan.steps;
                     document.getElementById("infoSteps").textContent =
@@ -1414,12 +1963,16 @@
                         document.getElementById("directSampling").value,
                     ),
                     fft_size: selectedFftSize(),
+                    display_bins: displayBins(),
                 };
             }
 
             function clearScanDisplay() {
                 cancelCurrentViewRedraw();
                 linesCount = 0;
+                currentBins = null;
+                currentBinsFreq0 = 0;
+                currentBinsFreq1 = 0;
                 wfRows = [];
                 clearWaterfallPixels();
                 if (wfImageData) wfCtx.putImageData(wfImageData, 0, 0);
@@ -1427,6 +1980,13 @@
 
             async function startOrRestartScan() {
                 const serial = ++scanRequestSerial;
+                viewRequestSerial++;
+                pendingView = null;
+                pendingViewChange = false;
+                if (viewUpdateTimer) {
+                    clearTimeout(viewUpdateTimer);
+                    viewUpdateTimer = null;
+                }
                 const result = await apiPost("/api/start", buildScanRequest());
                 if (serial !== scanRequestSerial) return result;
 
@@ -1498,6 +2058,13 @@
                 .getElementById("btnStop")
                 .addEventListener("click", async function () {
                     scanRequestSerial++;
+                    viewRequestSerial++;
+                    pendingView = null;
+                    pendingViewChange = false;
+                    if (viewUpdateTimer) {
+                        clearTimeout(viewUpdateTimer);
+                        viewUpdateTimer = null;
+                    }
                     const result = await apiPost("/api/stop", {});
                     if (!result) {
                         updateUI(false, false);
@@ -1577,20 +2144,31 @@
                         document.getElementById("infoSteps").textContent =
                             status.steps;
                     currentSteps = status.steps || 0;
-                    currentFreq0 = status.freq_start || 0;
-                    currentFreq1 = status.freq_end || 0;
+                    configuredFreq0 =
+                        status.configured_start_hz || status.freq_start || 0;
+                    configuredFreq1 =
+                        status.configured_end_hz || status.freq_end || 0;
+                    currentFreq0 =
+                        status.visible_start_hz || status.freq_start || 0;
+                    currentFreq1 =
+                        status.visible_end_hz || status.freq_end || 0;
+                    if (status.view_id !== undefined)
+                        currentViewId = Number(status.view_id);
                     if (currentFreq0 && currentFreq1 && currentSteps)
                         updateFrequencyLabels(
                             currentFreq0,
                             currentFreq1,
                             currentSteps,
                         );
-                    if (status.freq_start)
+                    if (currentFreq0 && currentFreq1)
+                        document.getElementById("infoRange").textContent =
+                            formatScanRange(currentFreq0, currentFreq1);
+                    if (configuredFreq0)
                         document.getElementById("freqStart").value =
-                            status.freq_start / 1e6;
-                    if (status.freq_end)
+                            configuredFreq0 / 1e6;
+                    if (configuredFreq1)
                         document.getElementById("freqEnd").value =
-                            status.freq_end / 1e6;
+                            configuredFreq1 / 1e6;
                     if (status.converter_freq !== undefined) {
                         currentConverterFreq = status.converter_freq;
                         document.getElementById("converterFreq").value =
@@ -1655,6 +2233,7 @@
                 } else if (status.scanning) {
                     updateUI(true, true);
                     clearScanDisplay();
+                    scheduleViewUpdate(currentFreq0, currentFreq1, false);
                     connectSSE();
                 } else {
                     await startOrRestartScan();

@@ -11,7 +11,7 @@
  */
 
 #define _USE_MATH_DEFINES
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <limits.h>
 #include <fobos_sdr.h>
 
 #ifndef M_PI
@@ -35,6 +36,7 @@
 /* ------------------------------------------------------------------ */
 #define PORT                8080
 #define MAX_HEADERS         4096
+#define MAX_REQUEST         65536
 #define MAX_CLIENTS         64
 #define MAX_SSE_CLIENTS     16
 #define MAX_FREQS           256
@@ -42,6 +44,8 @@
 #define MAX_PATH            1024
 #define HTML_PATH           "index.html"
 #define MIN_FREQ_START_HZ   50.0e6
+#define DISPLAY_BINS_MIN    64
+#define DISPLAY_BINS_MAX    32768
 
 /* FFT: powers of 2 from 1024 to 65536 */
 #define FFT_SIZE_MIN        1024
@@ -74,9 +78,13 @@ static uint32_t g_fft_generation = 1;
 /* Scan parameters */
 static double g_freq_start   = MIN_FREQ_START_HZ;
 static double g_freq_end     = 2000.0e6;
+static double g_visible_start = MIN_FREQ_START_HZ;
+static double g_visible_end   = 2000.0e6;
 static double g_converter_freq = 0.0;
 static double g_samplerate   = 50.0e6;
 static double g_bw_ratio     = 0.8;
+static int g_display_bins    = 1024;
+static uint32_t g_view_id    = 1;
 static uint32_t g_lna_gain   = 0;
 static uint32_t g_vga_gain   = 0;
 static uint32_t g_direct_sampling = 0;
@@ -263,6 +271,8 @@ static void load_config(void)
         else if (strcmp(key, "fft_size") == 0) { update_fft_size((int)val); }
     }
     fclose(f);
+    g_visible_start = g_freq_start;
+    g_visible_end = g_freq_end;
     printf("[SDR] Loaded config from %s\n", CONFIG_FILE);
 }
 
@@ -296,6 +306,45 @@ static void url_decode(char *s)
         else { *r++ = *s++; }
     }
     *r = 0;
+}
+
+static void chdir_to_executable_dir(const char *argv0)
+{
+    char path[PATH_MAX];
+    char *slash;
+
+    if (argv0 && strchr(argv0, '/')) {
+        snprintf(path, sizeof(path), "%s", argv0);
+    } else {
+        ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+        if (n <= 0)
+            return;
+        path[n] = 0;
+    }
+
+    slash = strrchr(path, '/');
+    if (!slash)
+        return;
+    if (slash == path)
+        slash[1] = 0;
+    else
+        *slash = 0;
+    if (chdir(path) != 0)
+        fprintf(stderr, "[SDR] chdir(%s) failed: %s\n", path, strerror(errno));
+}
+
+static int http_content_length(const char *req)
+{
+    const char *headers[] = { "Content-Length:", "content-length:" };
+    for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
+        const char *p = strstr(req, headers[i]);
+        if (p) {
+            int len = 0;
+            if (sscanf(p + strlen(headers[i]), " %d", &len) == 1 && len > 0)
+                return len;
+        }
+    }
+    return 0;
 }
 
 static void load_sample_rates(struct fobos_sdr_dev_t *dev)
@@ -332,6 +381,10 @@ static void format_sample_rates_json(char *buf, size_t len)
         buf[len - 1] = 0;
 }
 
+static int normalize_display_bins(int bins);
+static int current_display_bins(void);
+static void active_scan_band(double *out_start, double *out_end);
+
 /* ------------------------------------------------------------------ */
 /* Hardware scan context                                              */
 /* ------------------------------------------------------------------ */
@@ -351,17 +404,21 @@ typedef struct {
     int line_num;
     int fft_size;
     uint32_t fft_generation;
-    double freq_start;
-    double freq_end;
+    double configured_start;
+    double configured_end;
+    double visible_start;
+    double visible_end;
+    double scan_start;
+    double scan_end;
     double samplerate;
     double bw_ratio;
     double step_width;
     double last_width;
+    uint32_t view_id;
     float mag_scale;
     float *window;
     float *fft_scratch;
     float *line_buf;
-    uint8_t *line_packed;
     uint8_t step_seen[MAX_FREQS];
     sample_queue_item_t queue[PROCESS_QUEUE_LEN];
     int queue_head;
@@ -374,10 +431,10 @@ typedef struct {
     pthread_t worker_thread;
 } scan_ctx_t;
 
-static int build_scan_frequencies(double *freqs, double *out_step)
+static int build_scan_frequencies_for_band(double start, double end, double *freqs, double *out_step)
 {
     double step = g_samplerate * g_bw_ratio;
-    double span = g_freq_end - g_freq_start;
+    double span = end - start;
     int count;
 
     if (out_step) *out_step = 0.0;
@@ -391,8 +448,8 @@ static int build_scan_frequencies(double *freqs, double *out_step)
 
     if (freqs) {
         for (int i = 0; i < count; i++) {
-            double slice_start = g_freq_start + (double)i * step;
-            double width = g_freq_end - slice_start;
+            double slice_start = start + (double)i * step;
+            double width = end - slice_start;
             if (width > step)
                 width = step;
             freqs[i] = slice_start + width / 2.0;
@@ -402,15 +459,31 @@ static int build_scan_frequencies(double *freqs, double *out_step)
     return count;
 }
 
-static double build_scan_effective_end(int count, double step)
+static int build_scan_frequencies(double *freqs, double *out_step)
 {
-    if (count <= 0 || step <= 0.0)
-        return g_freq_start;
-    double end = g_freq_start + (double)count * step;
-    return (end < g_freq_end) ? end : g_freq_end;
+    double start;
+    double end;
+    active_scan_band(&start, &end);
+    return build_scan_frequencies_for_band(start, end, freqs, out_step);
 }
 
-static double scan_last_width(int count, double step)
+static double build_scan_effective_end_for_band(double start, double end_limit, int count, double step)
+{
+    if (count <= 0 || step <= 0.0)
+        return start;
+    double end = start + (double)count * step;
+    return (end < end_limit) ? end : end_limit;
+}
+
+static double build_scan_effective_end(int count, double step)
+{
+    double start;
+    double end;
+    active_scan_band(&start, &end);
+    return build_scan_effective_end_for_band(start, end, count, step);
+}
+
+static double scan_last_width_for_band(double start, double end, int count, double step)
 {
     double last_start;
     double width;
@@ -418,8 +491,8 @@ static double scan_last_width(int count, double step)
     if (count <= 0 || step <= 0.0)
         return 0.0;
 
-    last_start = g_freq_start + (double)(count - 1) * step;
-    width = g_freq_end - last_start;
+    last_start = start + (double)(count - 1) * step;
+    width = end - last_start;
     if (width > step)
         width = step;
     if (width <= 0.0)
@@ -438,6 +511,8 @@ static void clamp_scan_end_to_hardware_limit(void)
     max_end = g_freq_start + (double)MAX_FREQS * step;
     if (g_freq_end > max_end)
         g_freq_end = max_end;
+    g_visible_start = g_freq_start;
+    g_visible_end = g_freq_end;
 }
 
 static int current_scan_plan(double *out_step, double *out_freq_end)
@@ -485,6 +560,24 @@ static int scan_bins_per_step(void)
     return scan_bins_per_step_for_width(g_samplerate * g_bw_ratio);
 }
 
+static int current_line_bins(void)
+{
+    double scan_start;
+    double scan_end;
+    double step = 0.0;
+    int total_steps;
+    int bins_per_step;
+    int last_bins;
+
+    active_scan_band(&scan_start, &scan_end);
+    total_steps = build_scan_frequencies_for_band(scan_start, scan_end, NULL, &step);
+    if (total_steps <= 0)
+        return 0;
+    bins_per_step = scan_bins_per_step_for_width(step);
+    last_bins = scan_bins_per_step_for_width(scan_last_width_for_band(scan_start, scan_end, total_steps, step));
+    return (total_steps - 1) * bins_per_step + last_bins;
+}
+
 static int scan_bins_for_context_width(scan_ctx_t *ctx, double width, int fft_size)
 {
     double max_width = ctx->samplerate * ctx->bw_ratio;
@@ -507,7 +600,6 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
     float *window = NULL;
     float *fft_scratch = NULL;
     float *line_buf = NULL;
-    uint8_t *line_packed = NULL;
     float mag_scale;
 
     for (;;) {
@@ -524,12 +616,10 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         window = malloc((size_t)fft_size * sizeof(float));
         fft_scratch = malloc((size_t)fft_size * 2 * sizeof(float));
         line_buf = malloc(bin_count * sizeof(float));
-        line_packed = malloc(bin_count);
-        if (!window || !fft_scratch || !line_buf || !line_packed) {
+        if (!window || !fft_scratch || !line_buf) {
             free(window);
             free(fft_scratch);
             free(line_buf);
-            free(line_packed);
             return -1;
         }
 
@@ -545,11 +635,9 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         free(window);
         free(fft_scratch);
         free(line_buf);
-        free(line_packed);
         window = NULL;
         fft_scratch = NULL;
         line_buf = NULL;
-        line_packed = NULL;
     }
 
     {
@@ -563,7 +651,6 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
     free(ctx->window);
     free(ctx->fft_scratch);
     free(ctx->line_buf);
-    free(ctx->line_packed);
 
     ctx->fft_size = fft_size;
     ctx->fft_generation = fft_generation;
@@ -574,7 +661,6 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
     ctx->window = window;
     ctx->fft_scratch = fft_scratch;
     ctx->line_buf = line_buf;
-    ctx->line_packed = line_packed;
     ctx->steps_seen = 0;
     memset(ctx->step_seen, 0, sizeof(ctx->step_seen));
 
@@ -627,32 +713,75 @@ static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step
     return fft_count;
 }
 
+static uint8_t magnitude_to_u8(float mag)
+{
+    float db = 20.0f * log10f(mag + 1e-20f);
+    float v = (db - DB_FLOOR) * (255.0f / (DB_CEIL - DB_FLOOR));
+    if (v < 0.0f) v = 0.0f;
+    if (v > 255.0f) v = 255.0f;
+    return (uint8_t)lrintf(v);
+}
+
 static void publish_scan_line(scan_ctx_t *ctx)
 {
-    int bin_count = ctx->line_bins;
-    if (bin_count <= 0) return;
+    int source_bins = ctx->line_bins;
+    int display_bins = current_display_bins();
+    double source_span = ctx->scan_end - ctx->scan_start;
+    double visible_span = ctx->visible_end - ctx->visible_start;
+    uint8_t *line_packed;
+    char *json;
+    int pos;
 
-    for (int i = 0; i < bin_count; i++) {
-        float mag = ctx->line_buf[i];
-        float db = 20.0f * log10f(mag + 1e-20f);
-        float v = (db - DB_FLOOR) * (255.0f / (DB_CEIL - DB_FLOOR));
-        if (v < 0.0f) v = 0.0f;
-        if (v > 255.0f) v = 255.0f;
-        ctx->line_packed[i] = (uint8_t)lrintf(v);
+    if (source_bins <= 0 || display_bins <= 0 || source_span <= 0.0 || visible_span <= 0.0)
+        return;
+
+    line_packed = malloc((size_t)display_bins);
+    if (!line_packed)
+        return;
+
+    for (int x = 0; x < display_bins; x++) {
+        double pixel_start = ctx->visible_start + ((double)x / (double)display_bins) * visible_span;
+        double pixel_end = ctx->visible_start + ((double)(x + 1) / (double)display_bins) * visible_span;
+        int first = (int)floor(((pixel_start - ctx->scan_start) / source_span) * (double)source_bins);
+        int last = (int)ceil(((pixel_end - ctx->scan_start) / source_span) * (double)source_bins);
+        float peak = 0.0f;
+
+        if (first < 0) first = 0;
+        if (first >= source_bins) first = source_bins - 1;
+        if (last < first + 1) last = first + 1;
+        if (last > source_bins) last = source_bins;
+
+        for (int i = first; i < last; i++) {
+            if (ctx->line_buf[i] > peak)
+                peak = ctx->line_buf[i];
+        }
+        line_packed[x] = magnitude_to_u8(peak);
     }
 
-    char *json = malloc((size_t)bin_count * 5 + 256);
-    if (!json) return;
+    json = malloc((size_t)display_bins * 5 + 1024);
+    if (!json) {
+        free(line_packed);
+        return;
+    }
 
-    int pos = snprintf(json, 256,
-        "event: line\ndata: {\"n\":%d,\"b\":%d,\"f0\":%.0f,\"f1\":%.0f,\"d\":[",
-        ctx->line_num, ctx->total_steps, ctx->freq_start, ctx->freq_end);
+    pos = snprintf(json, 1024,
+        "event: line\ndata: {\"view\":%u,\"n\":%d,\"b\":%d,"
+        "\"f0\":%.0f,\"f1\":%.0f,"
+        "\"full_f0\":%.0f,\"full_f1\":%.0f,"
+        "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
+        "\"display_bins\":%d,\"source_bins\":%d,\"d\":[",
+        ctx->view_id, ctx->line_num, ctx->total_steps,
+        ctx->visible_start, ctx->visible_end,
+        ctx->configured_start, ctx->configured_end,
+        ctx->visible_start, ctx->visible_end,
+        display_bins, source_bins);
 
-    for (int i = 0; i < bin_count; i++)
-        pos += snprintf(json + pos, 5, "%s%d", (i ? "," : ""), ctx->line_packed[i]);
+    for (int i = 0; i < display_bins; i++)
+        pos += snprintf(json + pos, 5, "%s%d", (i ? "," : ""), line_packed[i]);
 
     pos += snprintf(json + pos, 16, "]}\n\n");
     sse_broadcast(json, pos);
+    free(line_packed);
     free(json);
 }
 
@@ -689,6 +818,79 @@ static void process_scan_buffer(scan_ctx_t *ctx, float *buf, uint32_t buf_len, i
         ctx->steps_seen = 0;
         ctx->line_num++;
     }
+}
+
+static int normalize_display_bins(int bins)
+{
+    if (bins < DISPLAY_BINS_MIN) bins = DISPLAY_BINS_MIN;
+    if (bins > DISPLAY_BINS_MAX) bins = DISPLAY_BINS_MAX;
+    return bins;
+}
+
+static int current_display_bins(void)
+{
+    return normalize_display_bins(g_display_bins);
+}
+
+static void clamp_visible_to_config(void)
+{
+    if (g_freq_start < MIN_FREQ_START_HZ)
+        g_freq_start = MIN_FREQ_START_HZ;
+    if (g_freq_end <= g_freq_start)
+        g_freq_end = g_freq_start + g_samplerate;
+
+    if (g_visible_start < g_freq_start)
+        g_visible_start = g_freq_start;
+    if (g_visible_end > g_freq_end)
+        g_visible_end = g_freq_end;
+    if (g_visible_end <= g_visible_start) {
+        g_visible_start = g_freq_start;
+        g_visible_end = g_freq_end;
+    }
+}
+
+static void active_scan_band(double *out_start, double *out_end)
+{
+    double start = g_visible_start;
+    double end = g_visible_end;
+    double step = g_samplerate * g_bw_ratio;
+    double config_span;
+    double min_span;
+    double center;
+
+    clamp_visible_to_config();
+    start = g_visible_start;
+    end = g_visible_end;
+
+    if (step <= 0.0 || end <= start) {
+        *out_start = start;
+        *out_end = end;
+        return;
+    }
+
+    config_span = g_freq_end - g_freq_start;
+    min_span = step * (double)FOBOS_MIN_FREQS_CNT;
+    if (config_span < min_span)
+        min_span = config_span;
+
+    if (end - start < min_span && min_span > 0.0) {
+        center = (start + end) * 0.5;
+        start = center - min_span * 0.5;
+        end = start + min_span;
+        if (start < g_freq_start) {
+            end += g_freq_start - start;
+            start = g_freq_start;
+        }
+        if (end > g_freq_end) {
+            start -= end - g_freq_end;
+            end = g_freq_end;
+        }
+        if (start < g_freq_start)
+            start = g_freq_start;
+    }
+
+    *out_start = start;
+    *out_end = end;
 }
 
 static int scan_queue_init(scan_ctx_t *ctx)
@@ -817,11 +1019,16 @@ static void *scan_thread_func(void *arg)
     (void)arg;
     double air_freqs[MAX_FREQS];
     double device_freqs[MAX_FREQS];
+    double scan_start = 0.0;
+    double scan_end = 0.0;
     double step = 0.0;
-    int total_steps = build_scan_frequencies(air_freqs, &step);
+    int total_steps;
     scan_ctx_t ctx;
     int ret;
     int worker_started = 0;
+
+    active_scan_band(&scan_start, &scan_end);
+    total_steps = build_scan_frequencies_for_band(scan_start, scan_end, air_freqs, &step);
 
     if (total_steps < FOBOS_MIN_FREQS_CNT) {
         fprintf(stderr, "[SDR] Hardware scan needs at least %d frequencies\n", FOBOS_MIN_FREQS_CNT);
@@ -840,9 +1047,14 @@ static void *scan_thread_func(void *arg)
     ctx.samplerate = g_samplerate;
     ctx.bw_ratio = g_bw_ratio;
     ctx.step_width = step;
-    ctx.last_width = scan_last_width(total_steps, step);
-    ctx.freq_start = g_freq_start;
-    ctx.freq_end = build_scan_effective_end(total_steps, step);
+    ctx.last_width = scan_last_width_for_band(scan_start, scan_end, total_steps, step);
+    ctx.configured_start = g_freq_start;
+    ctx.configured_end = g_freq_end;
+    ctx.visible_start = g_visible_start;
+    ctx.visible_end = g_visible_end;
+    ctx.scan_start = scan_start;
+    ctx.scan_end = build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
+    ctx.view_id = g_view_id;
 
     if (scan_ctx_apply_fft_config(&ctx) != 0) {
         fprintf(stderr, "[SDR] Out of memory\n");
@@ -855,7 +1067,6 @@ static void *scan_thread_func(void *arg)
         free(ctx.window);
         free(ctx.fft_scratch);
         free(ctx.line_buf);
-        free(ctx.line_packed);
         g_scanning = 0;
         return NULL;
     }
@@ -866,7 +1077,6 @@ static void *scan_thread_func(void *arg)
         free(ctx.window);
         free(ctx.fft_scratch);
         free(ctx.line_buf);
-        free(ctx.line_packed);
         g_scanning = 0;
         return NULL;
     }
@@ -884,7 +1094,7 @@ static void *scan_thread_func(void *arg)
     if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_direct_sampling failed: %d\n", ret);
 
     printf("[SDR] Hardware scan: air band %.0f - %.0f Hz, converter %.0f Hz, SDR centers %.0f - %.0f Hz, step %.0f Hz (%d freqs, max %d)\n",
-           ctx.freq_start, ctx.freq_end, g_converter_freq,
+           ctx.scan_start, ctx.scan_end, g_converter_freq,
            device_freqs[0], device_freqs[total_steps - 1], step, total_steps, MAX_FREQS);
 
     ret = fobos_sdr_start_scan(g_dev, device_freqs, (unsigned int)total_steps);
@@ -913,7 +1123,6 @@ static void *scan_thread_func(void *arg)
     free(ctx.window);
     free(ctx.fft_scratch);
     free(ctx.line_buf);
-    free(ctx.line_packed);
     printf("[SDR] Scan thread stopped\n");
     return NULL;
 }
@@ -1031,14 +1240,19 @@ static void handle_request(int client_fd, const char *req)
 
     /* GET /api/status */
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
-        char body[2048];
+        char body[4096];
         char sample_rates[1024];
-        double freqs[MAX_FREQS];
         double step = 0.0;
-        int total_steps = build_scan_frequencies(freqs, &step);
+        double scan_start = 0.0;
+        double scan_end = 0.0;
+        int total_steps;
         int bins_per_step = scan_bins_per_step();
-        double freq_end = build_scan_effective_end(total_steps, step);
+        int line_bins = current_line_bins();
+        int display_bins = current_display_bins();
 
+        active_scan_band(&scan_start, &scan_end);
+        total_steps = build_scan_frequencies_for_band(scan_start, scan_end, NULL, &step);
+        scan_end = build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
         format_sample_rates_json(sample_rates, sizeof(sample_rates));
 
         int n = snprintf(body, sizeof(body),
@@ -1047,18 +1261,27 @@ static void handle_request(int client_fd, const char *req)
             "\"manufacturer\":\"%s\",\"product\":\"%s\","
             "\"scanning\":%d,"
             "\"freq_start\":%.0f,\"freq_end\":%.0f,\"converter_freq\":%.0f,"
+            "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
+            "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
+            "\"scan_start_hz\":%.0f,\"scan_end_hz\":%.0f,"
             "\"samplerate\":%.0f,\"bw_ratio\":%.2f,"
             "\"step_hz\":%.0f,\"steps\":%d,"
-            "\"bins_per_step\":%d,\"fft_size\":%d,"
+            "\"bins_per_step\":%d,\"line_bins\":%d,\"display_bins\":%d,"
+            "\"view_id\":%u,\"fft_size\":%d,"
             "\"lna_gain\":%u,\"vga_gain\":%u,\"direct_sampling\":%u,"
             "\"sample_rates\":%s}",
             g_hw_rev, g_fw_ver, g_serial,
             g_manufacturer, g_product,
             g_scanning,
-            g_freq_start, freq_end, g_converter_freq,
+            g_freq_start, g_freq_end, g_converter_freq,
+            g_freq_start, g_freq_end,
+            g_visible_start, g_visible_end,
+            scan_start,
+            scan_end,
             g_samplerate, g_bw_ratio,
             step, total_steps,
-            bins_per_step, current_fft_size(),
+            bins_per_step, line_bins, display_bins,
+            g_view_id, current_fft_size(),
             g_lna_gain, g_vga_gain, g_direct_sampling,
             sample_rates);
 
@@ -1088,6 +1311,7 @@ static void handle_request(int client_fd, const char *req)
     /* POST /api/start */
     if (strcmp(method, "POST") == 0 && strcmp(path, "/api/start") == 0) {
         uint32_t fft_tmp = 0;
+        uint32_t display_tmp = 0;
         const char *body = strstr(req, "\r\n\r\n");
         if (!body) { close(client_fd); return; }
         body += 4;
@@ -1124,11 +1348,17 @@ static void handle_request(int client_fd, const char *req)
         GET_UINT("\"vga_gain\"", g_vga_gain);
         GET_UINT("direct_sampling", g_direct_sampling);
         GET_UINT("fft_size", fft_tmp);
+        GET_UINT("display_bins", display_tmp);
         if (fft_tmp >= FFT_SIZE_MIN && fft_tmp <= FFT_SIZE_MAX)
             update_fft_size((int)fft_tmp);
+        if (display_tmp > 0)
+            g_display_bins = normalize_display_bins((int)display_tmp);
         if (g_freq_start < MIN_FREQ_START_HZ) g_freq_start = MIN_FREQ_START_HZ;
         if (g_bw_ratio > 1.0) g_bw_ratio = 1.0;
         clamp_scan_end_to_hardware_limit();
+        g_visible_start = g_freq_start;
+        g_visible_end = g_freq_end;
+        g_view_id++;
 
         #undef GET_DOUBLE
         #undef GET_UINT
@@ -1138,17 +1368,111 @@ static void handle_request(int client_fd, const char *req)
         int ret = start_scan();
         const char *status = (ret == 0) ? "ok" : "error";
         double step = 0.0;
-        double freq_end = 0.0;
-        int total_steps = current_scan_plan(&step, &freq_end);
-        char resp[512];
+        double scan_end = 0.0;
+        int total_steps = current_scan_plan(&step, &scan_end);
+        char resp[1024];
         int n = snprintf(resp, sizeof(resp),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n%s\r\n"
             "{\"status\":\"%s\",\"freq_start\":%.0f,\"freq_end\":%.0f,"
-            "\"converter_freq\":%.0f,\"steps\":%d,\"step_hz\":%.0f}",
-            cors, status, g_freq_start, freq_end, g_converter_freq,
-            total_steps, step);
+            "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
+            "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
+            "\"converter_freq\":%.0f,\"steps\":%d,\"step_hz\":%.0f,"
+            "\"display_bins\":%d,\"view_id\":%u}",
+            cors, status,
+            g_freq_start, g_freq_end,
+            g_freq_start, g_freq_end,
+            g_visible_start, g_visible_end,
+            g_converter_freq, total_steps, step,
+            current_display_bins(), g_view_id);
         WRITE(client_fd, resp, (size_t)n);
+        close(client_fd);
+        return;
+    }
+
+    /* POST /api/view */
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/view") == 0) {
+        double visible_start = g_visible_start;
+        double visible_end = g_visible_end;
+        uint32_t display_tmp = 0;
+        int visible_changed;
+        int ret = 0;
+        const char *body = strstr(req, "\r\n\r\n");
+        if (!body) { close(client_fd); return; }
+        body += 4;
+
+        #define GET_DOUBLE_RAW(key, target) do { \
+            const char *k = strstr(body, key); \
+            if (k) { \
+                k = strchr(k, ':'); \
+                if (k) { \
+                    double v; \
+                    if (sscanf(k+1, " %lf", &v) == 1) \
+                        (target) = v; \
+                } \
+            } \
+        } while(0)
+        #define GET_UINT_RAW(key, target) do { \
+            const char *k = strstr(body, key); \
+            if (k) { \
+                k = strchr(k, ':'); \
+                if (k) { \
+                    unsigned int v; \
+                    if (sscanf(k+1, " %u", &v) == 1) \
+                        (target) = (uint32_t)v; \
+                } \
+            } \
+        } while(0)
+
+        GET_DOUBLE_RAW("\"visible_start_hz\"", visible_start);
+        GET_DOUBLE_RAW("\"visible_end_hz\"", visible_end);
+        GET_UINT_RAW("\"display_bins\"", display_tmp);
+
+        #undef GET_DOUBLE_RAW
+        #undef GET_UINT_RAW
+
+        if (display_tmp > 0)
+            g_display_bins = normalize_display_bins((int)display_tmp);
+
+        if (visible_start < g_freq_start) visible_start = g_freq_start;
+        if (visible_end > g_freq_end) visible_end = g_freq_end;
+        if (visible_end <= visible_start) {
+            visible_start = g_freq_start;
+            visible_end = g_freq_end;
+        }
+
+        visible_changed = fabs(visible_start - g_visible_start) >= 1.0 ||
+                          fabs(visible_end - g_visible_end) >= 1.0;
+        if (visible_changed) {
+            g_visible_start = visible_start;
+            g_visible_end = visible_end;
+            g_view_id++;
+            if (g_scanning)
+                ret = start_scan();
+        }
+
+        {
+            double step = 0.0;
+            double scan_end = 0.0;
+            int total_steps = current_scan_plan(&step, &scan_end);
+            char resp[1024];
+            int n = snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n%s\r\n"
+                "{\"status\":\"%s\",\"view_id\":%u,"
+                "\"freq_start\":%.0f,\"freq_end\":%.0f,"
+                "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
+                "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
+                "\"steps\":%d,\"step_hz\":%.0f,\"display_bins\":%d,"
+                "\"scanning\":%d}",
+                cors, (ret == 0) ? "ok" : "error", g_view_id,
+                g_freq_start, g_freq_end,
+                g_freq_start, g_freq_end,
+                g_visible_start, g_visible_end,
+                total_steps, step, current_display_bins(),
+                g_scanning);
+            WRITE(client_fd, resp, (size_t)n);
+        }
         close(client_fd);
         return;
     }
@@ -1256,8 +1580,54 @@ static void handle_request(int client_fd, const char *req)
 static volatile int g_exit = 0;
 static void sigint_handler(int sig) { (void)sig; g_exit = 1; }
 
-int main(void)
+static int create_http_server_socket(void)
 {
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    int opt = 1;
+    int v6only = 0;
+
+    if (fd >= 0) {
+        struct sockaddr_in6 addr6;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+
+        memset(&addr6, 0, sizeof(addr6));
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_addr = in6addr_any;
+        addr6.sin6_port = htons(PORT);
+
+        if (bind(fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0 &&
+            listen(fd, MAX_CLIENTS) == 0)
+            return fd;
+
+        close(fd);
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        struct sockaddr_in addr;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(PORT);
+
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
+            listen(fd, MAX_CLIENTS) == 0)
+            return fd;
+
+        close(fd);
+    }
+
+    return -1;
+}
+
+int main(int argc, char **argv)
+{
+    (void)argc;
+    chdir_to_executable_dir(argv ? argv[0] : NULL);
+
     signal(SIGINT, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
 
@@ -1292,37 +1662,9 @@ int main(void)
         }
     }
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int server_fd = create_http_server_socket();
     if (server_fd < 0) {
-        perror("socket");
-        if (g_dev) {
-            fobos_sdr_close(g_dev);
-            g_dev = NULL;
-        }
-        return 1;
-    }
-
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(server_fd);
-        if (g_dev) {
-            fobos_sdr_close(g_dev);
-            g_dev = NULL;
-        }
-        return 1;
-    }
-    if (listen(server_fd, MAX_CLIENTS) < 0) {
-        perror("listen");
-        close(server_fd);
+        perror("bind/listen");
         if (g_dev) {
             fobos_sdr_close(g_dev);
             g_dev = NULL;
@@ -1345,9 +1687,9 @@ int main(void)
     printf("[SDR] Waiting for scan start from web UI\n");
 
     while (!g_exit) {
-        struct sockaddr_in client_addr;
+        struct sockaddr_storage client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
             perror("accept"); break;
@@ -1357,14 +1699,25 @@ int main(void)
         to.tv_sec = 5; to.tv_usec = 0;
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
-        char req[MAX_HEADERS + 1] = {0};
+        char req[MAX_REQUEST + 1] = {0};
         int total = 0;
-        while (total < MAX_HEADERS) {
-            int n = (int)read(client_fd, req + total, (size_t)(MAX_HEADERS - total));
+        int header_len = 0;
+        int body_len = 0;
+
+        while (total < MAX_REQUEST) {
+            int n = (int)read(client_fd, req + total, (size_t)(MAX_REQUEST - total));
             if (n <= 0) break;
             total += n;
             req[total] = 0;
-            if (strstr(req, "\r\n\r\n")) break;
+            if (!header_len) {
+                char *header_end = strstr(req, "\r\n\r\n");
+                if (header_end) {
+                    header_len = (int)(header_end - req) + 4;
+                    body_len = http_content_length(req);
+                }
+            }
+            if (header_len && total >= header_len + body_len)
+                break;
         }
 
         if (total > 0) handle_request(client_fd, req);
