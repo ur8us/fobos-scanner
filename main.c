@@ -50,6 +50,7 @@
 /* FFT: powers of 2 from 1024 to 65536 */
 #define FFT_SIZE_MIN        1024
 #define FFT_SIZE_MAX        65536
+#define SINGLE_FFT_SIZE_MAX 1048576
 #define FFT_LEVEL_REF_SIZE  FFT_SIZE_MIN
 #define FFTS_PER_STEP       32
 #define SCAN_BUF_LEN        65536
@@ -72,6 +73,11 @@ static int g_bins_per_step = 512;  /* g_fft_size / 2 */
 static struct fobos_sdr_dev_t *g_dev = NULL;
 static pthread_t g_scan_thread;
 static volatile int g_scanning = 0;
+typedef enum {
+    RUN_MODE_SCAN = 0,
+    RUN_MODE_SINGLE = 1
+} run_mode_t;
+static volatile run_mode_t g_active_mode = RUN_MODE_SCAN;
 static pthread_mutex_t g_fft_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_fft_generation = 1;
 
@@ -231,6 +237,16 @@ static int current_fft_size(void)
     return size;
 }
 
+static int next_power_of_two_int(int value)
+{
+    int size = 1;
+    if (value <= 1)
+        return 1;
+    while (size < value && size <= SINGLE_FFT_SIZE_MAX / 2)
+        size *= 2;
+    return size;
+}
+
 /* ------------------------------------------------------------------ */
 /* Persistent config                                                   */
 /* ------------------------------------------------------------------ */
@@ -383,6 +399,10 @@ static void format_sample_rates_json(char *buf, size_t len)
 
 static int normalize_display_bins(int bins);
 static int current_display_bins(void);
+static int planned_required_points(void);
+static run_mode_t planned_run_mode(void);
+static void clamp_visible_to_config(void);
+static void raw_visible_band(double *out_start, double *out_end);
 static void active_scan_band(double *out_start, double *out_end);
 
 /* ------------------------------------------------------------------ */
@@ -403,6 +423,9 @@ typedef struct {
     int steps_seen;
     int line_num;
     int fft_size;
+    int selected_fft_size;
+    int async_buf_len;
+    int single_mode;
     uint32_t fft_generation;
     double configured_start;
     double configured_end;
@@ -414,6 +437,7 @@ typedef struct {
     double bw_ratio;
     double step_width;
     double last_width;
+    double center_freq;
     uint32_t view_id;
     float mag_scale;
     float *window;
@@ -518,7 +542,22 @@ static void clamp_scan_end_to_hardware_limit(void)
 static int current_scan_plan(double *out_step, double *out_freq_end)
 {
     double step = 0.0;
-    int total_steps = build_scan_frequencies(NULL, &step);
+    int total_steps;
+
+    if (planned_run_mode() == RUN_MODE_SINGLE) {
+        double start;
+        double end;
+        raw_visible_band(&start, &end);
+        step = g_samplerate * g_bw_ratio;
+        total_steps = 1;
+        if (out_step)
+            *out_step = step;
+        if (out_freq_end)
+            *out_freq_end = end;
+        return total_steps;
+    }
+
+    total_steps = build_scan_frequencies(NULL, &step);
 
     if (out_step)
         *out_step = step;
@@ -540,10 +579,92 @@ static int build_device_scan_frequencies(const double *air_freqs, int count, dou
     return 0;
 }
 
-static int scan_bins_per_step_for_width(double width)
+static double receiver_frequency_from_radio(double air_freq)
+{
+    if (g_converter_freq >= 0.0)
+        return air_freq - g_converter_freq;
+    return fabs(-g_converter_freq - air_freq);
+}
+
+static void raw_visible_band(double *out_start, double *out_end)
+{
+    clamp_visible_to_config();
+    *out_start = g_visible_start;
+    *out_end = g_visible_end;
+}
+
+static int required_points_for_band(double start, double end)
+{
+    double step = g_samplerate * g_bw_ratio;
+    double span = end - start;
+    int points;
+
+    if (step <= 0.0 || span <= 0.0)
+        return 0;
+
+    points = (int)ceil(span / step);
+    if (points < 1)
+        points = 1;
+    if (points > MAX_FREQS)
+        points = MAX_FREQS;
+    return points;
+}
+
+static int planned_required_points(void)
+{
+    double start;
+    double end;
+    raw_visible_band(&start, &end);
+    return required_points_for_band(start, end);
+}
+
+static run_mode_t planned_run_mode(void)
+{
+    return (planned_required_points() <= 1) ? RUN_MODE_SINGLE : RUN_MODE_SCAN;
+}
+
+static int single_effective_fft_size_for_span(double span)
+{
+    int selected = current_fft_size();
+    int display_bins = current_display_bins();
+    double needed;
+    int effective;
+
+    if (span <= 0.0 || g_samplerate <= 0.0)
+        return selected;
+
+    needed = ceil(((double)display_bins * g_samplerate) / span);
+    if (needed < selected)
+        needed = selected;
+    if (needed > SINGLE_FFT_SIZE_MAX)
+        needed = SINGLE_FFT_SIZE_MAX;
+
+    effective = next_power_of_two_int((int)needed);
+    if (effective < selected)
+        effective = selected;
+    if (effective > SINGLE_FFT_SIZE_MAX)
+        effective = SINGLE_FFT_SIZE_MAX;
+    return effective;
+}
+
+static int current_effective_fft_size(void)
+{
+    double start;
+    double end;
+    if (planned_run_mode() != RUN_MODE_SINGLE)
+        return current_fft_size();
+    raw_visible_band(&start, &end);
+    return single_effective_fft_size_for_span(end - start);
+}
+
+static const char *run_mode_name(run_mode_t mode)
+{
+    return mode == RUN_MODE_SINGLE ? "single" : "scan";
+}
+
+static int scan_bins_per_step_for_width_and_fft(double width, int fft_size)
 {
     double max_width = g_samplerate * g_bw_ratio;
-    int fft_size = current_fft_size();
     int bins;
     if (width > max_width) width = max_width;
     bins = (int)lrint((width / g_samplerate) * (double)fft_size);
@@ -552,9 +673,20 @@ static int scan_bins_per_step_for_width(double width)
     return bins;
 }
 
+static int scan_bins_per_step_for_width(double width)
+{
+    return scan_bins_per_step_for_width_and_fft(width, current_fft_size());
+}
+
 static int scan_bins_per_step(void)
 {
     double step = 0.0;
+    double start;
+    double end;
+    if (planned_run_mode() == RUN_MODE_SINGLE) {
+        raw_visible_band(&start, &end);
+        return scan_bins_per_step_for_width_and_fft(end - start, current_effective_fft_size());
+    }
     if (build_scan_frequencies(NULL, &step) <= 0)
         return 1;
     return scan_bins_per_step_for_width(g_samplerate * g_bw_ratio);
@@ -568,6 +700,11 @@ static int current_line_bins(void)
     int total_steps;
     int bins_per_step;
     int last_bins;
+
+    if (planned_run_mode() == RUN_MODE_SINGLE) {
+        raw_visible_band(&scan_start, &scan_end);
+        return scan_bins_per_step_for_width_and_fft(scan_end - scan_start, current_effective_fft_size());
+    }
 
     active_scan_band(&scan_start, &scan_end);
     total_steps = build_scan_frequencies_for_band(scan_start, scan_end, NULL, &step);
@@ -607,6 +744,12 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         fft_size = g_fft_size;
         fft_generation = g_fft_generation;
         pthread_mutex_unlock(&g_fft_mutex);
+        ctx->selected_fft_size = fft_size;
+        if (ctx->single_mode) {
+            int effective = single_effective_fft_size_for_span(ctx->visible_end - ctx->visible_start);
+            if (effective > fft_size)
+                fft_size = effective;
+        }
 
         bins_per_step = scan_bins_for_context_width(ctx, ctx->step_width, fft_size);
         last_bins = scan_bins_for_context_width(ctx, ctx->last_width, fft_size);
@@ -624,8 +767,11 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         }
 
         pthread_mutex_lock(&g_fft_mutex);
-        if (fft_size == g_fft_size) {
-            memcpy(window, g_window, (size_t)fft_size * sizeof(float));
+        if (ctx->selected_fft_size == g_fft_size) {
+            if (fft_size == g_fft_size)
+                memcpy(window, g_window, (size_t)fft_size * sizeof(float));
+            else
+                init_window_for_size(window, fft_size);
             fft_generation = g_fft_generation;
             pthread_mutex_unlock(&g_fft_mutex);
             break;
@@ -766,15 +912,17 @@ static void publish_scan_line(scan_ctx_t *ctx)
 
     pos = snprintf(json, 1024,
         "event: line\ndata: {\"view\":%u,\"n\":%d,\"b\":%d,"
+        "\"mode\":\"%s\","
         "\"f0\":%.0f,\"f1\":%.0f,"
         "\"full_f0\":%.0f,\"full_f1\":%.0f,"
         "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
-        "\"display_bins\":%d,\"source_bins\":%d,\"d\":[",
+        "\"display_bins\":%d,\"source_bins\":%d,\"effective_fft_size\":%d,\"d\":[",
         ctx->view_id, ctx->line_num, ctx->total_steps,
+        ctx->single_mode ? "single" : "scan",
         ctx->visible_start, ctx->visible_end,
         ctx->configured_start, ctx->configured_end,
         ctx->visible_start, ctx->visible_end,
-        display_bins, source_bins);
+        display_bins, source_bins, ctx->fft_size);
 
     for (int i = 0; i < display_bins; i++)
         pos += snprintf(json + pos, 5, "%s%d", (i ? "," : ""), line_packed[i]);
@@ -893,7 +1041,7 @@ static void active_scan_band(double *out_start, double *out_end)
     *out_end = end;
 }
 
-static int scan_queue_init(scan_ctx_t *ctx)
+static int scan_queue_init(scan_ctx_t *ctx, uint32_t sample_capacity)
 {
     if (pthread_mutex_init(&ctx->queue_mutex, NULL) != 0)
         return -1;
@@ -902,8 +1050,9 @@ static int scan_queue_init(scan_ctx_t *ctx)
         return -1;
     }
 
+    ctx->async_buf_len = (int)sample_capacity;
     for (int i = 0; i < PROCESS_QUEUE_LEN; i++) {
-        ctx->queue[i].samples = malloc((size_t)SCAN_BUF_LEN * 2 * sizeof(float));
+        ctx->queue[i].samples = malloc((size_t)sample_capacity * 2 * sizeof(float));
         if (!ctx->queue[i].samples) {
             for (int j = 0; j < i; j++) {
                 free(ctx->queue[j].samples);
@@ -939,8 +1088,8 @@ static void scan_queue_push(scan_ctx_t *ctx, int channel, float *buf, uint32_t b
 {
     sample_queue_item_t *item;
 
-    if (buf_len > SCAN_BUF_LEN)
-        buf_len = SCAN_BUF_LEN;
+    if (buf_len > (uint32_t)ctx->async_buf_len)
+        buf_len = (uint32_t)ctx->async_buf_len;
 
     pthread_mutex_lock(&ctx->queue_mutex);
     if (ctx->queue_len >= PROCESS_QUEUE_LEN) {
@@ -1004,7 +1153,7 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
         return;
     }
 
-    channel = fobos_sdr_get_scan_index(dev);
+    channel = ctx->single_mode ? 0 : fobos_sdr_get_scan_index(dev);
     if (channel < 0 || channel >= ctx->total_steps)
         return;
 
@@ -1022,38 +1171,64 @@ static void *scan_thread_func(void *arg)
     double scan_start = 0.0;
     double scan_end = 0.0;
     double step = 0.0;
+    double device_center = 0.0;
+    run_mode_t mode;
     int total_steps;
     scan_ctx_t ctx;
     int ret;
     int worker_started = 0;
+    uint32_t async_len;
 
-    active_scan_band(&scan_start, &scan_end);
-    total_steps = build_scan_frequencies_for_band(scan_start, scan_end, air_freqs, &step);
+    mode = planned_run_mode();
+    g_active_mode = mode;
 
-    if (total_steps < FOBOS_MIN_FREQS_CNT) {
-        fprintf(stderr, "[SDR] Hardware scan needs at least %d frequencies\n", FOBOS_MIN_FREQS_CNT);
-        g_scanning = 0;
-        return NULL;
-    }
+    if (mode == RUN_MODE_SINGLE) {
+        raw_visible_band(&scan_start, &scan_end);
+        if (scan_end <= scan_start) {
+            g_scanning = 0;
+            return NULL;
+        }
+        total_steps = 1;
+        step = scan_end - scan_start;
+        device_center = receiver_frequency_from_radio((scan_start + scan_end) * 0.5);
+        if (device_center < 0.0) {
+            fprintf(stderr, "[SDR] Converter frequency makes receiver frequency negative\n");
+            g_scanning = 0;
+            return NULL;
+        }
+    } else {
+        active_scan_band(&scan_start, &scan_end);
+        total_steps = build_scan_frequencies_for_band(scan_start, scan_end, air_freqs, &step);
 
-    if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) {
-        fprintf(stderr, "[SDR] Converter frequency makes hardware scan frequency negative\n");
-        g_scanning = 0;
-        return NULL;
+        if (total_steps < FOBOS_MIN_FREQS_CNT) {
+            fprintf(stderr, "[SDR] Hardware scan needs at least %d frequencies\n", FOBOS_MIN_FREQS_CNT);
+            g_scanning = 0;
+            return NULL;
+        }
+
+        if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) {
+            fprintf(stderr, "[SDR] Converter frequency makes hardware scan frequency negative\n");
+            g_scanning = 0;
+            return NULL;
+        }
     }
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.total_steps = total_steps;
+    ctx.single_mode = (mode == RUN_MODE_SINGLE);
     ctx.samplerate = g_samplerate;
     ctx.bw_ratio = g_bw_ratio;
     ctx.step_width = step;
-    ctx.last_width = scan_last_width_for_band(scan_start, scan_end, total_steps, step);
+    ctx.last_width = ctx.single_mode ? (scan_end - scan_start) :
+        scan_last_width_for_band(scan_start, scan_end, total_steps, step);
     ctx.configured_start = g_freq_start;
     ctx.configured_end = g_freq_end;
     ctx.visible_start = g_visible_start;
     ctx.visible_end = g_visible_end;
     ctx.scan_start = scan_start;
-    ctx.scan_end = build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
+    ctx.scan_end = ctx.single_mode ? scan_end :
+        build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
+    ctx.center_freq = (scan_start + scan_end) * 0.5;
     ctx.view_id = g_view_id;
 
     if (scan_ctx_apply_fft_config(&ctx) != 0) {
@@ -1062,7 +1237,8 @@ static void *scan_thread_func(void *arg)
         return NULL;
     }
 
-    if (scan_queue_init(&ctx) != 0) {
+    async_len = ctx.single_mode ? (uint32_t)ctx.fft_size : SCAN_BUF_LEN;
+    if (scan_queue_init(&ctx, async_len) != 0) {
         fprintf(stderr, "[SDR] Out of memory\n");
         free(ctx.window);
         free(ctx.fft_scratch);
@@ -1093,23 +1269,36 @@ static void *scan_thread_func(void *arg)
     ret = fobos_sdr_set_direct_sampling(g_dev, g_direct_sampling);
     if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_direct_sampling failed: %d\n", ret);
 
-    printf("[SDR] Hardware scan: air band %.0f - %.0f Hz, converter %.0f Hz, SDR centers %.0f - %.0f Hz, step %.0f Hz (%d freqs, max %d)\n",
-           ctx.scan_start, ctx.scan_end, g_converter_freq,
-           device_freqs[0], device_freqs[total_steps - 1], step, total_steps, MAX_FREQS);
+    if (ctx.single_mode) {
+        fobos_sdr_stop_scan(g_dev);
+        ret = fobos_sdr_set_frequency(g_dev, device_center);
+        if (ret != FOBOS_ERR_OK) {
+            fprintf(stderr, "[SDR] set_frequency failed: %d\n", ret);
+            g_scanning = 0;
+        }
+        printf("[SDR] Single stream: air band %.0f - %.0f Hz, converter %.0f Hz, SDR center %.0f Hz, fft %d effective %d, async %u\n",
+               ctx.scan_start, ctx.scan_end, g_converter_freq,
+               device_center, ctx.selected_fft_size, ctx.fft_size, async_len);
+    } else {
+        printf("[SDR] Hardware scan: air band %.0f - %.0f Hz, converter %.0f Hz, SDR centers %.0f - %.0f Hz, step %.0f Hz (%d freqs, max %d)\n",
+               ctx.scan_start, ctx.scan_end, g_converter_freq,
+               device_freqs[0], device_freqs[total_steps - 1], step, total_steps, MAX_FREQS);
 
-    ret = fobos_sdr_start_scan(g_dev, device_freqs, (unsigned int)total_steps);
-    if (ret != FOBOS_ERR_OK) {
-        fprintf(stderr, "[SDR] fobos_sdr_start_scan failed: %d\n", ret);
-        g_scanning = 0;
+        ret = fobos_sdr_start_scan(g_dev, device_freqs, (unsigned int)total_steps);
+        if (ret != FOBOS_ERR_OK) {
+            fprintf(stderr, "[SDR] fobos_sdr_start_scan failed: %d\n", ret);
+            g_scanning = 0;
+        }
     }
 
     if (g_scanning) {
-        ret = fobos_sdr_read_async(g_dev, scan_callback, &ctx, 16, SCAN_BUF_LEN);
+        ret = fobos_sdr_read_async(g_dev, scan_callback, &ctx, 16, async_len);
         if (ret != FOBOS_ERR_OK && g_scanning)
             fprintf(stderr, "[SDR] fobos_sdr_read_async failed: %d\n", ret);
     }
 
-    fobos_sdr_stop_scan(g_dev);
+    if (!ctx.single_mode)
+        fobos_sdr_stop_scan(g_dev);
     if (worker_started) {
         scan_queue_stop(&ctx);
         pthread_join(ctx.worker_thread, NULL);
@@ -1134,20 +1323,33 @@ static int start_scan(void)
 {
     double air_freqs[MAX_FREQS];
     double device_freqs[MAX_FREQS];
+    double start;
+    double end;
     double step = 0.0;
     int total_steps;
+    run_mode_t mode;
 
     /* If already scanning, restart with new params */
     if (g_scanning) {
         g_scanning = 0;
         fobos_sdr_cancel_async(g_dev);
         pthread_join(g_scan_thread, NULL);
-        fobos_sdr_stop_scan(g_dev);
+        if (g_active_mode == RUN_MODE_SCAN)
+            fobos_sdr_stop_scan(g_dev);
     }
 
-    total_steps = build_scan_frequencies(air_freqs, &step);
-    if (total_steps < FOBOS_MIN_FREQS_CNT) return -1;
-    if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) return -1;
+    mode = planned_run_mode();
+    if (mode == RUN_MODE_SINGLE) {
+        raw_visible_band(&start, &end);
+        if (end <= start)
+            return -1;
+        if (receiver_frequency_from_radio((start + end) * 0.5) < 0.0)
+            return -1;
+    } else {
+        total_steps = build_scan_frequencies(air_freqs, &step);
+        if (total_steps < FOBOS_MIN_FREQS_CNT) return -1;
+        if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) return -1;
+    }
 
     if (!g_dev) {
         if (fobos_sdr_get_device_count() <= 0) return -1;
@@ -1194,6 +1396,22 @@ static int apply_gain_settings(void)
 /* ------------------------------------------------------------------ */
 __attribute__((unused)) static void _nowarn(void *x) { (void)x; }
 #define WRITE(fd, buf, len) do { ssize_t _r = write(fd, buf, len); _nowarn((void*)_r); } while(0)
+
+static void send_json_response(int client_fd, int code, const char *reason,
+                               const char *cors, const char *body)
+{
+    char header[512];
+    size_t len = strlen(body);
+    int n = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "%s\r\n",
+        code, reason, len, cors);
+    WRITE(client_fd, header, (size_t)n);
+    WRITE(client_fd, body, len);
+}
 
 static void handle_request(int client_fd, const char *req)
 {
@@ -1246,13 +1464,22 @@ static void handle_request(int client_fd, const char *req)
         double scan_start = 0.0;
         double scan_end = 0.0;
         int total_steps;
+        int required_points = planned_required_points();
+        run_mode_t mode = planned_run_mode();
         int bins_per_step = scan_bins_per_step();
         int line_bins = current_line_bins();
         int display_bins = current_display_bins();
+        int effective_fft = current_effective_fft_size();
 
-        active_scan_band(&scan_start, &scan_end);
-        total_steps = build_scan_frequencies_for_band(scan_start, scan_end, NULL, &step);
-        scan_end = build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
+        if (mode == RUN_MODE_SINGLE) {
+            raw_visible_band(&scan_start, &scan_end);
+            step = g_samplerate * g_bw_ratio;
+            total_steps = 1;
+        } else {
+            active_scan_band(&scan_start, &scan_end);
+            total_steps = build_scan_frequencies_for_band(scan_start, scan_end, NULL, &step);
+            scan_end = build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
+        }
         format_sample_rates_json(sample_rates, sizeof(sample_rates));
 
         int n = snprintf(body, sizeof(body),
@@ -1266,8 +1493,9 @@ static void handle_request(int client_fd, const char *req)
             "\"scan_start_hz\":%.0f,\"scan_end_hz\":%.0f,"
             "\"samplerate\":%.0f,\"bw_ratio\":%.2f,"
             "\"step_hz\":%.0f,\"steps\":%d,"
+            "\"required_points\":%d,\"mode\":\"%s\",\"active_mode\":\"%s\","
             "\"bins_per_step\":%d,\"line_bins\":%d,\"display_bins\":%d,"
-            "\"view_id\":%u,\"fft_size\":%d,"
+            "\"view_id\":%u,\"fft_size\":%d,\"effective_fft_size\":%d,"
             "\"lna_gain\":%u,\"vga_gain\":%u,\"direct_sampling\":%u,"
             "\"sample_rates\":%s}",
             g_hw_rev, g_fw_ver, g_serial,
@@ -1280,8 +1508,9 @@ static void handle_request(int client_fd, const char *req)
             scan_end,
             g_samplerate, g_bw_ratio,
             step, total_steps,
+            required_points, run_mode_name(mode), run_mode_name(g_active_mode),
             bins_per_step, line_bins, display_bins,
-            g_view_id, current_fft_size(),
+            g_view_id, current_fft_size(), effective_fft,
             g_lna_gain, g_vga_gain, g_direct_sampling,
             sample_rates);
 
@@ -1370,22 +1599,23 @@ static void handle_request(int client_fd, const char *req)
         double step = 0.0;
         double scan_end = 0.0;
         int total_steps = current_scan_plan(&step, &scan_end);
-        char resp[1024];
-        int n = snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n%s\r\n"
+        run_mode_t mode = planned_run_mode();
+        char json_body[1024];
+        snprintf(json_body, sizeof(json_body),
             "{\"status\":\"%s\",\"freq_start\":%.0f,\"freq_end\":%.0f,"
             "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
             "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
             "\"converter_freq\":%.0f,\"steps\":%d,\"step_hz\":%.0f,"
-            "\"display_bins\":%d,\"view_id\":%u}",
-            cors, status,
+            "\"required_points\":%d,\"mode\":\"%s\","
+            "\"display_bins\":%d,\"view_id\":%u,\"effective_fft_size\":%d}",
+            status,
             g_freq_start, g_freq_end,
             g_freq_start, g_freq_end,
             g_visible_start, g_visible_end,
             g_converter_freq, total_steps, step,
-            current_display_bins(), g_view_id);
-        WRITE(client_fd, resp, (size_t)n);
+            planned_required_points(), run_mode_name(mode),
+            current_display_bins(), g_view_id, current_effective_fft_size());
+        send_json_response(client_fd, 200, "OK", cors, json_body);
         close(client_fd);
         return;
     }
@@ -1455,23 +1685,25 @@ static void handle_request(int client_fd, const char *req)
             double step = 0.0;
             double scan_end = 0.0;
             int total_steps = current_scan_plan(&step, &scan_end);
-            char resp[1024];
-            int n = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n%s\r\n"
+            run_mode_t mode = planned_run_mode();
+            char json_body[1024];
+            snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"view_id\":%u,"
                 "\"freq_start\":%.0f,\"freq_end\":%.0f,"
                 "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
                 "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
                 "\"steps\":%d,\"step_hz\":%.0f,\"display_bins\":%d,"
-                "\"scanning\":%d}",
-                cors, (ret == 0) ? "ok" : "error", g_view_id,
+                "\"required_points\":%d,\"mode\":\"%s\","
+                "\"effective_fft_size\":%d,\"scanning\":%d}",
+                (ret == 0) ? "ok" : "error", g_view_id,
                 g_freq_start, g_freq_end,
                 g_freq_start, g_freq_end,
                 g_visible_start, g_visible_end,
                 total_steps, step, current_display_bins(),
+                planned_required_points(), run_mode_name(mode),
+                current_effective_fft_size(),
                 g_scanning);
-            WRITE(client_fd, resp, (size_t)n);
+            send_json_response(client_fd, 200, "OK", cors, json_body);
         }
         close(client_fd);
         return;
@@ -1497,21 +1729,17 @@ static void handle_request(int client_fd, const char *req)
         if (fft_tmp >= FFT_SIZE_MIN && fft_tmp <= FFT_SIZE_MAX) {
             update_fft_size((int)fft_tmp);
             save_config();
-            char resp[256];
-            int n = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n%s\r\n"
+            char json_body[256];
+            snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"ok\",\"fft_size\":%d,\"scanning\":%d}",
-                cors, current_fft_size(), g_scanning);
-            WRITE(client_fd, resp, (size_t)n);
+                current_fft_size(), g_scanning);
+            send_json_response(client_fd, 200, "OK", cors, json_body);
         } else {
-            char resp[256];
-            int n = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 400 Bad Request\r\n"
-                "Content-Type: application/json\r\n%s\r\n"
+            char json_body[256];
+            snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"error\",\"fft_size\":%d}",
-                cors, current_fft_size());
-            WRITE(client_fd, resp, (size_t)n);
+                current_fft_size());
+            send_json_response(client_fd, 400, "Bad Request", cors, json_body);
         }
         close(client_fd);
         return;
@@ -1544,13 +1772,11 @@ static void handle_request(int client_fd, const char *req)
 
         int ret = apply_gain_settings();
         const char *status = (ret == FOBOS_ERR_OK) ? "ok" : "error";
-        char resp[512];
-        int n = snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n%s\r\n"
+        char json_body[256];
+        snprintf(json_body, sizeof(json_body),
             "{\"status\":\"%s\",\"lna_gain\":%u,\"vga_gain\":%u}",
-            cors, status, g_lna_gain, g_vga_gain);
-        WRITE(client_fd, resp, (size_t)n);
+            status, g_lna_gain, g_vga_gain);
+        send_json_response(client_fd, 200, "OK", cors, json_body);
         close(client_fd);
         return;
     }
@@ -1558,12 +1784,7 @@ static void handle_request(int client_fd, const char *req)
     /* POST /api/stop */
     if (strcmp(method, "POST") == 0 && strcmp(path, "/api/stop") == 0) {
         stop_scan();
-        char resp[512];
-        int n = snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n%s\r\n"
-            "{\"status\":\"ok\"}", cors);
-        WRITE(client_fd, resp, (size_t)n);
+        send_json_response(client_fd, 200, "OK", cors, "{\"status\":\"ok\"}");
         close(client_fd);
         return;
     }

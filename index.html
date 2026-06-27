@@ -105,6 +105,14 @@
                 background: #506070;
                 transform: translateX(-0.5px);
             }
+            .wf-tick.mid {
+                height: 8px;
+                background: #405060;
+            }
+            .wf-tick.minor {
+                height: 4px;
+                background: #303a46;
+            }
             .wf-tick-label {
                 position: absolute;
                 bottom: 14px;
@@ -285,7 +293,7 @@
                 <span>HW: <span class="val" id="infoHw">---</span></span>
                 <span>FW: <span class="val" id="infoFw">---</span></span>
                 <span>S/N: <span class="val" id="infoSn">---</span></span>
-                <span>Scan: <span class="val" id="infoRange">---</span></span>
+                <span>Shown: <span class="val" id="infoRange">---</span></span>
                 <span>Steps: <span class="val" id="infoSteps">---</span></span>
                 <span>Lines: <span class="val" id="infoLines">0</span></span>
                 <span>Zoom (press SHIFT): <span class="val" id="infoZoom">1.00x</span></span>
@@ -863,17 +871,24 @@
             }
 
             function formatScanRange(freqStart, freqEnd) {
-                const start = freqStart / 1e6;
-                const end = freqEnd / 1e6;
-                const span = Math.abs(end - start);
+                const start = formatMHzValue(freqStart);
+                const end = formatMHzValue(freqEnd);
+                const span = formatMHzValue(Math.abs(freqEnd - freqStart));
                 return (
-                    start.toFixed(0) +
+                    start +
                     " - " +
-                    end.toFixed(0) +
+                    end +
                     " (" +
-                    span.toFixed(0) +
+                    span +
                     ") MHz"
                 );
+            }
+
+            function formatMHzValue(freq) {
+                return (freq / 1e6)
+                    .toFixed(3)
+                    .replace(/0+$/, "")
+                    .replace(/\.$/, "");
             }
 
             function tickTargetCount(width) {
@@ -951,23 +966,70 @@
                 return (freq / 1e6).toFixed(decimals) + " MHz";
             }
 
-            function buildFrequencyTicks(left, right, width) {
+            function subdivisionCountForStep(step) {
+                if (step <= 0) return 0;
+                const pow = Math.pow(10, Math.floor(Math.log10(step)));
+                const lead = step / pow;
+                return Math.abs(lead - 5) < 1e-9 ? 5 : 10;
+            }
+
+            function tickKey(freq) {
+                return Math.round(freq);
+            }
+
+            function buildFrequencyMarks(left, right, width) {
                 if (right <= left) return [];
                 const step = chooseFrequencyStep(left, right, width);
-                const ticks = [];
+                const marks = [];
+                const seen = new Set();
                 const eps = step * 1e-9;
                 let freq = Math.ceil((left - eps) / step) * step;
                 const end = Math.floor((right + eps) / step) * step;
-                while (freq <= end + eps && ticks.length <= TICK_MAX_COUNT) {
+                while (freq <= end + eps && marks.length < TICK_MAX_COUNT) {
                     const pos = ((freq - left) / (right - left)) * 100;
-                    ticks.push({
+                    marks.push({
                         pos: Math.max(0, Math.min(100, pos)),
                         freq,
                         step,
+                        kind: "major",
                     });
+                    seen.add(tickKey(freq));
                     freq += step;
                 }
-                return ticks;
+
+                const subdivisions = subdivisionCountForStep(step);
+                const minorStep = step / subdivisions;
+                for (
+                    let major = Math.ceil((left - step - eps) / step) * step;
+                    major <= right + step + eps;
+                    major += step
+                ) {
+                    for (let i = 1; i < subdivisions; i++) {
+                        const minorFreq = major + minorStep * i;
+                        if (minorFreq <= left + eps || minorFreq >= right - eps)
+                            continue;
+                        const key = tickKey(minorFreq);
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        marks.push({
+                            pos:
+                                ((minorFreq - left) / (right - left)) *
+                                100,
+                            freq: minorFreq,
+                            step,
+                            kind:
+                                subdivisions === 10 && i === 5
+                                    ? "mid"
+                                    : "minor",
+                        });
+                    }
+                }
+
+                return marks.sort((a, b) => {
+                    if (a.pos !== b.pos) return a.pos - b.pos;
+                    if (a.kind === b.kind) return 0;
+                    return a.kind === "major" ? -1 : 1;
+                });
             }
 
             function updateZoomIndicator() {
@@ -988,7 +1050,7 @@
                     steps,
                     currentBins ? currentBins.length : 0,
                 );
-                const ticks = buildFrequencyTicks(
+                const ticks = buildFrequencyMarks(
                     axis.left,
                     axis.right,
                     overlay.clientWidth || wfCanvas.width,
@@ -998,13 +1060,19 @@
                     ...ticks.map((tick) => {
                         const mark = document.createElement("div");
                         const label = document.createElement("div");
-                        mark.className = "wf-tick";
+                        mark.className =
+                            "wf-tick" + (tick.kind === "major" ? "" : " " + tick.kind);
                         if (tick.pos < 2) mark.classList.add("edge-start");
                         if (tick.pos > 98) mark.classList.add("edge-end");
                         mark.style.left = tick.pos + "%";
-                        label.className = "wf-tick-label";
-                        label.textContent = formatTickMHz(tick.freq, tick.step);
-                        mark.appendChild(label);
+                        if (tick.kind === "major") {
+                            label.className = "wf-tick-label";
+                            label.textContent = formatTickMHz(
+                                tick.freq,
+                                tick.step,
+                            );
+                            mark.appendChild(label);
+                        }
                         return mark;
                     }),
                 );
@@ -1056,6 +1124,58 @@
                     pix[i + 1] = 0;
                     pix[i + 2] = 0;
                     pix[i + 3] = 255;
+                }
+            }
+
+            function transformWaterfallPixels(prevStart, prevEnd, nextStart, nextEnd) {
+                if (!wfImageData) return;
+                const w = wfImageData.width;
+                const h = wfImageData.height;
+                const prevSpan = prevEnd - prevStart;
+                const nextSpan = nextEnd - nextStart;
+                if (w <= 0 || h <= 0 || prevSpan <= 0 || nextSpan <= 0) return;
+
+                const source = new Uint8ClampedArray(wfImageData.data);
+                const imageData = wfCtx.createImageData(w, h);
+                const dest = imageData.data;
+
+                for (let y = 0; y < h; y++) {
+                    const rowOffset = y * w * 4;
+                    for (let x = 0; x < w; x++) {
+                        const freq =
+                            nextStart + ((x + 0.5) / w) * nextSpan;
+                        const srcX = Math.floor(
+                            ((freq - prevStart) / prevSpan) * w,
+                        );
+                        const dst = rowOffset + x * 4;
+                        if (srcX >= 0 && srcX < w) {
+                            const src = rowOffset + srcX * 4;
+                            dest[dst] = source[src];
+                            dest[dst + 1] = source[src + 1];
+                            dest[dst + 2] = source[src + 2];
+                            dest[dst + 3] = 255;
+                        } else {
+                            dest[dst] = 0;
+                            dest[dst + 1] = 0;
+                            dest[dst + 2] = 0;
+                            dest[dst + 3] = 255;
+                        }
+                    }
+                }
+
+                wfImageData = imageData;
+                wfCtx.putImageData(wfImageData, 0, 0);
+            }
+
+            function transformVisibleDisplay(prevStart, prevEnd, nextStart, nextEnd) {
+                transformWaterfallPixels(prevStart, prevEnd, nextStart, nextEnd);
+                if (currentBins && currentBins.length) {
+                    drawScope(
+                        currentBins,
+                        currentBinsFreq0 || prevStart,
+                        currentBinsFreq1 || prevEnd,
+                        currentSteps,
+                    );
                 }
             }
 
@@ -1421,8 +1541,12 @@
             async function checkBackendStatus() {
                 if (statusPollInFlight) return null;
                 statusPollInFlight = true;
-                const status = await apiGet("/api/status");
-                statusPollInFlight = false;
+                let status = null;
+                try {
+                    status = await apiGet("/api/status");
+                } finally {
+                    statusPollInFlight = false;
+                }
 
                 if (!status) {
                     updateUI(false, false);
@@ -1552,12 +1676,15 @@
                 right = Math.min(fullEnd, right);
                 if (right <= left) return;
 
+                const prevFreq0 = currentFreq0;
+                const prevFreq1 = currentFreq1;
                 zoomLeft = 0;
                 zoomRight = 1;
                 currentFreq0 = left;
                 currentFreq1 = right;
                 pendingViewChange = true;
                 binRangeCache = null;
+                transformVisibleDisplay(prevFreq0, prevFreq1, currentFreq0, currentFreq1);
                 scheduleCurrentViewRedraw();
                 updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
                 document.getElementById("infoRange").textContent =
@@ -1630,10 +1757,13 @@
                     return;
                 }
 
+                const prevFreq0 = currentFreq0;
+                const prevFreq1 = currentFreq1;
                 currentFreq0 = clamped.left;
                 currentFreq1 = clamped.right;
                 pendingViewChange = true;
                 binRangeCache = null;
+                transformVisibleDisplay(prevFreq0, prevFreq1, currentFreq0, currentFreq1);
                 scheduleCurrentViewRedraw();
                 updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
                 document.getElementById("infoRange").textContent =
@@ -1680,26 +1810,33 @@
             // ===================================================================
             //  API calls
             // ===================================================================
-            async function apiPost(url, body) {
+            async function apiFetchJson(url, options = {}) {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 5000);
                 try {
                     const resp = await fetch(url, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(body),
+                        ...options,
+                        signal: controller.signal,
                     });
+                    if (!resp.ok) return null;
                     return await resp.json();
                 } catch (e) {
                     return null;
+                } finally {
+                    clearTimeout(timer);
                 }
             }
 
+            async function apiPost(url, body) {
+                return apiFetchJson(url, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
+                });
+            }
+
             async function apiGet(url) {
-                try {
-                    const resp = await fetch(url);
-                    return await resp.json();
-                } catch (e) {
-                    return null;
-                }
+                return apiFetchJson(url);
             }
 
             function applyViewPlan(plan, clearOnViewChange) {
