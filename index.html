@@ -56,6 +56,10 @@
                 background: #40c040;
                 box-shadow: 0 0 8px #40c04088;
             }
+            .status-dot.disconnected {
+                background: #c04040;
+                box-shadow: 0 0 8px #c0404088;
+            }
 
             .waterfall-wrap {
                 position: relative;
@@ -70,6 +74,10 @@
                 width: 100%;
                 height: 600px;
                 cursor: crosshair;
+            }
+            body.zoom-mode #waterfall,
+            body.zoom-mode #scope {
+                cursor: zoom-in;
             }
             .freq-scale {
                 position: relative;
@@ -374,13 +382,14 @@
                 </div>
                 <div class="ctrl-group">
                     <label>FFT</label>
-                    <select id="fftSize" disabled>
-                        <option value="128">128</option>
-                        <option value="256">256</option>
-                        <option value="512">512</option>
+                    <select id="fftSize">
                         <option value="1024" selected>1024</option>
                         <option value="2048">2048</option>
                         <option value="4096">4096</option>
+                        <option value="8192">8192</option>
+                        <option value="16384">16384</option>
+                        <option value="32768">32768</option>
+                        <option value="65536">65536</option>
                     </select>
                 </div>
                 <div class="ctrl-group">
@@ -392,7 +401,7 @@
                         type="range"
                         id="wfMin"
                         min="0"
-                        max="300"
+                        max="400"
                         value="0"
                         step="1"
                     />
@@ -406,7 +415,7 @@
                         type="range"
                         id="wfMax"
                         min="1"
-                        max="300"
+                        max="400"
                         value="15"
                         step="1"
                     />
@@ -440,7 +449,13 @@
             let wfRows = [];
             let waterfallMin = 0;
             let waterfallMax = 15;
+            let zoomLeft = 0;
+            let zoomRight = 1;
             let lutReady = false;
+            let scanRunning = false;
+            let backendOnline = false;
+            let scanRequestSerial = 0;
+            let statusPollInFlight = false;
 
             function resizeCanvases() {
                 const rect = wfCanvas.parentElement.getBoundingClientRect();
@@ -538,6 +553,122 @@
                 };
             }
 
+            function minZoomSpan(binCount) {
+                if (!binCount || binCount <= 0) return 0.002;
+                return Math.min(1, Math.max(4 / binCount, 0.002));
+            }
+
+            function clampZoomRange(binCount) {
+                const minSpan = minZoomSpan(binCount);
+                let left = Math.max(0, Math.min(1, zoomLeft));
+                let right = Math.max(0, Math.min(1, zoomRight));
+                if (right < left) {
+                    const tmp = left;
+                    left = right;
+                    right = tmp;
+                }
+
+                let span = right - left;
+                if (span < minSpan) {
+                    const center = (left + right) * 0.5;
+                    span = minSpan;
+                    left = center - span * 0.5;
+                    right = center + span * 0.5;
+                }
+                if (left < 0) {
+                    right -= left;
+                    left = 0;
+                }
+                if (right > 1) {
+                    left -= right - 1;
+                    right = 1;
+                }
+                left = Math.max(0, left);
+                right = Math.min(1, right);
+
+                zoomLeft = left;
+                zoomRight = right;
+                return { left, right };
+            }
+
+            function getZoomedFrequencyAxis(freqStart, freqEnd, steps, binCount) {
+                const axis = getFrequencyAxis(freqStart, freqEnd, steps);
+                const range = clampZoomRange(binCount);
+                const span = axis.right - axis.left;
+                const left = axis.left + span * range.left;
+                const right = axis.left + span * range.right;
+                return {
+                    left,
+                    right,
+                    center: (left + right) * 0.5,
+                    step: axis.step,
+                };
+            }
+
+            function dataIndexForCanvasX(x, width, binCount, zoomRange) {
+                if (!binCount || binCount <= 0 || width <= 0) return 0;
+                const range = zoomRange || clampZoomRange(binCount);
+                const pos = Math.max(0, Math.min(width - 1, x));
+                const frac = width > 1 ? pos / (width - 1) : 0;
+                const idx = Math.floor(
+                    (range.left + frac * (range.right - range.left)) *
+                        binCount,
+                );
+                return Math.max(0, Math.min(binCount - 1, idx));
+            }
+
+            function dataBinRangeForCanvasX(x, width, binCount, zoomRange) {
+                if (!binCount || binCount <= 0 || width <= 0) {
+                    return { first: 0, last: 1 };
+                }
+                const range = zoomRange || clampZoomRange(binCount);
+                const span = range.right - range.left;
+                const leftFrac = Math.max(0, Math.min(1, x / width));
+                const rightFrac = Math.max(0, Math.min(1, (x + 1) / width));
+                let first = Math.floor(
+                    (range.left + leftFrac * span) * binCount,
+                );
+                let last = Math.ceil(
+                    (range.left + rightFrac * span) * binCount,
+                );
+                first = Math.max(0, Math.min(binCount - 1, first));
+                last = Math.max(first + 1, Math.min(binCount, last));
+                return { first, last };
+            }
+
+            function dataPeakForCanvasX(data, x, width, zoomRange) {
+                const binRange = dataBinRangeForCanvasX(
+                    x,
+                    width,
+                    data.length,
+                    zoomRange,
+                );
+                let peak = 0;
+                for (let i = binRange.first; i < binRange.last; i++) {
+                    if (data[i] > peak) peak = data[i];
+                }
+                return peak | 0;
+            }
+
+            function redrawCurrentView() {
+                if (currentBins && currentBins.length) {
+                    redrawWaterfallHistory();
+                    drawScope(
+                        currentBins,
+                        currentFreq0,
+                        currentFreq1,
+                        currentSteps,
+                    );
+                }
+                if (currentFreq0 && currentFreq1 && currentSteps) {
+                    updateFrequencyLabels(
+                        currentFreq0,
+                        currentFreq1,
+                        currentSteps,
+                    );
+                }
+            }
+
             function formatMHz(freq) {
                 const mhz = freq / 1e6;
                 if (Number.isInteger(mhz)) return mhz.toFixed(0) + " MHz";
@@ -546,8 +677,27 @@
                 return mhz.toFixed(3) + " MHz";
             }
 
+            function formatScanRange(freqStart, freqEnd) {
+                const start = freqStart / 1e6;
+                const end = freqEnd / 1e6;
+                const span = Math.abs(end - start);
+                return (
+                    start.toFixed(0) +
+                    " - " +
+                    end.toFixed(0) +
+                    " (" +
+                    span.toFixed(0) +
+                    ") MHz"
+                );
+            }
+
             function updateFrequencyLabels(freqStart, freqEnd, steps) {
-                const axis = getFrequencyAxis(freqStart, freqEnd, steps);
+                const axis = getZoomedFrequencyAxis(
+                    freqStart,
+                    freqEnd,
+                    steps,
+                    currentBins ? currentBins.length : 0,
+                );
                 const overlay = document.getElementById("freqScale");
                 const span = axis.right - axis.left;
                 const ticks = [
@@ -578,10 +728,11 @@
                     0,
                     Math.min(rect.width, clientX - rect.left),
                 );
-                const axis = getFrequencyAxis(
+                const axis = getZoomedFrequencyAxis(
                     currentFreq0,
                     currentFreq1,
                     currentSteps,
+                    currentBins ? currentBins.length : 0,
                 );
                 if (axis.right <= axis.left || rect.width <= 0) return null;
                 return axis.left + (x / rect.width) * (axis.right - axis.left);
@@ -631,10 +782,14 @@
                 for (let y = 0; y < rows; y++) {
                     const row = wfRows[y];
                     const n = row.length;
+                    const range = clampZoomRange(n);
                     const rowOffset = y * w * 4;
                     for (let x = 0; x < w; x++) {
-                        const idx = Math.floor((x / w) * n);
-                        writeWaterfallPixel(pix, rowOffset + x * 4, row[idx]);
+                        writeWaterfallPixel(
+                            pix,
+                            rowOffset + x * 4,
+                            dataPeakForCanvasX(row, x, w, range),
+                        );
                     }
                 }
 
@@ -657,10 +812,14 @@
 
                 // Map data bins to canvas pixels
                 const n = data.length;
+                const range = clampZoomRange(n);
                 for (let x = 0; x < w; x++) {
-                    const idx = Math.floor((x / w) * n);
                     const bi = topRow + x * 4;
-                    writeWaterfallPixel(pix, bi, data[idx]);
+                    writeWaterfallPixel(
+                        pix,
+                        bi,
+                        dataPeakForCanvasX(data, x, w, range),
+                    );
                 }
 
                 wfCtx.putImageData(wfImageData, 0, 0);
@@ -698,9 +857,9 @@
                 scCtx.strokeStyle = "#40c0a0";
                 scCtx.lineWidth = 1.5;
                 scCtx.beginPath();
+                const range = clampZoomRange(n);
                 for (let x = 0; x < w; x++) {
-                    const idx = Math.floor((x / w) * n);
-                    const v = (data[idx] | 0) / 255;
+                    const v = dataPeakForCanvasX(data, x, w, range) / 255;
                     const y = h - 5 - v * (h - 10);
                     if (x === 0) scCtx.moveTo(x, y);
                     else scCtx.lineTo(x, y);
@@ -710,13 +869,21 @@
                 // Peak dot
                 let maxVal = 0,
                     maxX = 0;
-                for (let i = 0; i < n; i++) {
+                const firstBin = Math.max(0, Math.floor(range.left * n));
+                const lastBin = Math.min(
+                    n,
+                    Math.max(firstBin + 1, Math.ceil(range.right * n)),
+                );
+                for (let i = firstBin; i < lastBin; i++) {
                     if (data[i] > maxVal) {
                         maxVal = data[i];
                         maxX = i;
                     }
                 }
-                const px = (maxX / n) * w;
+                const px =
+                    ((maxX / n - range.left) /
+                        Math.max(0.000001, range.right - range.left)) *
+                    w;
                 const py = h - 5 - (maxVal / 255) * (h - 10);
                 scCtx.fillStyle = "#ff8040";
                 scCtx.beginPath();
@@ -765,10 +932,7 @@
                         document.getElementById("infoLines").textContent =
                             linesCount;
                         document.getElementById("infoRange").textContent =
-                            (currentFreq0 / 1e6).toFixed(0) +
-                            " - " +
-                            (currentFreq1 / 1e6).toFixed(0) +
-                            " MHz";
+                            formatScanRange(currentFreq0, currentFreq1);
                         if (data.b)
                             document.getElementById("infoSteps").textContent =
                                 data.b;
@@ -778,7 +942,7 @@
                 });
 
                 eventSource.onerror = function () {
-                    /* auto-reconnect */
+                    checkBackendStatus();
                 };
             }
 
@@ -787,6 +951,27 @@
                     eventSource.close();
                     eventSource = null;
                 }
+            }
+
+            async function checkBackendStatus() {
+                if (statusPollInFlight) return null;
+                statusPollInFlight = true;
+                const status = await apiGet("/api/status");
+                statusPollInFlight = false;
+
+                if (!status) {
+                    updateUI(false, false);
+                    disconnectSSE();
+                    return null;
+                }
+
+                updateUI(!!status.scanning, true);
+                if (status.scanning) {
+                    if (!eventSource) connectSSE();
+                } else {
+                    disconnectSSE();
+                }
+                return status;
             }
 
             // ===================================================================
@@ -816,14 +1001,12 @@
                         0,
                         Math.min(rect.width - 1, evt.clientX - rect.left),
                     );
-                    const idx = Math.max(
-                        0,
-                        Math.min(
-                            currentBins.length - 1,
-                            Math.floor((x / rect.width) * currentBins.length),
-                        ),
+                    const level = dataPeakForCanvasX(
+                        currentBins,
+                        x,
+                        rect.width,
                     );
-                    text += "\n" + (currentBins[idx] | 0);
+                    text += "\n" + level;
                 }
 
                 hoverReadout.textContent = text;
@@ -845,6 +1028,63 @@
             wfCanvas.addEventListener("mouseleave", hideHoverReadout);
             scCanvas.addEventListener("mouseleave", hideHoverReadout);
 
+            function handleZoomWheel(evt) {
+                if (!evt.shiftKey || !currentBins || !currentBins.length) {
+                    return;
+                }
+
+                const rect = evt.currentTarget.getBoundingClientRect();
+                if (rect.width <= 0) return;
+
+                evt.preventDefault();
+                const cursor = Math.max(
+                    0,
+                    Math.min(1, (evt.clientX - rect.left) / rect.width),
+                );
+                const range = clampZoomRange(currentBins.length);
+                const anchor = range.left + cursor * (range.right - range.left);
+                const factor = evt.deltaY < 0 ? 1 / 1.25 : 1.25;
+                const minSpan = minZoomSpan(currentBins.length);
+                let span = Math.max(
+                    minSpan,
+                    Math.min(1, (range.right - range.left) * factor),
+                );
+                let left = anchor - cursor * span;
+                let right = left + span;
+
+                if (left < 0) {
+                    right -= left;
+                    left = 0;
+                }
+                if (right > 1) {
+                    left -= right - 1;
+                    right = 1;
+                }
+
+                zoomLeft = Math.max(0, left);
+                zoomRight = Math.min(1, right);
+                redrawCurrentView();
+            }
+
+            function setZoomCursor(active) {
+                document.body.classList.toggle("zoom-mode", active);
+            }
+
+            window.addEventListener("keydown", (evt) => {
+                if (evt.key === "Shift") setZoomCursor(true);
+            });
+            window.addEventListener("keyup", (evt) => {
+                if (evt.key === "Shift") setZoomCursor(false);
+            });
+            window.addEventListener("blur", () => setZoomCursor(false));
+
+            wfCanvas.addEventListener("wheel", handleZoomWheel, {
+                passive: false,
+            });
+            scCanvas.addEventListener("wheel", handleZoomWheel, {
+                passive: false,
+            });
+
             // ===================================================================
             //  API calls
             // ===================================================================
@@ -857,7 +1097,7 @@
                     });
                     return await resp.json();
                 } catch (e) {
-                    return { status: "error" };
+                    return null;
                 }
             }
 
@@ -911,16 +1151,46 @@
                 }
             }
 
+            function setFftSizeValue(value) {
+                const sel = document.getElementById("fftSize");
+                const selectedText = String(value);
+                if ([...sel.options].some((opt) => opt.value === selectedText)) {
+                    sel.value = selectedText;
+                } else {
+                    sel.value = "1024";
+                }
+            }
+
+            function selectedFftSize() {
+                const value = parseInt(
+                    document.getElementById("fftSize").value,
+                    10,
+                );
+                if (Number.isFinite(value)) return value;
+                setFftSizeValue(1024);
+                return 1024;
+            }
+
             // ===================================================================
             //  UI
             // ===================================================================
-            function updateUI(running) {
-                document.getElementById("btnStop").disabled = !running;
+            function updateUI(running, connected = true) {
+                backendOnline = connected;
+                scanRunning = connected && running;
+                document.getElementById("btnStart").disabled = !connected;
+                document.getElementById("btnStop").disabled = !scanRunning;
                 const dot = document.getElementById("statusDot");
-                dot.className = "status-dot " + (running ? "running" : "idle");
-                document.getElementById("statusText").textContent = running
-                    ? "scanning"
-                    : "idle";
+                if (!connected) {
+                    dot.className = "status-dot disconnected";
+                    document.getElementById("statusText").textContent =
+                        "disconnected";
+                } else {
+                    dot.className =
+                        "status-dot " + (running ? "running" : "idle");
+                    document.getElementById("statusText").textContent = running
+                        ? "scanning"
+                        : "idle";
+                }
             }
 
             function mhzInputValue(freq) {
@@ -932,6 +1202,9 @@
 
             function applyScanPlan(plan) {
                 if (!plan) return;
+
+                zoomLeft = 0;
+                zoomRight = 1;
 
                 if (plan.freq_start !== undefined) {
                     currentFreq0 = plan.freq_start;
@@ -960,10 +1233,81 @@
                         currentSteps,
                     );
                     document.getElementById("infoRange").textContent =
-                        (currentFreq0 / 1e6).toFixed(0) +
-                        " - " +
-                        (currentFreq1 / 1e6).toFixed(0) +
-                        " MHz";
+                        formatScanRange(currentFreq0, currentFreq1);
+                }
+            }
+
+            function buildScanRequest() {
+                return {
+                    freq_start: parseFloat(
+                        document.getElementById("freqStart").value,
+                    ),
+                    freq_end: parseFloat(
+                        document.getElementById("freqEnd").value,
+                    ),
+                    converter_freq: parseFloat(
+                        document.getElementById("converterFreq").value,
+                    ),
+                    samplerate: parseFloat(
+                        document.getElementById("samplerate").value,
+                    ),
+                    bw_ratio: parseFloat(
+                        document.getElementById("bwRatio").value,
+                    ),
+                    lna_gain: parseInt(
+                        document.getElementById("lnaGain").value,
+                    ),
+                    vga_gain: parseInt(
+                        document.getElementById("vgaGain").value,
+                    ),
+                    direct_sampling: parseInt(
+                        document.getElementById("directSampling").value,
+                    ),
+                    fft_size: selectedFftSize(),
+                };
+            }
+
+            function clearScanDisplay() {
+                linesCount = 0;
+                wfRows = [];
+                clearWaterfallPixels();
+                if (wfImageData) wfCtx.putImageData(wfImageData, 0, 0);
+            }
+
+            async function startOrRestartScan() {
+                const serial = ++scanRequestSerial;
+                const result = await apiPost("/api/start", buildScanRequest());
+                if (serial !== scanRequestSerial) return result;
+
+                if (!result) {
+                    updateUI(false, false);
+                    disconnectSSE();
+                } else if (result.status === "ok") {
+                    applyScanPlan(result);
+                    updateUI(true, true);
+                    clearScanDisplay();
+                    connectSSE();
+                } else {
+                    updateUI(false, true);
+                    disconnectSSE();
+                }
+                return result;
+            }
+
+            async function updateBackendFftSize() {
+                const result = await apiPost("/api/fft", {
+                    fft_size: selectedFftSize(),
+                });
+
+                if (!result) {
+                    updateUI(false, false);
+                    disconnectSSE();
+                    return;
+                }
+                if (result.status === "ok") {
+                    if (result.fft_size) setFftSizeValue(result.fft_size);
+                    updateUI(!!result.scanning, true);
+                    if (result.scanning && !eventSource) connectSSE();
                 }
             }
 
@@ -996,53 +1340,19 @@
             document
                 .getElementById("btnStart")
                 .addEventListener("click", async function () {
-                    const body = {
-                        freq_start: parseFloat(
-                            document.getElementById("freqStart").value,
-                        ),
-                        freq_end: parseFloat(
-                            document.getElementById("freqEnd").value,
-                        ),
-                        converter_freq: parseFloat(
-                            document.getElementById("converterFreq").value,
-                        ),
-                        samplerate: parseFloat(
-                            document.getElementById("samplerate").value,
-                        ),
-                        bw_ratio: parseFloat(
-                            document.getElementById("bwRatio").value,
-                        ),
-                        lna_gain: parseInt(
-                            document.getElementById("lnaGain").value,
-                        ),
-                        vga_gain: parseInt(
-                            document.getElementById("vgaGain").value,
-                        ),
-                        direct_sampling: parseInt(
-                            document.getElementById("directSampling").value,
-                        ),
-                        fft_size: parseInt(
-                            document.getElementById("fftSize").value,
-                        ),
-                    };
-                    const result = await apiPost("/api/start", body);
-                    if (result && result.status === "ok") {
-                        applyScanPlan(result);
-                        updateUI(true);
-                        linesCount = 0;
-                        wfRows = [];
-                        clearWaterfallPixels();
-                        if (wfImageData) wfCtx.putImageData(wfImageData, 0, 0);
-                        connectSSE();
-                    }
+                    await startOrRestartScan();
                 });
 
             document
                 .getElementById("btnStop")
                 .addEventListener("click", async function () {
+                    scanRequestSerial++;
                     const result = await apiPost("/api/stop", {});
-                    if (result && result.status === "ok") {
-                        updateUI(false);
+                    if (!result) {
+                        updateUI(false, false);
+                        disconnectSSE();
+                    } else if (result.status === "ok") {
+                        updateUI(false, true);
                         disconnectSSE();
                     }
                 });
@@ -1067,7 +1377,7 @@
 
                 if (minVal >= maxVal) {
                     if (changed === "min") minVal = Math.max(0, maxVal - 1);
-                    else maxVal = Math.min(300, minVal + 1);
+                    else maxVal = Math.min(400, minVal + 1);
                 }
 
                 waterfallMin = minVal;
@@ -1094,8 +1404,10 @@
 
             document
                 .getElementById("fftSize")
-                .addEventListener("change", function () {
+                .addEventListener("change", async function () {
+                    setFftSizeValue(this.value);
                     localStorage.setItem("fftSize", this.value);
+                    await updateBackendFftSize();
                 });
 
             // ===================================================================
@@ -1181,52 +1493,22 @@
                 /* Restore FFT size from localStorage, then let backend status override */
                 const savedFft = localStorage.getItem("fftSize");
                 if (savedFft !== null) {
-                    document.getElementById("fftSize").value = savedFft;
+                    setFftSizeValue(savedFft);
                 }
-                if (status.fft_size) {
-                    document.getElementById("fftSize").value = status.fft_size;
+                if (status && status.fft_size) {
+                    setFftSizeValue(status.fft_size);
                 }
 
-                /* Auto-start scanning immediately */
-                const body = {
-                    freq_start: parseFloat(
-                        document.getElementById("freqStart").value,
-                    ),
-                    freq_end: parseFloat(
-                        document.getElementById("freqEnd").value,
-                    ),
-                    converter_freq: parseFloat(
-                        document.getElementById("converterFreq").value,
-                    ),
-                    samplerate: parseFloat(
-                        document.getElementById("samplerate").value,
-                    ),
-                    bw_ratio: parseFloat(
-                        document.getElementById("bwRatio").value,
-                    ),
-                    lna_gain: parseInt(
-                        document.getElementById("lnaGain").value,
-                    ),
-                    vga_gain: parseInt(
-                        document.getElementById("vgaGain").value,
-                    ),
-                    direct_sampling: parseInt(
-                        document.getElementById("directSampling").value,
-                    ),
-                    fft_size: parseInt(
-                        document.getElementById("fftSize").value,
-                    ),
-                };
-                const startResult = await apiPost("/api/start", body);
-                if (startResult && startResult.status === "ok") {
-                    applyScanPlan(startResult);
-                    updateUI(true);
-                    linesCount = 0;
-                    wfRows = [];
-                    clearWaterfallPixels();
-                    if (wfImageData) wfCtx.putImageData(wfImageData, 0, 0);
+                if (!status) {
+                    updateUI(false, false);
+                } else if (status.scanning) {
+                    updateUI(true, true);
+                    clearScanDisplay();
                     connectSSE();
+                } else {
+                    await startOrRestartScan();
                 }
+                window.setInterval(checkBackendStatus, 2000);
             })();
         </script>
     </body>

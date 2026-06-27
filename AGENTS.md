@@ -24,6 +24,12 @@ The backend uses the agile Fobos SDR hardware scan API:
 
 Do not move FFT, JSON generation, SSE broadcasting, or other expensive work back into `scan_callback()`.
 
+The backend should not auto-start a scan immediately after the server banner. The web UI starts scanning through `/api/start`, and if a scan is already active the UI should attach to `/api/waterfall` instead of restarting it. This avoids racing Fobos async USB setup during page load or refresh.
+
+`/api/start` is for hardware scan changes: band, sample rate, bandwidth ratio, converter, direct sampling, and gains. It can restart the hardware scan.
+
+`/api/fft` is for FFT-size changes only. It must not call `start_scan()`, must not call `fobos_sdr_start_scan()`, and must not reset frontend zoom, waterfall history, or brightness settings. The scan worker notices `g_fft_generation`, swaps FFT buffers, drops the partial mixed-size row, and continues processing the current hardware scan.
+
 ## Frequency Rules
 
 Frontend frequencies are air/signal frequencies. The backend converts them to receiver frequencies only immediately before programming the SDR.
@@ -42,6 +48,19 @@ Frontend frequencies are air/signal frequencies. The backend converts them to re
 - Other ratios follow the same rule: `step = samplerate * bw_ratio`, and displayed bins are the centered `bw_ratio` part of the FFT.
 
 Signal normalization should not depend on the number of displayed bins. Keep waterfall/spectrum row values on fixed dB limits unless intentionally changing the user-facing level scale.
+
+FFT magnitudes are normalized by the Hann window sum and compensated to a `1024`-point FFT reference bandwidth with `sqrt(fft_size / 1024)`. This keeps displayed levels comparable as FFT size changes. Preserve the division by the number of averaged FFTs.
+
+The frontend uses peak-per-pixel reduction when more FFT bins exist than canvas pixels. Do not switch it back to nearest-bin sampling unless you also solve narrow-signal disappearance at high FFT sizes.
+
+## Frontend Behavior
+
+- Shift + mouse wheel zooms the spectrum/waterfall horizontally around the cursor.
+- Holding Shift changes the spectrum/waterfall cursor to zoom mode.
+- Frequency scale, hover frequency, and hover level must use the current zoomed view.
+- The scan label shows `from - to (bandwidth) MHz`.
+- Waterfall min/max sliders currently allow values up to `400`.
+- `/api/status` is polled as a heartbeat. If the backend is unreachable, the UI must show `disconnected`, not stale `scanning`.
 
 ## Build
 

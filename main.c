@@ -43,8 +43,10 @@
 #define HTML_PATH           "index.html"
 #define MIN_FREQ_START_HZ   50.0e6
 
-/* FFT: can be 128, 256, 512, 1024, 2048, or 4096 */
-#define FFT_SIZE_MAX        4096
+/* FFT: powers of 2 from 1024 to 65536 */
+#define FFT_SIZE_MIN        1024
+#define FFT_SIZE_MAX        65536
+#define FFT_LEVEL_REF_SIZE  FFT_SIZE_MIN
 #define FFTS_PER_STEP       32
 #define SCAN_BUF_LEN        65536
 #define PROCESS_QUEUE_LEN   8
@@ -54,7 +56,7 @@
 /* Max bins per step at largest FFT */
 #define MAX_BINS_PER_STEP   FFT_SIZE_MAX
 
-/* Max total bins per line (256 freq steps * 4096 bins) */
+/* Max total bins per line (256 freq steps * 65536 bins) */
 #define MAX_BINS_PER_LINE   (MAX_FREQS * MAX_BINS_PER_STEP)
 
 static int g_fft_size = 1024;   /* runtime FFT size */
@@ -66,6 +68,8 @@ static int g_bins_per_step = 512;  /* g_fft_size / 2 */
 static struct fobos_sdr_dev_t *g_dev = NULL;
 static pthread_t g_scan_thread;
 static volatile int g_scanning = 0;
+static pthread_mutex_t g_fft_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_fft_generation = 1;
 
 /* Scan parameters */
 static double g_freq_start   = MIN_FREQ_START_HZ;
@@ -173,24 +177,50 @@ static void fft_c2c(float *data, int n)
 /* Hann window — sized for max FFT */
 static float g_window[FFT_SIZE_MAX];
 
+static void init_window_for_size(float *window, int fft_size)
+{
+    for (int i = 0; i < fft_size; i++)
+        window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (float)(fft_size - 1)));
+}
+
 static void init_window(void)
 {
-    /* Always recompute for current g_fft_size */
-    for (int i = 0; i < g_fft_size; i++)
-        g_window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (float)(g_fft_size - 1)));
+    init_window_for_size(g_window, g_fft_size);
+}
+
+static int normalize_fft_size(int new_size)
+{
+    if (new_size < FFT_SIZE_MIN) new_size = FFT_SIZE_MIN;
+    if (new_size > FFT_SIZE_MAX) new_size = FFT_SIZE_MAX;
+    /* Round down to nearest power of 2 */
+    int size = 1;
+    while (size * 2 <= new_size) size *= 2;
+    return size;
 }
 
 /* Call this when g_fft_size changes */
 static void update_fft_size(int new_size)
 {
-    if (new_size < 128) new_size = 128;
-    if (new_size > FFT_SIZE_MAX) new_size = FFT_SIZE_MAX;
-    /* Round down to nearest power of 2 */
-    int size = 1;
-    while (size * 2 <= new_size) size *= 2;
+    int size = normalize_fft_size(new_size);
+    pthread_mutex_lock(&g_fft_mutex);
+    if (g_fft_size == size) {
+        pthread_mutex_unlock(&g_fft_mutex);
+        return;
+    }
     g_fft_size = size;
     g_bins_per_step = g_fft_size / 2;
     init_window();
+    g_fft_generation++;
+    pthread_mutex_unlock(&g_fft_mutex);
+}
+
+static int current_fft_size(void)
+{
+    int size;
+    pthread_mutex_lock(&g_fft_mutex);
+    size = g_fft_size;
+    pthread_mutex_unlock(&g_fft_mutex);
+    return size;
 }
 
 /* ------------------------------------------------------------------ */
@@ -320,9 +350,16 @@ typedef struct {
     int steps_seen;
     int line_num;
     int fft_size;
+    uint32_t fft_generation;
     double freq_start;
     double freq_end;
-    float window[FFT_SIZE_MAX];
+    double samplerate;
+    double bw_ratio;
+    double step_width;
+    double last_width;
+    float mag_scale;
+    float *window;
+    float *fft_scratch;
     float *line_buf;
     uint8_t *line_packed;
     uint8_t step_seen[MAX_FREQS];
@@ -431,11 +468,12 @@ static int build_device_scan_frequencies(const double *air_freqs, int count, dou
 static int scan_bins_per_step_for_width(double width)
 {
     double max_width = g_samplerate * g_bw_ratio;
+    int fft_size = current_fft_size();
     int bins;
     if (width > max_width) width = max_width;
-    bins = (int)lrint((width / g_samplerate) * (double)g_fft_size);
+    bins = (int)lrint((width / g_samplerate) * (double)fft_size);
     if (bins < 1) bins = 1;
-    if (bins > g_fft_size) bins = g_fft_size;
+    if (bins > fft_size) bins = fft_size;
     return bins;
 }
 
@@ -447,10 +485,115 @@ static int scan_bins_per_step(void)
     return scan_bins_per_step_for_width(g_samplerate * g_bw_ratio);
 }
 
-static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step,
-                                 int fft_size, const float *window, float *out)
+static int scan_bins_for_context_width(scan_ctx_t *ctx, double width, int fft_size)
 {
-    float local_fft[fft_size * 2];
+    double max_width = ctx->samplerate * ctx->bw_ratio;
+    int bins;
+    if (width > max_width) width = max_width;
+    bins = (int)lrint((width / ctx->samplerate) * (double)fft_size);
+    if (bins < 1) bins = 1;
+    if (bins > fft_size) bins = fft_size;
+    return bins;
+}
+
+static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
+{
+    int fft_size;
+    uint32_t fft_generation;
+    int bins_per_step;
+    int last_bins;
+    int line_bins;
+    size_t bin_count;
+    float *window = NULL;
+    float *fft_scratch = NULL;
+    float *line_buf = NULL;
+    uint8_t *line_packed = NULL;
+    float mag_scale;
+
+    for (;;) {
+        pthread_mutex_lock(&g_fft_mutex);
+        fft_size = g_fft_size;
+        fft_generation = g_fft_generation;
+        pthread_mutex_unlock(&g_fft_mutex);
+
+        bins_per_step = scan_bins_for_context_width(ctx, ctx->step_width, fft_size);
+        last_bins = scan_bins_for_context_width(ctx, ctx->last_width, fft_size);
+        line_bins = (ctx->total_steps - 1) * bins_per_step + last_bins;
+        bin_count = (size_t)line_bins;
+
+        window = malloc((size_t)fft_size * sizeof(float));
+        fft_scratch = malloc((size_t)fft_size * 2 * sizeof(float));
+        line_buf = malloc(bin_count * sizeof(float));
+        line_packed = malloc(bin_count);
+        if (!window || !fft_scratch || !line_buf || !line_packed) {
+            free(window);
+            free(fft_scratch);
+            free(line_buf);
+            free(line_packed);
+            return -1;
+        }
+
+        pthread_mutex_lock(&g_fft_mutex);
+        if (fft_size == g_fft_size) {
+            memcpy(window, g_window, (size_t)fft_size * sizeof(float));
+            fft_generation = g_fft_generation;
+            pthread_mutex_unlock(&g_fft_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&g_fft_mutex);
+
+        free(window);
+        free(fft_scratch);
+        free(line_buf);
+        free(line_packed);
+        window = NULL;
+        fft_scratch = NULL;
+        line_buf = NULL;
+        line_packed = NULL;
+    }
+
+    {
+        float window_sum = 0.0f;
+        float bin_width_scale = sqrtf((float)fft_size / (float)FFT_LEVEL_REF_SIZE);
+        for (int i = 0; i < fft_size; i++)
+            window_sum += window[i];
+        mag_scale = (window_sum > 0.0f) ? (bin_width_scale / window_sum) : (bin_width_scale / (float)fft_size);
+    }
+
+    free(ctx->window);
+    free(ctx->fft_scratch);
+    free(ctx->line_buf);
+    free(ctx->line_packed);
+
+    ctx->fft_size = fft_size;
+    ctx->fft_generation = fft_generation;
+    ctx->bins_per_step = bins_per_step;
+    ctx->last_bins = last_bins;
+    ctx->line_bins = line_bins;
+    ctx->mag_scale = mag_scale;
+    ctx->window = window;
+    ctx->fft_scratch = fft_scratch;
+    ctx->line_buf = line_buf;
+    ctx->line_packed = line_packed;
+    ctx->steps_seen = 0;
+    memset(ctx->step_seen, 0, sizeof(ctx->step_seen));
+
+    return 0;
+}
+
+static uint32_t current_fft_generation(void)
+{
+    uint32_t generation;
+    pthread_mutex_lock(&g_fft_mutex);
+    generation = g_fft_generation;
+    pthread_mutex_unlock(&g_fft_mutex);
+    return generation;
+}
+
+static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step,
+                                 int fft_size, const float *window,
+                                 float *local_fft, float mag_scale, float *out)
+{
     int fft_count = 0;
     int shifted_start = (fft_size - bins_per_step) / 2;
 
@@ -477,7 +620,7 @@ static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step
 
     if (fft_count <= 0) return 0;
 
-    float inv = 1.0f / (float)fft_count;
+    float inv = mag_scale / (float)fft_count;
     for (int i = 0; i < bins_per_step; i++)
         out[i] *= inv;
 
@@ -490,7 +633,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
     if (bin_count <= 0) return;
 
     for (int i = 0; i < bin_count; i++) {
-        float mag = ctx->line_buf[i] / (float)ctx->fft_size;
+        float mag = ctx->line_buf[i];
         float db = 20.0f * log10f(mag + 1e-20f);
         float v = (db - DB_FLOOR) * (255.0f / (DB_CEIL - DB_FLOOR));
         if (v < 0.0f) v = 0.0f;
@@ -521,9 +664,18 @@ static void process_scan_buffer(scan_ctx_t *ctx, float *buf, uint32_t buf_len, i
     if (channel < 0 || channel >= ctx->total_steps)
         return;
 
+    if (ctx->fft_generation != current_fft_generation()) {
+        if (scan_ctx_apply_fft_config(ctx) != 0) {
+            fprintf(stderr, "[SDR] Failed to apply FFT size %d\n", current_fft_size());
+            return;
+        }
+    }
+
     channel_bins = (channel == ctx->total_steps - 1) ? ctx->last_bins : ctx->bins_per_step;
     slot = ctx->line_buf + (size_t)channel * ctx->bins_per_step;
-    if (average_fft_magnitude(buf, buf_len, channel_bins, ctx->fft_size, ctx->window, slot) <= 0)
+    if (average_fft_magnitude(buf, buf_len, channel_bins, ctx->fft_size,
+                              ctx->window, ctx->fft_scratch, ctx->mag_scale,
+                              slot) <= 0)
         return;
 
     if (!ctx->step_seen[channel]) {
@@ -670,7 +822,6 @@ static void *scan_thread_func(void *arg)
     scan_ctx_t ctx;
     int ret;
     int worker_started = 0;
-    size_t bin_count;
 
     if (total_steps < FOBOS_MIN_FREQS_CNT) {
         fprintf(stderr, "[SDR] Hardware scan needs at least %d frequencies\n", FOBOS_MIN_FREQS_CNT);
@@ -686,27 +837,23 @@ static void *scan_thread_func(void *arg)
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.total_steps = total_steps;
-    ctx.bins_per_step = scan_bins_per_step_for_width(step);
-    ctx.last_bins = scan_bins_per_step_for_width(scan_last_width(total_steps, step));
-    ctx.line_bins = (total_steps - 1) * ctx.bins_per_step + ctx.last_bins;
-    ctx.fft_size = g_fft_size;
-    memcpy(ctx.window, g_window, (size_t)ctx.fft_size * sizeof(float));
+    ctx.samplerate = g_samplerate;
+    ctx.bw_ratio = g_bw_ratio;
+    ctx.step_width = step;
+    ctx.last_width = scan_last_width(total_steps, step);
     ctx.freq_start = g_freq_start;
     ctx.freq_end = build_scan_effective_end(total_steps, step);
 
-    bin_count = (size_t)ctx.line_bins;
-    ctx.line_buf = malloc(bin_count * sizeof(float));
-    ctx.line_packed = malloc(bin_count);
-    if (!ctx.line_buf || !ctx.line_packed) {
+    if (scan_ctx_apply_fft_config(&ctx) != 0) {
         fprintf(stderr, "[SDR] Out of memory\n");
-        free(ctx.line_buf);
-        free(ctx.line_packed);
         g_scanning = 0;
         return NULL;
     }
 
     if (scan_queue_init(&ctx) != 0) {
         fprintf(stderr, "[SDR] Out of memory\n");
+        free(ctx.window);
+        free(ctx.fft_scratch);
         free(ctx.line_buf);
         free(ctx.line_packed);
         g_scanning = 0;
@@ -716,6 +863,8 @@ static void *scan_thread_func(void *arg)
     if (pthread_create(&ctx.worker_thread, NULL, scan_worker_thread, &ctx) != 0) {
         fprintf(stderr, "[SDR] Failed to start scan processing worker\n");
         scan_queue_destroy(&ctx);
+        free(ctx.window);
+        free(ctx.fft_scratch);
         free(ctx.line_buf);
         free(ctx.line_packed);
         g_scanning = 0;
@@ -761,6 +910,8 @@ static void *scan_thread_func(void *arg)
     }
     g_scanning = 0;
     scan_queue_destroy(&ctx);
+    free(ctx.window);
+    free(ctx.fft_scratch);
     free(ctx.line_buf);
     free(ctx.line_packed);
     printf("[SDR] Scan thread stopped\n");
@@ -907,7 +1058,7 @@ static void handle_request(int client_fd, const char *req)
             g_freq_start, freq_end, g_converter_freq,
             g_samplerate, g_bw_ratio,
             step, total_steps,
-            bins_per_step, g_fft_size,
+            bins_per_step, current_fft_size(),
             g_lna_gain, g_vga_gain, g_direct_sampling,
             sample_rates);
 
@@ -973,7 +1124,8 @@ static void handle_request(int client_fd, const char *req)
         GET_UINT("\"vga_gain\"", g_vga_gain);
         GET_UINT("direct_sampling", g_direct_sampling);
         GET_UINT("fft_size", fft_tmp);
-        if (fft_tmp >= 128 && fft_tmp <= 4096) update_fft_size((int)fft_tmp);
+        if (fft_tmp >= FFT_SIZE_MIN && fft_tmp <= FFT_SIZE_MAX)
+            update_fft_size((int)fft_tmp);
         if (g_freq_start < MIN_FREQ_START_HZ) g_freq_start = MIN_FREQ_START_HZ;
         if (g_bw_ratio > 1.0) g_bw_ratio = 1.0;
         clamp_scan_end_to_hardware_limit();
@@ -997,6 +1149,46 @@ static void handle_request(int client_fd, const char *req)
             cors, status, g_freq_start, freq_end, g_converter_freq,
             total_steps, step);
         WRITE(client_fd, resp, (size_t)n);
+        close(client_fd);
+        return;
+    }
+
+    /* POST /api/fft */
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/fft") == 0) {
+        uint32_t fft_tmp = 0;
+        const char *body = strstr(req, "\r\n\r\n");
+        if (!body) { close(client_fd); return; }
+        body += 4;
+
+        const char *k = strstr(body, "fft_size");
+        if (k) {
+            k = strchr(k, ':');
+            if (k) {
+                unsigned int v;
+                if (sscanf(k + 1, " %u", &v) == 1)
+                    fft_tmp = (uint32_t)v;
+            }
+        }
+
+        if (fft_tmp >= FFT_SIZE_MIN && fft_tmp <= FFT_SIZE_MAX) {
+            update_fft_size((int)fft_tmp);
+            save_config();
+            char resp[256];
+            int n = snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n%s\r\n"
+                "{\"status\":\"ok\",\"fft_size\":%d,\"scanning\":%d}",
+                cors, current_fft_size(), g_scanning);
+            WRITE(client_fd, resp, (size_t)n);
+        } else {
+            char resp[256];
+            int n = snprintf(resp, sizeof(resp),
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Content-Type: application/json\r\n%s\r\n"
+                "{\"status\":\"error\",\"fft_size\":%d}",
+                cors, current_fft_size());
+            WRITE(client_fd, resp, (size_t)n);
+        }
         close(client_fd);
         return;
     }
@@ -1092,8 +1284,6 @@ int main(void)
                 printf("[SDR] Device: %s %s\n", g_manufacturer, g_product);
                 printf("[SDR]   HW: %s  FW: %s  S/N: %s\n",
                        g_hw_rev, g_fw_ver, g_serial);
-                fobos_sdr_close(g_dev);
-                g_dev = NULL;
             } else {
                 printf("[SDR] Could not open device: %d\n", ret);
             }
@@ -1103,7 +1293,14 @@ int main(void)
     }
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket"); return 1; }
+    if (server_fd < 0) {
+        perror("socket");
+        if (g_dev) {
+            fobos_sdr_close(g_dev);
+            g_dev = NULL;
+        }
+        return 1;
+    }
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1115,10 +1312,22 @@ int main(void)
     addr.sin_port = htons(PORT);
 
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind"); close(server_fd); return 1;
+        perror("bind");
+        close(server_fd);
+        if (g_dev) {
+            fobos_sdr_close(g_dev);
+            g_dev = NULL;
+        }
+        return 1;
     }
     if (listen(server_fd, MAX_CLIENTS) < 0) {
-        perror("listen"); close(server_fd); return 1;
+        perror("listen");
+        close(server_fd);
+        if (g_dev) {
+            fobos_sdr_close(g_dev);
+            g_dev = NULL;
+        }
+        return 1;
     }
 
     {
@@ -1133,12 +1342,7 @@ int main(void)
         printf("\n");
     }
 
-    /* Auto-start scanning when a device is available */
-    if (start_scan() == 0) {
-        printf("[SDR] Auto-scan started\n");
-    } else {
-        printf("[SDR] No device — waiting for connection via web UI\n");
-    }
+    printf("[SDR] Waiting for scan start from web UI\n");
 
     while (!g_exit) {
         struct sockaddr_in client_addr;
