@@ -10,6 +10,8 @@
 - `run.sh` starts the binary with the local agile library paths in `LD_LIBRARY_PATH`.
 - `fobos-scanner.conf` is a local runtime config file and should stay untracked.
 - `scanner-deepseek` is reference material and should stay untracked.
+- `bands.ini` is a tracked, human-editable band overlay file served to the frontend.
+- `tasks.md`, `PLAN.MD`, and `suggestions.md` are local planning/report files and should stay untracked.
 
 ## Scanner Architecture
 
@@ -23,6 +25,10 @@ The backend uses the agile Fobos SDR hardware scan API:
 6. A worker thread consumes queued buffers, runs FFT magnitude averaging, aggregates one slot per hardware scan frequency, normalizes to fixed dB limits, and publishes complete spectrum/waterfall rows by SSE.
 
 Do not move FFT, JSON generation, SSE broadcasting, or other expensive work back into `scan_callback()`.
+
+When the current visible span needs only one hardware scan point, the backend uses normal single-frequency streaming instead of `fobos_sdr_start_scan()`. At high zoom, single mode may use a 3-stage CIC decimator before a 65536-point FFT. The decimator accumulates continuous raw I/Q buffers in the worker thread; do not rate-drop raw buffers before the CIC path because gaps corrupt the filtered stream.
+
+Single mode distinguishes the visible span from the processed source span. When the processed span is wide enough, the backend tunes the receiver center just outside the visible window so the I/Q zero-frequency dip is not centered on the screen.
 
 The backend should not auto-start a scan immediately after the server banner. The web UI starts scanning through `/api/start`, and if a scan is already active the UI should attach to `/api/waterfall` instead of restarting it. This avoids racing Fobos async USB setup during page load or refresh.
 
@@ -61,6 +67,7 @@ The frontend uses peak-per-pixel reduction when more FFT bins exist than canvas 
 - The scan label shows `from - to (bandwidth) MHz`.
 - Waterfall min/max sliders currently allow values up to `400`.
 - `/api/status` is polled as a heartbeat. If the backend is unreachable, the UI must show `disconnected`, not stale `scanning`.
+- `bands.ini` is loaded by the frontend from `/bands.ini`; keep its syntax simple key/value sections with `name`, `start_mhz`, and `end_mhz`.
 
 ## Build
 
