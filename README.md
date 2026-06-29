@@ -20,6 +20,7 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Single-frequency super-zoom path using automatic 1024-65536 FFT sizing plus CIC decimation when the visible span is too narrow for a direct FFT
 - Minimum line-rate control for decimated single-stream zoom using FFT-window overlap
 - Editable `bands.ini` spectrum overlays for QO-100 NB/WB transponder ranges
+- Editable frequency markers using `Shift + left-click` or `Ctrl/Alt + right-click`
 - Browser status heartbeat that shows `disconnected`, `idle`, or `scanning`
 - Hardened flat-JSON control parser, explicit bad-request responses, validated marker saves, and throttled frontend view persistence
 

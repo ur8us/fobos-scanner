@@ -395,7 +395,7 @@
                     <span class="val" id="infoZoom">1.00x</span></span
                 >
                 <span
-                    >Markers (press SHIFT):
+                    >Markers (SHIFT+click):
                     <span class="val" id="infoMarkers">0</span></span
                 >
                 <span>Shown: <span class="val" id="infoRange">---</span></span>
@@ -1845,7 +1845,12 @@
             }
 
             function handleMarkerMouseDown(canvas, evt) {
-                if (!evt.shiftKey || evt.button !== 2) return;
+                const shiftLeftClick = evt.shiftKey && evt.button === 0;
+                const modifiedRightClick =
+                    evt.button === 2 &&
+                    !evt.shiftKey &&
+                    (evt.ctrlKey || evt.altKey || evt.metaKey);
+                if (!shiftLeftClick && !modifiedRightClick) return;
                 if (openMarkerDialogFromEvent(canvas, evt))
                     markerContextSuppressUntil = Date.now() + 1000;
             }
@@ -1855,7 +1860,13 @@
                     stopMarkerMouseEvent(evt);
                     return;
                 }
-                if (!evt.shiftKey) return;
+                if (
+                    evt.shiftKey ||
+                    evt.button !== 2 ||
+                    !(evt.ctrlKey || evt.altKey || evt.metaKey)
+                ) {
+                    return;
+                }
                 openMarkerDialogFromEvent(canvas, evt);
             }
 
