@@ -696,6 +696,7 @@ static void format_sample_rates_json(char *buf, size_t len)
 static int normalize_display_bins(int bins);
 static int current_display_bins(void);
 static single_fft_plan_t single_fft_plan_for_span(double span);
+static int scan_effective_fft_size_for_span(double span, int selected_fft_size);
 static int planned_required_points(void);
 static run_mode_t planned_run_mode(void);
 static void clamp_visible_to_config(void);
@@ -1243,6 +1244,40 @@ static int single_effective_fft_size_for_span(double span)
     return single_fft_plan_for_span(span).fft_size;
 }
 
+static int scan_effective_fft_size_for_span(double span, int selected_fft_size)
+{
+    int display_bins = current_display_bins();
+    int selected = normalize_fft_size(selected_fft_size);
+    double needed_fft;
+    int effective;
+
+    if (span <= 0.0 || g_samplerate <= 0.0 || display_bins <= 0)
+        return selected;
+
+    needed_fft = ceil(((double)display_bins * g_samplerate) / span);
+    if (needed_fft < FFT_SIZE_MIN)
+        needed_fft = FFT_SIZE_MIN;
+    if (needed_fft > (double)FFT_SIZE_MAX)
+        needed_fft = FFT_SIZE_MAX;
+
+    effective = next_power_of_two_int((int)needed_fft);
+    if (effective < FFT_SIZE_MIN)
+        effective = FFT_SIZE_MIN;
+    if (effective > selected)
+        effective = selected;
+    if (effective > FFT_SIZE_MAX)
+        effective = FFT_SIZE_MAX;
+    return effective;
+}
+
+static int scan_effective_fft_size_for_current_view(void)
+{
+    double start;
+    double end;
+    raw_visible_band(&start, &end);
+    return scan_effective_fft_size_for_span(end - start, current_fft_size());
+}
+
 static int single_decim_hop_for_plan(const single_fft_plan_t *plan);
 
 static uint32_t single_line_sample_count_for_span(double span)
@@ -1284,7 +1319,7 @@ static int current_effective_fft_size(void)
     double start;
     double end;
     if (planned_run_mode() != RUN_MODE_SINGLE)
-        return current_fft_size();
+        return scan_effective_fft_size_for_current_view();
     raw_visible_band(&start, &end);
     return single_effective_fft_size_for_span(end - start);
 }
@@ -1392,7 +1427,7 @@ static int bins_for_width_and_rate(double width, double samplerate,
 
 static int scan_bins_per_step_for_width(double width)
 {
-    return scan_bins_per_step_for_width_and_fft(width, current_fft_size());
+    return scan_bins_per_step_for_width_and_fft(width, scan_effective_fft_size_for_current_view());
 }
 
 static int scan_bins_per_step(void)
@@ -1420,6 +1455,7 @@ static int current_line_bins(void)
     int total_steps;
     int bins_per_step;
     int last_bins;
+    int fft_size;
 
     if (planned_run_mode() == RUN_MODE_SINGLE) {
         single_fft_plan_t plan;
@@ -1433,8 +1469,9 @@ static int current_line_bins(void)
     total_steps = build_scan_frequencies_for_band(scan_start, scan_end, NULL, &step);
     if (total_steps <= 0)
         return 0;
-    bins_per_step = scan_bins_per_step_for_width(step);
-    last_bins = scan_bins_per_step_for_width(scan_last_width_for_band(scan_start, scan_end, total_steps, step));
+    fft_size = scan_effective_fft_size_for_current_view();
+    bins_per_step = scan_bins_per_step_for_width_and_fft(step, fft_size);
+    last_bins = scan_bins_per_step_for_width_and_fft(scan_last_width_for_band(scan_start, scan_end, total_steps, step), fft_size);
     return (total_steps - 1) * bins_per_step + last_bins;
 }
 
@@ -1479,6 +1516,10 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
             fft_ratio = plan.extraction_ratio;
             step_width = plan.source_span;
             last_width = plan.source_span;
+        } else {
+            fft_size = scan_effective_fft_size_for_span(ctx->visible_end - ctx->visible_start,
+                                                        ctx->selected_fft_size);
+            decim_hop = fft_size;
         }
 
         bins_per_step = bins_for_width_and_rate(step_width, fft_samplerate, fft_ratio, fft_size);
