@@ -53,6 +53,60 @@ bands.ini
 
 The file is human editable. Use one section per band with `name`, `start_mhz`, and `end_mhz`.
 
+## Browser Traffic
+
+The browser uses ordinary HTTP for the page, settings, and status, plus one long-lived Server-Sent Events stream for live spectrum/waterfall data.
+
+Frontend to backend:
+
+- `GET /`, `GET /bands.ini`, and `GET /markers.ini` load static UI data.
+- `GET /api/status` is the heartbeat and parameter snapshot. The frontend polls it every `2` seconds.
+- `POST /api/start`, `/api/view`, `/api/fft`, `/api/gain`, `/api/rate-limit`, `/api/min-rate`, `/api/stop`, and marker save endpoints send control changes.
+- `GET /api/waterfall` opens the SSE stream. After this request, the backend pushes live lines to the browser.
+
+Backend to frontend:
+
+- `/api/status` returns JSON with scan state, displayed frequency range, FFT/decimation settings, line-rate settings, and `traffic_kbytes_s`.
+- `/api/waterfall` sends one SSE `line` event per displayed waterfall row. The same row is also used by the frontend as the latest spectrum trace.
+- Each `line` event contains metadata plus `d`, an array of `display_bins` unsigned 8-bit magnitudes written as decimal JSON numbers:
+
+```text
+event: line
+data: {"view":...,"n":...,"b":...,"mode":"scan|single",
+       "f0":...,"f1":...,"full_f0":...,"full_f1":...,
+       "visible_start_hz":...,"visible_end_hz":...,
+       "display_bins":N,"source_bins":...,"effective_fft_size":...,
+       "decim_factor":...,"decim_hop":...,"overlap_factor":...,
+       "d":[v0,v1,...,vN-1]}
+```
+
+The backend reduces the processed FFT/source bins to exactly `display_bins` dots before sending the row. Values in `d` are text JSON, not binary bytes, so each magnitude costs `1` to `3` digit bytes plus commas.
+
+For one SSE client, exact live waterfall traffic is:
+
+```text
+B_line = H + (N - 1) + sum(digits(v_i), i = 0..N-1)
+T_sse_bytes_per_sec = R * B_line
+T_sse_kbytes_per_sec = T_sse_bytes_per_sec / 1024
+```
+
+Where:
+
+- `N` is `display_bins`.
+- `R` is the delivered waterfall line rate after backend rate limiting, in lines/s.
+- `v_i` is one magnitude value in `d`, from `0` to `255`.
+- `digits(v_i)` is `1`, `2`, or `3`.
+- `H` is the fixed SSE/JSON metadata overhead for that line, including `event: line`, field names, frequency values, and the final `]}\n\n`, but excluding magnitude digits and commas.
+
+A practical estimate is:
+
+```text
+B_line ~= H + N * (avg_digits + 1) - 1
+T_sse_kbytes_per_sec ~= clients * R * B_line / 1024
+```
+
+`avg_digits` is usually between `2` and `3`; worst case is `3`. The `traffic_kbytes_s` field shown by the frontend is not this estimate. It is measured in the backend from actual SSE bytes successfully written over the recent traffic window, and it multiplies naturally when multiple browser tabs are connected. It excludes most small request/response overhead such as `/api/status` polling and control POSTs.
+
 ## Dependencies
 
 This project expects to be built inside the Fobos SDR workspace layout used by this repository:
