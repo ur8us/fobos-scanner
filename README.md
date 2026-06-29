@@ -118,6 +118,18 @@ FobosSDR/
   local-agile/
 ```
 
+The scanner uses these sibling folders as follows:
+
+- `libfobos-sdr-agile/` is expected to be the agile Fobos SDR source and build tree.
+  - Required header path: `../libfobos-sdr-agile/fobos/fobos_sdr.h`
+  - Required runtime/link library after building the agile library: `../libfobos-sdr-agile/build-local/libfobos_sdr.so`
+  - Optional pkg-config metadata from that build: `../libfobos-sdr-agile/build-local/libfobos_sdr.pc`
+  - The scanner does not compile the library sources directly; it only includes `fobos_sdr.h` and links `-lfobos_sdr`.
+- `local-agile/` is expected to be an optional install prefix for the same agile library.
+  - Header path used by the Makefile if present: `../local-agile/include/fobos_sdr.h`
+  - Runtime/link library path used by the Makefile and run scripts if present: `../local-agile/lib/libfobos_sdr.so`
+  - Optional pkg-config metadata if installed there: `../local-agile/lib/pkgconfig/libfobos_sdr.pc`
+
 Required tools and libraries:
 
 - GCC with C99 support
