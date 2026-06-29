@@ -44,6 +44,7 @@
 #define MAX_PATH            1024
 #define HTML_PATH           "index.html"
 #define BANDS_PATH          "bands.ini"
+#define MARKERS_PATH        "markers.ini"
 #define MIN_FREQ_START_HZ   50.0e6
 #define DISPLAY_BINS_MIN    64
 #define DISPLAY_BINS_MAX    32768
@@ -59,9 +60,12 @@
 #define FFTS_PER_STEP       32
 #define SCAN_BUF_LEN        65536
 #define PROCESS_QUEUE_LEN   8
+#define DIRECT_SAMPLING_RATE_HZ 50.0e6
 #define DIRECT_SAMPLING_MAX_HZ 25.0e6
 #define DB_FLOOR            -100.0f
 #define DB_CEIL             -20.0f
+#define MAX_MARKERS         2048
+#define MARKER_NAME_MAX     128
 
 /* Max bins per step at largest FFT */
 #define MAX_BINS_PER_STEP   FFT_SIZE_MAX
@@ -109,7 +113,7 @@ static uint32_t g_view_id    = 1;
 static uint32_t g_lna_gain   = 0;
 static uint32_t g_vga_gain   = 0;
 static uint32_t g_direct_sampling = 0;
-static uint32_t g_clk_source __attribute__((unused)) = 0;
+static uint32_t g_clk_source = 0;
 
 /* Device info */
 static char g_hw_rev[64]    = "unknown";
@@ -287,6 +291,11 @@ static uint32_t normalize_direct_sampling(uint32_t value)
     return value <= 2 ? value : 0;
 }
 
+static uint32_t normalize_clk_source(uint32_t value)
+{
+    return value ? 1 : 0;
+}
+
 static int direct_sampling_enabled(void)
 {
     return g_direct_sampling != 0;
@@ -300,6 +309,29 @@ static double direct_sampling_max_hz(void)
     if (max_hz < 1.0)
         max_hz = 1.0;
     return max_hz;
+}
+
+static void force_direct_sampling_defaults(int reset_visible)
+{
+    g_converter_freq = 0.0;
+    g_samplerate = DIRECT_SAMPLING_RATE_HZ;
+    g_bw_ratio = 1.0;
+    g_freq_start = 0.0;
+    g_freq_end = direct_sampling_max_hz();
+
+    if (reset_visible) {
+        g_visible_start = g_freq_start;
+        g_visible_end = g_freq_end;
+    } else {
+        if (g_visible_start < g_freq_start)
+            g_visible_start = g_freq_start;
+        if (g_visible_end > g_freq_end)
+            g_visible_end = g_freq_end;
+        if (g_visible_end <= g_visible_start) {
+            g_visible_start = g_freq_start;
+            g_visible_end = g_freq_end;
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -319,6 +351,7 @@ static void save_config(void)
     fprintf(f, "lna_gain = %u\n", g_lna_gain);
     fprintf(f, "vga_gain = %u\n", g_vga_gain);
     fprintf(f, "direct_sampling = %u\n", g_direct_sampling);
+    fprintf(f, "clk_source = %u\n", g_clk_source);
     fprintf(f, "fft_size = %d\n", g_fft_size);
     fprintf(f, "min_rate_lps = %u\n", g_min_rate_lps);
     fprintf(f, "rate_limit_lps = %u\n", g_rate_limit_lps);
@@ -341,6 +374,7 @@ static void load_config(void)
         else if (strcmp(key, "lna_gain") == 0)        { uval = (unsigned int)val; g_lna_gain = uval; }
         else if (strcmp(key, "vga_gain") == 0)        { uval = (unsigned int)val; g_vga_gain = uval; }
         else if (strcmp(key, "direct_sampling") == 0) { uval = (unsigned int)val; g_direct_sampling = normalize_direct_sampling(uval); }
+        else if (strcmp(key, "clk_source") == 0)      { uval = (unsigned int)val; g_clk_source = normalize_clk_source(uval); }
         else if (strcmp(key, "fft_size") == 0) { update_fft_size((int)val); }
         else if (strcmp(key, "min_rate_lps") == 0) { uval = (unsigned int)val; g_min_rate_lps = normalize_min_rate_lps(uval); }
         else if (strcmp(key, "rate_limit_lps") == 0) { uval = (unsigned int)val; g_rate_limit_lps = normalize_rate_limit_lps(uval); }
@@ -348,12 +382,8 @@ static void load_config(void)
     fclose(f);
     g_visible_start = g_freq_start;
     g_visible_end = g_freq_end;
-    if (direct_sampling_enabled()) {
-        g_freq_start = 0.0;
-        g_freq_end = direct_sampling_max_hz();
-        g_visible_start = g_freq_start;
-        g_visible_end = g_freq_end;
-    }
+    if (direct_sampling_enabled())
+        force_direct_sampling_defaults(1);
     printf("[SDR] Loaded config from %s\n", CONFIG_FILE);
 }
 
@@ -374,6 +404,185 @@ static char *read_file(const char *path, size_t *out_len)
     fclose(f);
     if (out_len) *out_len = (size_t)len;
     return buf;
+}
+
+static void send_json_response(int client_fd, int code, const char *reason,
+                               const char *cors, const char *body);
+
+typedef struct {
+    char name[MARKER_NAME_MAX];
+    char group[MARKER_NAME_MAX];
+    double frequency_hz;
+} marker_t;
+
+static char *trim_ws(char *s)
+{
+    char *end;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    end = s + strlen(s);
+    while (end > s &&
+           (end[-1] == ' ' || end[-1] == '\t' ||
+            end[-1] == '\r' || end[-1] == '\n')) {
+        *--end = 0;
+    }
+    return s;
+}
+
+static void copy_marker_text(char *dst, size_t dst_size, const char *src)
+{
+    if (!dst || dst_size == 0)
+        return;
+    if (!src)
+        src = "";
+    snprintf(dst, dst_size, "%s", src);
+}
+
+static int marker_group_exists(char groups[][MARKER_NAME_MAX], int count, const char *group)
+{
+    for (int i = 0; i < count; i++) {
+        if (strcmp(groups[i], group) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void add_marker_group(char groups[][MARKER_NAME_MAX], int *count, const char *group)
+{
+    const char *name = (group && *group) ? group : "Ungrouped";
+    if (*count >= MAX_MARKERS || marker_group_exists(groups, *count, name))
+        return;
+    copy_marker_text(groups[*count], MARKER_NAME_MAX, name);
+    (*count)++;
+}
+
+static int load_markers(marker_t *markers, int max_markers,
+                        char groups[][MARKER_NAME_MAX], int *group_count)
+{
+    size_t len = 0;
+    char *text = read_file(MARKERS_PATH, &len);
+    char *saveptr = NULL;
+    char *line;
+    marker_t current;
+    int have_marker = 0;
+    int count = 0;
+
+    *group_count = 0;
+    add_marker_group(groups, group_count, "Ungrouped");
+
+    if (!text)
+        return 0;
+
+    memset(&current, 0, sizeof(current));
+    copy_marker_text(current.group, sizeof(current.group), "Ungrouped");
+
+    for (line = strtok_r(text, "\n", &saveptr);
+         line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        char *trimmed = trim_ws(line);
+        char *eq;
+
+        if (!*trimmed || *trimmed == '#' || *trimmed == ';')
+            continue;
+
+        if (trimmed[0] == '[') {
+            if (have_marker && current.frequency_hz > 0.0 && current.name[0] && count < max_markers) {
+                markers[count++] = current;
+                add_marker_group(groups, group_count, current.group);
+            }
+            memset(&current, 0, sizeof(current));
+            copy_marker_text(current.group, sizeof(current.group), "Ungrouped");
+            have_marker = 1;
+            continue;
+        }
+
+        eq = strchr(trimmed, '=');
+        if (!eq)
+            continue;
+        *eq = 0;
+        {
+            char *key = trim_ws(trimmed);
+            char *value = trim_ws(eq + 1);
+            if (strcmp(key, "name") == 0) {
+                copy_marker_text(current.name, sizeof(current.name), value);
+            } else if (strcmp(key, "group") == 0) {
+                copy_marker_text(current.group, sizeof(current.group), value);
+                if (!current.group[0])
+                    copy_marker_text(current.group, sizeof(current.group), "Ungrouped");
+            } else if (strcmp(key, "frequency_hz") == 0) {
+                current.frequency_hz = atof(value);
+            } else if (strcmp(key, "frequency_mhz") == 0) {
+                current.frequency_hz = atof(value) * 1.0e6;
+            }
+        }
+    }
+
+    if (have_marker && current.frequency_hz > 0.0 && current.name[0] && count < max_markers) {
+        markers[count++] = current;
+        add_marker_group(groups, group_count, current.group);
+    }
+
+    free(text);
+    return count;
+}
+
+static int append_json_escaped(char *dst, size_t dst_size, int pos, const char *src)
+{
+    const unsigned char *s = (const unsigned char *)(src ? src : "");
+    while (*s && pos < (int)dst_size - 1) {
+        unsigned char c = *s++;
+        if (c == '"' || c == '\\') {
+            if (pos >= (int)dst_size - 2)
+                break;
+            dst[pos++] = '\\';
+            dst[pos++] = (char)c;
+        } else if (c < 0x20) {
+            if (pos >= (int)dst_size - 7)
+                break;
+            pos += snprintf(dst + pos, dst_size - (size_t)pos, "\\u%04x", c);
+        } else {
+            dst[pos++] = (char)c;
+        }
+    }
+    dst[pos] = 0;
+    return pos;
+}
+
+static void send_markers_json(int client_fd, const char *cors)
+{
+    marker_t markers[MAX_MARKERS];
+    char groups[MAX_MARKERS][MARKER_NAME_MAX];
+    int group_count = 0;
+    int marker_count = load_markers(markers, MAX_MARKERS, groups, &group_count);
+    size_t body_size = 1048576;
+    char *body = malloc(body_size);
+    int pos;
+
+    if (!body) {
+        send_json_response(client_fd, 500, "Internal Server Error", cors,
+                           "{\"status\":\"error\"}");
+        return;
+    }
+
+    pos = snprintf(body, body_size, "{\"status\":\"ok\",\"groups\":[");
+    for (int i = 0; i < group_count; i++) {
+        pos += snprintf(body + pos, body_size - (size_t)pos, "%s\"", i ? "," : "");
+        pos = append_json_escaped(body, body_size, pos, groups[i]);
+        pos += snprintf(body + pos, body_size - (size_t)pos, "\"");
+    }
+    pos += snprintf(body + pos, body_size - (size_t)pos, "],\"markers\":[");
+    for (int i = 0; i < marker_count; i++) {
+        pos += snprintf(body + pos, body_size - (size_t)pos,
+                        "%s{\"id\":%d,\"frequency_hz\":%.0f,\"name\":\"",
+                        i ? "," : "", i, markers[i].frequency_hz);
+        pos = append_json_escaped(body, body_size, pos, markers[i].name);
+        pos += snprintf(body + pos, body_size - (size_t)pos, "\",\"group\":\"");
+        pos = append_json_escaped(body, body_size, pos, markers[i].group);
+        pos += snprintf(body + pos, body_size - (size_t)pos, "\"}");
+    }
+    pos += snprintf(body + pos, body_size - (size_t)pos, "]}");
+    send_json_response(client_fd, 200, "OK", cors, body);
+    free(body);
 }
 
 static void url_decode(char *s)
@@ -470,6 +679,8 @@ static run_mode_t planned_run_mode(void);
 static void clamp_visible_to_config(void);
 static void raw_visible_band(double *out_start, double *out_end);
 static void active_scan_band(double *out_start, double *out_end);
+static void send_json_response(int client_fd, int code, const char *reason,
+                               const char *cors, const char *body);
 
 /* ------------------------------------------------------------------ */
 /* Hardware scan context                                              */
@@ -522,6 +733,8 @@ typedef struct {
     double center_freq;
     uint32_t view_id;
     uint32_t direct_sampling;
+    double direct_mix_phase;
+    double direct_mix_inc;
     float mag_scale;
     float *window;
     float *fft_scratch;
@@ -618,10 +831,7 @@ static void clamp_scan_end_to_hardware_limit(void)
     double max_end;
 
     if (direct_sampling_enabled()) {
-        g_freq_start = 0.0;
-        g_freq_end = direct_sampling_max_hz();
-        g_visible_start = g_freq_start;
-        g_visible_end = g_freq_end;
+        force_direct_sampling_defaults(1);
         return;
     }
 
@@ -718,6 +928,45 @@ static double single_source_center_for_visible(double visible_start,
     return candidates[2];
 }
 
+static double direct_source_center_for_visible(double visible_start,
+                                               double visible_end,
+                                               double source_span)
+{
+    double direct_max = direct_sampling_max_hz();
+    double visible_span = visible_end - visible_start;
+    double margin = visible_span * 0.05;
+    double candidates[3];
+
+    if (source_span >= direct_max)
+        return direct_max * 0.5;
+    if (margin < SINGLE_ZERO_SHIFT_HZ)
+        margin = SINGLE_ZERO_SHIFT_HZ;
+
+    candidates[0] = visible_start - margin;
+    candidates[1] = visible_end + margin;
+    candidates[2] = (visible_start + visible_end) * 0.5;
+
+    for (int i = 0; i < 3; i++) {
+        double center = candidates[i];
+        double source_start = center - source_span * 0.5;
+        double source_end = center + source_span * 0.5;
+        if (source_start < 0.0 || source_end > direct_max)
+            continue;
+        if (source_start <= visible_start && source_end >= visible_end)
+            return center;
+    }
+
+    {
+        double center = (visible_start + visible_end) * 0.5;
+        double half = source_span * 0.5;
+        if (center < half)
+            center = half;
+        if (center > direct_max - half)
+            center = direct_max - half;
+        return center;
+    }
+}
+
 static void raw_visible_band(double *out_start, double *out_end)
 {
     clamp_visible_to_config();
@@ -807,11 +1056,6 @@ static single_fft_plan_t single_fft_plan_for_span(double span)
         if (effective > FFT_SIZE_MAX)
             effective = FFT_SIZE_MAX;
         plan.fft_size = effective;
-        return plan;
-    }
-
-    if (direct_sampling_enabled()) {
-        plan.fft_size = FFT_SIZE_MAX;
         return plan;
     }
 
@@ -1165,6 +1409,16 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         ctx->scan_start = ctx->center_freq - step_width * 0.5;
         ctx->scan_end = ctx->center_freq + step_width * 0.5;
     }
+    ctx->direct_mix_phase = 0.0;
+    ctx->direct_mix_inc = 0.0;
+    if (ctx->direct_sampling && decim_factor > 1 &&
+        ctx->raw_samplerate > 0.0) {
+        ctx->direct_mix_inc = 2.0 * M_PI * ctx->center_freq / ctx->raw_samplerate;
+        while (ctx->direct_mix_inc >= 2.0 * M_PI)
+            ctx->direct_mix_inc -= 2.0 * M_PI;
+        while (ctx->direct_mix_inc < 0.0)
+            ctx->direct_mix_inc += 2.0 * M_PI;
+    }
     ctx->mag_scale = mag_scale;
     ctx->window = window;
     ctx->fft_scratch = fft_scratch;
@@ -1327,8 +1581,32 @@ static int cic_decimated_fft_magnitude(scan_ctx_t *ctx, float *buf,
     return 0;
 }
 
-static void select_direct_sampling_channel(float *buf, uint32_t buf_len, uint32_t direct_sampling)
+static void prepare_direct_sampling_samples(scan_ctx_t *ctx, float *buf, uint32_t buf_len)
 {
+    uint32_t direct_sampling = ctx->direct_sampling;
+
+    if (direct_sampling == 0)
+        return;
+
+    if (ctx->decim_factor > 1) {
+        double phase = ctx->direct_mix_phase;
+        double inc = ctx->direct_mix_inc;
+
+        for (uint32_t i = 0; i < buf_len; i++) {
+            float sample = (direct_sampling == 2) ? buf[2*i + 1] : buf[2*i];
+            buf[2*i] = sample * (float)cos(phase);
+            buf[2*i + 1] = -sample * (float)sin(phase);
+            phase += inc;
+            if (phase >= 2.0 * M_PI)
+                phase -= 2.0 * M_PI;
+            else if (phase < 0.0)
+                phase += 2.0 * M_PI;
+        }
+
+        ctx->direct_mix_phase = phase;
+        return;
+    }
+
     if (direct_sampling == 1) {
         for (uint32_t i = 0; i < buf_len; i++)
             buf[2*i + 1] = 0.0f;
@@ -1448,7 +1726,7 @@ static void process_scan_buffer(scan_ctx_t *ctx, float *buf, uint32_t buf_len, i
     }
 
     if (ctx->direct_sampling)
-        select_direct_sampling_channel(buf, buf_len, ctx->direct_sampling);
+        prepare_direct_sampling_samples(ctx, buf, buf_len);
 
     channel_bins = (channel == ctx->total_steps - 1) ? ctx->last_bins : ctx->bins_per_step;
     slot = ctx->line_buf + (size_t)channel * ctx->bins_per_step;
@@ -1458,7 +1736,8 @@ static void process_scan_buffer(scan_ctx_t *ctx, float *buf, uint32_t buf_len, i
     } else {
         if (average_fft_magnitude(buf, buf_len, channel_bins, ctx->fft_size,
                                   ctx->window, ctx->fft_scratch, ctx->mag_scale,
-                                  ctx->direct_sampling != 0, slot) <= 0)
+                                  ctx->direct_sampling != 0 && ctx->decim_factor <= 1,
+                                  slot) <= 0)
             return;
     }
 
@@ -1493,16 +1772,7 @@ static int current_display_bins(void)
 static void clamp_visible_to_config(void)
 {
     if (direct_sampling_enabled()) {
-        g_freq_start = 0.0;
-        g_freq_end = direct_sampling_max_hz();
-        if (g_visible_start < g_freq_start)
-            g_visible_start = g_freq_start;
-        if (g_visible_end > g_freq_end)
-            g_visible_end = g_freq_end;
-        if (g_visible_end <= g_visible_start) {
-            g_visible_start = g_freq_start;
-            g_visible_end = g_freq_end;
-        }
+        force_direct_sampling_defaults(0);
         return;
     }
 
@@ -1752,7 +2022,9 @@ static void *scan_thread_func(void *arg)
             return NULL;
         }
         single_plan = single_fft_plan_for_span(visible_end - visible_start);
-        center = direct_sampling_enabled() ? direct_sampling_max_hz() * 0.5 :
+        center = direct_sampling_enabled() ?
+            direct_source_center_for_visible(visible_start, visible_end,
+                                             single_plan.source_span) :
             single_source_center_for_visible(visible_start, visible_end,
                                              single_plan.source_span);
         total_steps = 1;
@@ -1839,14 +2111,18 @@ static void *scan_thread_func(void *arg)
     }
     worker_started = 1;
 
+    ret = fobos_sdr_set_clk_source(g_dev, (int)g_clk_source);
+    if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_clk_source failed: %d\n", ret);
     ret = fobos_sdr_set_samplerate(g_dev, g_samplerate);
     if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_samplerate failed: %d\n", ret);
     ret = fobos_sdr_set_auto_bandwidth(g_dev, g_bw_ratio);
     if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_auto_bandwidth failed: %d\n", ret);
-    ret = fobos_sdr_set_lna_gain(g_dev, g_lna_gain);
-    if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_lna_gain failed: %d\n", ret);
-    ret = fobos_sdr_set_vga_gain(g_dev, g_vga_gain);
-    if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_vga_gain failed: %d\n", ret);
+    if (!direct_sampling_enabled()) {
+        ret = fobos_sdr_set_lna_gain(g_dev, g_lna_gain);
+        if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_lna_gain failed: %d\n", ret);
+        ret = fobos_sdr_set_vga_gain(g_dev, g_vga_gain);
+        if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_vga_gain failed: %d\n", ret);
+    }
     ret = fobos_sdr_set_direct_sampling(g_dev, direct_sampling_enabled() ? 1 : 0);
     if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_direct_sampling failed: %d\n", ret);
 
@@ -1953,7 +2229,8 @@ static int start_scan(void)
         if (end <= start)
             return -1;
         plan = single_fft_plan_for_span(end - start);
-        center = direct_sampling_enabled() ? direct_sampling_max_hz() * 0.5 :
+        center = direct_sampling_enabled() ?
+            direct_source_center_for_visible(start, end, plan.source_span) :
             single_source_center_for_visible(start, end, plan.source_span);
         if (!direct_sampling_enabled() && receiver_frequency_from_radio(center) < 0.0)
             return -1;
@@ -1990,6 +2267,8 @@ static int apply_gain_settings(void)
     int ret_vga = FOBOS_ERR_OK;
 
     if (!g_dev || !g_scanning)
+        return FOBOS_ERR_OK;
+    if (direct_sampling_enabled())
         return FOBOS_ERR_OK;
 
     ret_lna = fobos_sdr_set_lna_gain(g_dev, g_lna_gain);
@@ -2089,6 +2368,64 @@ static void handle_request(int client_fd, const char *req)
         return;
     }
 
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/markers.ini") == 0) {
+        size_t len;
+        char *text = read_file(MARKERS_PATH, &len);
+        if (!text) {
+            const char *empty =
+                "# Human-editable frequency markers\n"
+                "# Each marker section supports name, group, frequency_hz or frequency_mhz.\n";
+            char resp[512];
+            int n = snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n"
+                "Content-Length: %zu\r\n%s\r\n",
+                strlen(empty), cors);
+            WRITE(client_fd, resp, (size_t)n);
+            WRITE(client_fd, empty, strlen(empty));
+            close(client_fd);
+            return;
+        }
+        char resp[512];
+        int n = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: %zu\r\n%s\r\n", len, cors);
+        WRITE(client_fd, resp, (size_t)n);
+        WRITE(client_fd, text, len);
+        free(text);
+        close(client_fd);
+        return;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/markers") == 0) {
+        send_markers_json(client_fd, cors);
+        close(client_fd);
+        return;
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/markers/save") == 0) {
+        const char *body = strstr(req, "\r\n\r\n");
+        int content_len = http_content_length(req);
+        FILE *f;
+        if (!body) { close(client_fd); return; }
+        body += 4;
+        if (content_len <= 0)
+            content_len = (int)strlen(body);
+        f = fopen(MARKERS_PATH, "wb");
+        if (!f) {
+            send_json_response(client_fd, 500, "Internal Server Error", cors,
+                               "{\"status\":\"error\"}");
+            close(client_fd);
+            return;
+        }
+        fwrite(body, 1, (size_t)content_len, f);
+        fclose(f);
+        send_json_response(client_fd, 200, "OK", cors, "{\"status\":\"ok\"}");
+        close(client_fd);
+        return;
+    }
+
     /* GET /api/status */
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
         char body[4096];
@@ -2115,7 +2452,9 @@ static void handle_request(int client_fd, const char *req)
             double center;
             raw_visible_band(&scan_start, &scan_end);
             plan = single_fft_plan_for_span(scan_end - scan_start);
-            center = direct_sampling_enabled() ? direct_sampling_max_hz() * 0.5 :
+            center = direct_sampling_enabled() ?
+                direct_source_center_for_visible(scan_start, scan_end,
+                                                 plan.source_span) :
                 single_source_center_for_visible(scan_start, scan_end,
                                                  plan.source_span);
             step = plan.source_span;
@@ -2153,6 +2492,7 @@ static void handle_request(int client_fd, const char *req)
             "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
             "\"effective_input_samples\":%u,"
             "\"lna_gain\":%u,\"vga_gain\":%u,\"direct_sampling\":%u,"
+            "\"clk_source\":%u,"
             "\"direct_sampling_max_hz\":%.0f,"
             "\"sample_rates\":%s}",
             g_hw_rev, g_fw_ver, g_serial,
@@ -2170,7 +2510,7 @@ static void handle_request(int client_fd, const char *req)
             bins_per_step, line_bins, display_bins,
             g_view_id, current_fft_size(), effective_fft,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
-            g_lna_gain, g_vga_gain, g_direct_sampling,
+            g_lna_gain, g_vga_gain, g_direct_sampling, g_clk_source,
             direct_sampling_max_hz(),
             sample_rates);
 
@@ -2255,6 +2595,8 @@ static void handle_request(int client_fd, const char *req)
         GET_UINT("\"lna_gain\"", g_lna_gain);
         GET_UINT("\"vga_gain\"", g_vga_gain);
         GET_UINT("direct_sampling", g_direct_sampling);
+        GET_UINT("\"clk_source\"", g_clk_source);
+        GET_UINT("\"clock_source\"", g_clk_source);
         GET_UINT("fft_size", fft_tmp);
         GET_UINT("display_bins", display_tmp);
         GET_UINT("min_rate_lps", min_rate_tmp);
@@ -2266,20 +2608,30 @@ static void handle_request(int client_fd, const char *req)
         if (display_tmp > 0)
             g_display_bins = normalize_display_bins((int)display_tmp);
         g_direct_sampling = normalize_direct_sampling(g_direct_sampling);
+        g_clk_source = normalize_clk_source(g_clk_source);
         g_min_rate_lps = normalize_min_rate_lps(min_rate_tmp);
         if (rate_tmp > 0)
             g_rate_limit_lps = normalize_rate_limit_lps(rate_tmp);
-        if (g_bw_ratio > 1.0) g_bw_ratio = 1.0;
-        if (!direct_sampling_enabled() && g_freq_start < MIN_FREQ_START_HZ)
-            g_freq_start = MIN_FREQ_START_HZ;
-        clamp_scan_end_to_hardware_limit();
-        if (have_visible_start && have_visible_end) {
-            g_visible_start = visible_start_tmp;
-            g_visible_end = visible_end_tmp;
-            clamp_visible_to_config();
+        if (direct_sampling_enabled()) {
+            force_direct_sampling_defaults(!have_visible_start || !have_visible_end);
+            if (have_visible_start && have_visible_end) {
+                g_visible_start = visible_start_tmp;
+                g_visible_end = visible_end_tmp;
+                clamp_visible_to_config();
+            }
         } else {
-            g_visible_start = g_freq_start;
-            g_visible_end = g_freq_end;
+            if (g_bw_ratio > 1.0) g_bw_ratio = 1.0;
+            if (g_freq_start < MIN_FREQ_START_HZ)
+                g_freq_start = MIN_FREQ_START_HZ;
+            clamp_scan_end_to_hardware_limit();
+            if (have_visible_start && have_visible_end) {
+                g_visible_start = visible_start_tmp;
+                g_visible_end = visible_end_tmp;
+                clamp_visible_to_config();
+            } else {
+                g_visible_start = g_freq_start;
+                g_visible_end = g_freq_end;
+            }
         }
         g_view_id++;
 
@@ -2317,6 +2669,7 @@ static void handle_request(int client_fd, const char *req)
             "\"display_bins\":%d,\"view_id\":%u,\"effective_fft_size\":%d,"
             "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
             "\"effective_input_samples\":%u,\"direct_sampling\":%u,"
+            "\"clk_source\":%u,\"samplerate\":%.0f,\"bw_ratio\":%.2f,"
             "\"direct_sampling_max_hz\":%.0f}",
             status,
             g_freq_start, g_freq_end,
@@ -2327,7 +2680,8 @@ static void handle_request(int client_fd, const char *req)
             g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
             current_display_bins(), g_view_id, effective_fft,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
-            g_direct_sampling, direct_sampling_max_hz());
+            g_direct_sampling, g_clk_source, g_samplerate, g_bw_ratio,
+            direct_sampling_max_hz());
         send_json_response(client_fd, 200, "OK", cors, json_body);
         close(client_fd);
         return;
@@ -2422,7 +2776,8 @@ static void handle_request(int client_fd, const char *req)
                 "\"effective_fft_size\":%d,\"decim_factor\":%d,"
                 "\"decim_hop\":%d,\"overlap_factor\":%.3f,"
                 "\"effective_input_samples\":%u,\"scanning\":%d,"
-                "\"direct_sampling\":%u,\"direct_sampling_max_hz\":%.0f}",
+                "\"direct_sampling\":%u,\"clk_source\":%u,"
+                "\"direct_sampling_max_hz\":%.0f}",
                 (ret == 0) ? "ok" : "error", g_view_id,
                 g_freq_start, g_freq_end,
                 g_freq_start, g_freq_end,
@@ -2431,7 +2786,8 @@ static void handle_request(int client_fd, const char *req)
                 planned_required_points(), run_mode_name(mode),
                 g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
                 effective_fft, decim_factor, decim_hop, overlap_factor, line_sample_count,
-                g_scanning, g_direct_sampling, direct_sampling_max_hz());
+                g_scanning, g_direct_sampling, g_clk_source,
+                direct_sampling_max_hz());
             send_json_response(client_fd, 200, "OK", cors, json_body);
         }
         close(client_fd);
