@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Fobos SDR Scanner with a million time zoom</title>
+        <title>Fobos SDR Scanner with a million times zoom</title>
         <style>
             * {
                 margin: 0;
@@ -382,7 +382,7 @@
         <div class="container">
             <h1>
                 <span class="status-dot idle" id="statusDot"></span>
-                Fobos SDR Scanner with a million time zoom
+                Fobos SDR Scanner with a million times zoom
                 <small id="statusText">disconnected</small>
             </h1>
 
@@ -390,18 +390,37 @@
                 <span>HW: <span class="val" id="infoHw">---</span></span>
                 <span>FW: <span class="val" id="infoFw">---</span></span>
                 <span>S/N: <span class="val" id="infoSn">---</span></span>
-                <span>Zoom (press SHIFT): <span class="val" id="infoZoom">1.00x</span></span>
-                <span>Markers (press SHIFT): <span class="val" id="infoMarkers">0</span></span>
+                <span
+                    >Zoom (press SHIFT):
+                    <span class="val" id="infoZoom">1.00x</span></span
+                >
+                <span
+                    >Markers (press SHIFT):
+                    <span class="val" id="infoMarkers">0</span></span
+                >
                 <span>Shown: <span class="val" id="infoRange">---</span></span>
                 <span>SCAN: <span class="val" id="infoScan">---</span></span>
                 <span>FFT: <span class="val" id="infoFFT">---</span></span>
-                <span>Traffic: <span class="val" id="infoTraffic">---</span></span>
+                <span
+                    >Traffic:
+                    <span class="val" id="infoTraffic">---</span></span
+                >
                 <span class="view-buttons">
-                    <button class="mini-btn" id="panLeft" title="Pan left">Left</button>
-                    <button class="mini-btn" id="zoomOut" title="Zoom out">-</button>
-                    <button class="mini-btn" id="zoomReset" title="Reset zoom">1x</button>
-                    <button class="mini-btn" id="zoomIn" title="Zoom in">+</button>
-                    <button class="mini-btn" id="panRight" title="Pan right">Right</button>
+                    <button class="mini-btn" id="panLeft" title="Pan left">
+                        Left
+                    </button>
+                    <button class="mini-btn" id="zoomOut" title="Zoom out">
+                        -
+                    </button>
+                    <button class="mini-btn" id="zoomReset" title="Reset zoom">
+                        1x
+                    </button>
+                    <button class="mini-btn" id="zoomIn" title="Zoom in">
+                        +
+                    </button>
+                    <button class="mini-btn" id="panRight" title="Pan right">
+                        Right
+                    </button>
                 </span>
             </div>
 
@@ -589,11 +608,7 @@
                 </label>
                 <label>
                     Frequency (MHz)
-                    <input
-                        type="number"
-                        id="markerFreq"
-                        step="0.000001"
-                    />
+                    <input type="number" id="markerFreq" step="0.000001" />
                 </label>
                 <div class="dialog-actions">
                     <button class="mini-btn" id="markerDelete">Delete</button>
@@ -651,6 +666,11 @@
             let zoomWheelDirection = 0;
             let zoomWheelCanvas = null;
             let zoomWheelClientX = 0;
+            let visibleViewSaveTimer = 0;
+            let visibleViewLastWriteMs = 0;
+            let visibleViewLastSerialized = "";
+            let sseReconnectTimer = 0;
+            let sseFailureCount = 0;
             const MAX_ZOOM_FACTOR = 1000000;
             const DIRECT_SAMPLING_HARD_MAX_HZ = 25000000;
             const TICK_MIN_COUNT = 5;
@@ -667,7 +687,10 @@
             let autoWfMin = null;
             let autoWfMax = null;
 
-            function hasFrequencyWindow(start = currentFreq0, end = currentFreq1) {
+            function hasFrequencyWindow(
+                start = currentFreq0,
+                end = currentFreq1,
+            ) {
                 return (
                     Number.isFinite(start) &&
                     Number.isFinite(end) &&
@@ -793,13 +816,18 @@
             }
 
             function clampVisibleWindow(left, right, fullStart, fullEnd) {
-                if (!Number.isFinite(left) || !Number.isFinite(right)) return null;
-                if (!Number.isFinite(fullStart) || !Number.isFinite(fullEnd)) return null;
+                if (!Number.isFinite(left) || !Number.isFinite(right))
+                    return null;
+                if (!Number.isFinite(fullStart) || !Number.isFinite(fullEnd))
+                    return null;
                 if (fullEnd <= fullStart || right <= left) return null;
                 const fullSpan = fullEnd - fullStart;
                 let span = Math.min(right - left, fullSpan);
                 span = Math.max(1, span);
-                let nextLeft = Math.max(fullStart, Math.min(fullEnd - span, left));
+                let nextLeft = Math.max(
+                    fullStart,
+                    Math.min(fullEnd - span, left),
+                );
                 let nextRight = nextLeft + span;
                 if (nextRight > fullEnd) {
                     nextRight = fullEnd;
@@ -816,7 +844,10 @@
                     if (!raw) return null;
                     const saved = JSON.parse(raw);
                     if (
-                        !sameStoredFrequency(saved.configured_start_hz, fullStart) ||
+                        !sameStoredFrequency(
+                            saved.configured_start_hz,
+                            fullStart,
+                        ) ||
                         !sameStoredFrequency(saved.configured_end_hz, fullEnd)
                     ) {
                         return null;
@@ -845,7 +876,16 @@
                 );
             }
 
-            function saveVisibleView() {
+            function performVisibleViewSave(serialized, hash) {
+                if (serialized === visibleViewLastSerialized) return;
+                localStorage.setItem(VIEW_STORAGE_KEY, serialized);
+                visibleViewLastSerialized = serialized;
+                visibleViewLastWriteMs = Date.now();
+                if (window.location.hash !== hash)
+                    history.replaceState(null, "", hash);
+            }
+
+            function saveVisibleView(force = false) {
                 if (
                     !hasFrequencyWindow(configuredFreq0, configuredFreq1) ||
                     !hasFrequencyWindow(currentFreq0, currentFreq1)
@@ -859,25 +899,38 @@
                     configuredFreq1,
                 );
                 if (!view) return;
-                localStorage.setItem(
-                    VIEW_STORAGE_KEY,
-                    JSON.stringify({
-                        configured_start_hz: configuredFreq0,
-                        configured_end_hz: configuredFreq1,
-                        visible_start_hz: view.left,
-                        visible_end_hz: view.right,
-                    }),
-                );
                 const hash =
                     "#view=" +
                     Math.round(view.left) +
                     "-" +
                     Math.round(view.right);
-                if (window.location.hash !== hash)
-                    history.replaceState(null, "", hash);
+                const serialized = JSON.stringify({
+                    configured_start_hz: configuredFreq0,
+                    configured_end_hz: configuredFreq1,
+                    visible_start_hz: view.left,
+                    visible_end_hz: view.right,
+                });
+                const elapsed = Date.now() - visibleViewLastWriteMs;
+                if (visibleViewSaveTimer) {
+                    clearTimeout(visibleViewSaveTimer);
+                    visibleViewSaveTimer = 0;
+                }
+                if (force || elapsed >= 1000) {
+                    performVisibleViewSave(serialized, hash);
+                } else {
+                    visibleViewSaveTimer = setTimeout(() => {
+                        visibleViewSaveTimer = 0;
+                        performVisibleViewSave(serialized, hash);
+                    }, 1000 - elapsed);
+                }
             }
 
             function clearSavedView() {
+                if (visibleViewSaveTimer) {
+                    clearTimeout(visibleViewSaveTimer);
+                    visibleViewSaveTimer = 0;
+                }
+                visibleViewLastSerialized = "";
                 localStorage.removeItem(VIEW_STORAGE_KEY);
                 if (window.location.hash.startsWith("#view="))
                     history.replaceState(
@@ -995,7 +1048,12 @@
                 return { left, right };
             }
 
-            function getZoomedFrequencyAxis(freqStart, freqEnd, steps, binCount) {
+            function getZoomedFrequencyAxis(
+                freqStart,
+                freqEnd,
+                steps,
+                binCount,
+            ) {
                 const axis = getFrequencyAxis(freqStart, freqEnd, steps);
                 const range = clampZoomRange(binCount);
                 const span = axis.right - axis.left;
@@ -1015,8 +1073,7 @@
                 const pos = Math.max(0, Math.min(width - 1, x));
                 const frac = width > 1 ? pos / (width - 1) : 0;
                 const idx = Math.floor(
-                    (range.left + frac * (range.right - range.left)) *
-                        binCount,
+                    (range.left + frac * (range.right - range.left)) * binCount,
                 );
                 return Math.max(0, Math.min(binCount - 1, idx));
             }
@@ -1060,11 +1117,7 @@
             }
 
             function sameFrequencySpan(a0, a1, b0, b1) {
-                const span = Math.max(
-                    1,
-                    Math.abs(a1 - a0),
-                    Math.abs(b1 - b0),
-                );
+                const span = Math.max(1, Math.abs(a1 - a0), Math.abs(b1 - b0));
                 const tol = Math.max(1, span * 1e-9);
                 return Math.abs(a0 - b0) <= tol && Math.abs(a1 - b1) <= tol;
             }
@@ -1105,7 +1158,12 @@
                 const targetSpan = targetEnd - targetStart;
                 if (
                     n === Math.floor(width) &&
-                    sameFrequencySpan(targetStart, targetEnd, sourceStart, sourceEnd)
+                    sameFrequencySpan(
+                        targetStart,
+                        targetEnd,
+                        sourceStart,
+                        sourceEnd,
+                    )
                 ) {
                     const px = Math.max(0, Math.min(n - 1, Math.floor(x)));
                     return data[px] | 0;
@@ -1148,10 +1206,7 @@
                 const span = range.right - range.left;
                 for (let x = 0; x < width; x++) {
                     const leftFrac = Math.max(0, Math.min(1, x / width));
-                    const rightFrac = Math.max(
-                        0,
-                        Math.min(1, (x + 1) / width),
-                    );
+                    const rightFrac = Math.max(0, Math.min(1, (x + 1) / width));
                     let first = Math.floor(
                         (range.left + leftFrac * span) * binCount,
                     );
@@ -1254,14 +1309,7 @@
                 const start = formatMHzValue(freqStart, decimals);
                 const end = formatMHzValue(freqEnd, decimals);
                 const span = formatMHzValue(shownSpan, decimals);
-                return (
-                    start +
-                    " - " +
-                    end +
-                    " (" +
-                    span +
-                    ") MHz"
-                );
+                return start + " - " + end + " (" + span + ") MHz";
             }
 
             function formatMHzValue(freq, decimals = 3) {
@@ -1390,8 +1438,7 @@
                         current.end_hz = Number(value) * 1e6;
                     else if (key === "start_hz")
                         current.start_hz = Number(value);
-                    else if (key === "end_hz")
-                        current.end_hz = Number(value);
+                    else if (key === "end_hz") current.end_hz = Number(value);
                 }
                 flushBand();
                 return parsed.sort((a, b) => a.start_hz - b.start_hz);
@@ -1399,7 +1446,9 @@
 
             async function loadBands() {
                 try {
-                    const resp = await fetch("/bands.ini", { cache: "no-store" });
+                    const resp = await fetch("/bands.ini", {
+                        cache: "no-store",
+                    });
                     if (!resp.ok) return;
                     bands = parseBandsIni(await resp.text());
                     if (currentBins && currentBins.length) {
@@ -1492,7 +1541,11 @@
                     scCtx.fillStyle = headerColors[colorIdx];
                     scCtx.fillRect(entry.x0, y, entry.w, 12);
                     scCtx.fillStyle = labelColors[colorIdx];
-                    scCtx.fillText(entry.band.name, entry.x0 + entry.w * 0.5, y + 1);
+                    scCtx.fillText(
+                        entry.band.name,
+                        entry.x0 + entry.w * 0.5,
+                        y + 1,
+                    );
                     scCtx.restore();
                 });
             }
@@ -1500,8 +1553,7 @@
             function bandsAtFrequency(freq) {
                 return bands
                     .filter(
-                        (band) =>
-                            freq >= band.start_hz && freq <= band.end_hz,
+                        (band) => freq >= band.start_hz && freq <= band.end_hz,
                     )
                     .map((band) => band.name);
             }
@@ -1537,7 +1589,9 @@
                             Number.isFinite(marker.frequency_hz) &&
                             marker.frequency_hz >= 0,
                     );
-                markerGroups = [...new Set(["Ungrouped", ...(data.groups || [])])];
+                markerGroups = [
+                    ...new Set(["Ungrouped", ...(data.groups || [])]),
+                ];
                 for (const marker of markers) {
                     if (!markerGroups.includes(marker.group))
                         markerGroups.push(marker.group);
@@ -1571,7 +1625,10 @@
                     .forEach((marker, idx) => {
                         lines.push("[marker_" + (idx + 1) + "]");
                         lines.push("name = " + cleanIniValue(marker.name));
-                        lines.push("group = " + cleanIniValue(marker.group || "Ungrouped"));
+                        lines.push(
+                            "group = " +
+                                cleanIniValue(marker.group || "Ungrouped"),
+                        );
                         lines.push(
                             "frequency_hz = " +
                                 Math.round(Number(marker.frequency_hz) || 0),
@@ -1685,12 +1742,16 @@
                         return option;
                     }),
                 );
-                select.value = values.includes(selected) ? selected : "Ungrouped";
+                select.value = values.includes(selected)
+                    ? selected
+                    : "Ungrouped";
             }
 
             function closeMarkerDialog() {
                 markerDialogTarget = null;
-                document.getElementById("markerDialog").classList.remove("open");
+                document
+                    .getElementById("markerDialog")
+                    .classList.remove("open");
             }
 
             function openMarkerDialog(marker, freq, clientX, clientY) {
@@ -1714,10 +1775,13 @@
             }
 
             async function applyMarkerDialog() {
-                const name = cleanIniValue(document.getElementById("markerName").value);
+                const name = cleanIniValue(
+                    document.getElementById("markerName").value,
+                );
                 const group =
-                    cleanIniValue(document.getElementById("markerGroup").value) ||
-                    "Ungrouped";
+                    cleanIniValue(
+                        document.getElementById("markerGroup").value,
+                    ) || "Ungrouped";
                 const freqHz =
                     Number(document.getElementById("markerFreq").value) * 1e6;
                 if (!name || !Number.isFinite(freqHz) || freqHz < 0) return;
@@ -1748,7 +1812,9 @@
 
             async function deleteMarkerDialog() {
                 if (!markerDialogTarget) return;
-                markers = markers.filter((marker) => marker !== markerDialogTarget);
+                markers = markers.filter(
+                    (marker) => marker !== markerDialogTarget,
+                );
                 updateMarkerCount();
                 closeMarkerDialog();
                 await saveMarkers();
@@ -1816,9 +1882,7 @@
                         if (seen.has(key)) continue;
                         seen.add(key);
                         marks.push({
-                            pos:
-                                ((minorFreq - left) / (right - left)) *
-                                100,
+                            pos: ((minorFreq - left) / (right - left)) * 100,
                             freq: minorFreq,
                             step,
                             kind:
@@ -1865,7 +1929,8 @@
                         const mark = document.createElement("div");
                         const label = document.createElement("div");
                         mark.className =
-                            "wf-tick" + (tick.kind === "major" ? "" : " " + tick.kind);
+                            "wf-tick" +
+                            (tick.kind === "major" ? "" : " " + tick.kind);
                         if (tick.pos < 2) mark.classList.add("edge-start");
                         if (tick.pos > 98) mark.classList.add("edge-end");
                         mark.style.left = tick.pos + "%";
@@ -1928,7 +1993,10 @@
                 const low = percentileFromSorted(samples, 0.08);
                 const high = percentileFromSorted(samples, 0.985);
                 const targetMin = Math.max(0, Math.min(398, low - 8));
-                const targetMax = Math.max(targetMin + 2, Math.min(400, high + 18));
+                const targetMax = Math.max(
+                    targetMin + 2,
+                    Math.min(400, high + 18),
+                );
 
                 if (autoWfMin === null || autoWfMax === null) {
                     autoWfMin = targetMin;
@@ -1940,13 +2008,16 @@
 
                 const nextMin = Math.round(autoWfMin);
                 const nextMax = Math.max(nextMin + 1, Math.round(autoWfMax));
-                if (nextMin === waterfallMin && nextMax === waterfallMax) return;
+                if (nextMin === waterfallMin && nextMax === waterfallMax)
+                    return;
                 waterfallMin = nextMin;
                 waterfallMax = nextMax;
                 document.getElementById("wfMin").value = String(nextMin);
                 document.getElementById("wfMax").value = String(nextMax);
-                document.getElementById("wfMinVal").textContent = String(nextMin);
-                document.getElementById("wfMaxVal").textContent = String(nextMax);
+                document.getElementById("wfMinVal").textContent =
+                    String(nextMin);
+                document.getElementById("wfMaxVal").textContent =
+                    String(nextMax);
                 localStorage.setItem("wfMin", String(nextMin));
                 localStorage.setItem("wfMax", String(nextMax));
             }
@@ -1982,7 +2053,12 @@
                 }
             }
 
-            function transformWaterfallPixels(prevStart, prevEnd, nextStart, nextEnd) {
+            function transformWaterfallPixels(
+                prevStart,
+                prevEnd,
+                nextStart,
+                nextEnd,
+            ) {
                 if (!wfImageData) return;
                 const w = wfImageData.width;
                 const h = wfImageData.height;
@@ -1997,8 +2073,7 @@
                 for (let y = 0; y < h; y++) {
                     const rowOffset = y * w * 4;
                     for (let x = 0; x < w; x++) {
-                        const freq =
-                            nextStart + ((x + 0.5) / w) * nextSpan;
+                        const freq = nextStart + ((x + 0.5) / w) * nextSpan;
                         const srcX = Math.floor(
                             ((freq - prevStart) / prevSpan) * w,
                         );
@@ -2022,8 +2097,18 @@
                 wfCtx.putImageData(wfImageData, 0, 0);
             }
 
-            function transformVisibleDisplay(prevStart, prevEnd, nextStart, nextEnd) {
-                transformWaterfallPixels(prevStart, prevEnd, nextStart, nextEnd);
+            function transformVisibleDisplay(
+                prevStart,
+                prevEnd,
+                nextStart,
+                nextEnd,
+            ) {
+                transformWaterfallPixels(
+                    prevStart,
+                    prevEnd,
+                    nextStart,
+                    nextEnd,
+                );
                 if (currentBins && currentBins.length) {
                     drawScope(
                         currentBins,
@@ -2068,7 +2153,9 @@
                         const n = rowData.length;
                         if (!n) continue;
                         const rowHasWindow = hasFrequencyWindow(row.f0, row.f1);
-                        const sourceStart = rowHasWindow ? row.f0 : currentFreq0;
+                        const sourceStart = rowHasWindow
+                            ? row.f0
+                            : currentFreq0;
                         const sourceEnd = rowHasWindow ? row.f1 : currentFreq1;
                         const targetAxis = getZoomedFrequencyAxis(
                             currentFreq0,
@@ -2113,11 +2200,7 @@
                                             sourceStart,
                                             sourceEnd,
                                         );
-                            writeWaterfallPixel(
-                                pix,
-                                rowOffset + x * 4,
-                                value,
-                            );
+                            writeWaterfallPixel(pix, rowOffset + x * 4, value);
                         }
                     }
 
@@ -2174,7 +2257,9 @@
                 );
                 const range = sameAxis ? clampZoomRange(n) : null;
                 const binRanges =
-                    sameAxis && n !== w ? getCanvasBinRanges(w, n, range) : null;
+                    sameAxis && n !== w
+                        ? getCanvasBinRanges(w, n, range)
+                        : null;
                 for (let x = 0; x < w; x++) {
                     const bi = topRow + x * 4;
                     const value =
@@ -2194,11 +2279,7 @@
                                     freqStart,
                                     freqEnd,
                                 );
-                    writeWaterfallPixel(
-                        pix,
-                        bi,
-                        value,
-                    );
+                    writeWaterfallPixel(pix, bi, value);
                 }
 
                 wfCtx.putImageData(wfImageData, 0, 0);
@@ -2253,7 +2334,9 @@
                 );
                 const range = sameAxis ? clampZoomRange(n) : null;
                 const binRanges =
-                    sameAxis && n !== w ? getCanvasBinRanges(w, n, range) : null;
+                    sameAxis && n !== w
+                        ? getCanvasBinRanges(w, n, range)
+                        : null;
                 for (let x = 0; x < w; x++) {
                     const rawValue =
                         sameAxis && n === w
@@ -2291,7 +2374,9 @@
                     0,
                     Math.min(
                         n - 1,
-                        Math.floor(((sourceStart - freqStart) / sourceSpan) * n),
+                        Math.floor(
+                            ((sourceStart - freqStart) / sourceSpan) * n,
+                        ),
                     ),
                 );
                 const lastBin = Math.min(
@@ -2324,18 +2409,68 @@
             // ===================================================================
             let eventSource = null;
 
+            function parseLineEventPayload(raw) {
+                let data;
+                try {
+                    data = JSON.parse(raw);
+                } catch (e) {
+                    return null;
+                }
+                if (!data || !Array.isArray(data.d)) return null;
+                const expectedBins = Number(data.display_bins || data.d.length);
+                if (
+                    !Number.isInteger(expectedBins) ||
+                    expectedBins <= 0 ||
+                    data.d.length !== expectedBins
+                ) {
+                    return null;
+                }
+                if (expectedBins !== displayBins()) {
+                    scheduleViewUpdate(currentFreq0, currentFreq1, false);
+                    return null;
+                }
+                for (let i = 0; i < data.d.length; i++) {
+                    const v = Number(data.d[i]);
+                    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
+                    data.d[i] = v;
+                }
+                if (
+                    data.f0 !== undefined &&
+                    data.f1 !== undefined &&
+                    (!Number.isFinite(Number(data.f0)) ||
+                        !Number.isFinite(Number(data.f1)) ||
+                        Number(data.f1) <= Number(data.f0))
+                ) {
+                    return null;
+                }
+                return data;
+            }
+
+            function scheduleSSEReconnect() {
+                if (!backendOnline || !scanRunning || sseReconnectTimer) return;
+                const delay = Math.min(5000, 500 * Math.max(1, ++sseFailureCount));
+                sseReconnectTimer = setTimeout(() => {
+                    sseReconnectTimer = 0;
+                    if (backendOnline && scanRunning && !eventSource)
+                        connectSSE();
+                }, delay);
+            }
+
             function connectSSE() {
                 if (eventSource) eventSource.close();
                 eventSource = new EventSource("/api/waterfall");
 
                 eventSource.addEventListener("line", function (e) {
+                    const data = parseLineEventPayload(e.data);
+                    if (!data) return;
                     try {
-                        const data = JSON.parse(e.data);
-                        const bins = Uint8Array.from(data.d || []);
-                        if (!bins.length) return;
+                        const bins = Uint8Array.from(data.d);
                         const rowView =
-                            data.view !== undefined ? Number(data.view) : currentViewId;
-                        if (pendingViewChange && rowView === currentViewId) return;
+                            data.view !== undefined
+                                ? Number(data.view)
+                                : currentViewId;
+                        if (pendingViewChange && rowView === currentViewId)
+                            return;
                         if (
                             currentViewId &&
                             rowView &&
@@ -2349,8 +2484,10 @@
                             configuredFreq0 = Number(data.full_f0);
                         if (data.full_f1 !== undefined)
                             configuredFreq1 = Number(data.full_f1);
-                        if (data.f0 !== undefined) currentFreq0 = Number(data.f0);
-                        if (data.f1 !== undefined) currentFreq1 = Number(data.f1);
+                        if (data.f0 !== undefined)
+                            currentFreq0 = Number(data.f0);
+                        if (data.f1 !== undefined)
+                            currentFreq1 = Number(data.f1);
                         if (data.b) currentSteps = data.b;
                         updateFFTInfo(data);
                         zoomLeft = 0;
@@ -2377,16 +2514,29 @@
                             formatScanRange(currentFreq0, currentFreq1);
                         saveVisibleView();
                     } catch (e) {
-                        /* ignore parse errors */
+                        console.warn("Ignored invalid waterfall line", e);
                     }
                 });
 
+                eventSource.onopen = function () {
+                    sseFailureCount = 0;
+                };
+
                 eventSource.onerror = function () {
+                    if (eventSource) {
+                        eventSource.close();
+                        eventSource = null;
+                    }
                     checkBackendStatus();
+                    scheduleSSEReconnect();
                 };
             }
 
             function disconnectSSE() {
+                if (sseReconnectTimer) {
+                    clearTimeout(sseReconnectTimer);
+                    sseReconnectTimer = 0;
+                }
                 if (eventSource) {
                     eventSource.close();
                     eventSource = null;
@@ -2459,7 +2609,10 @@
                 const marker = nearestMarkerAtCanvas(canvas, evt.clientX);
                 if (marker)
                     lines.push(
-                        marker.name + " (" + (marker.group || "Ungrouped") + ")",
+                        marker.name +
+                            " (" +
+                            (marker.group || "Ungrouped") +
+                            ")",
                     );
                 const bandNames = bandsAtFrequency(freq);
                 if (bandNames.length) lines.push(bandNames.join(", "));
@@ -2552,7 +2705,10 @@
                         ? Math.pow(1 / factorPerStep, steps)
                         : Math.pow(factorPerStep, steps);
                 const minSpan = Math.max(1, fullSpan / MAX_ZOOM_FACTOR);
-                let span = Math.max(minSpan, Math.min(fullSpan, currentSpan * factor));
+                let span = Math.max(
+                    minSpan,
+                    Math.min(fullSpan, currentSpan * factor),
+                );
                 let left = anchor - cursor * span;
                 let right = left + span;
 
@@ -2576,7 +2732,12 @@
                 currentFreq1 = right;
                 pendingViewChange = true;
                 binRangeCache = null;
-                transformVisibleDisplay(prevFreq0, prevFreq1, currentFreq0, currentFreq1);
+                transformVisibleDisplay(
+                    prevFreq0,
+                    prevFreq1,
+                    currentFreq0,
+                    currentFreq1,
+                );
                 scheduleCurrentViewRedraw();
                 updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
                 document.getElementById("infoRange").textContent =
@@ -2603,7 +2764,12 @@
             function applyVisibleWindow(left, right) {
                 if (!hasFrequencyWindow()) return;
                 const full = primaryFrequencyWindow();
-                const clamped = clampVisibleWindow(left, right, full.left, full.right);
+                const clamped = clampVisibleWindow(
+                    left,
+                    right,
+                    full.left,
+                    full.right,
+                );
                 if (!clamped) return;
                 if (
                     Math.abs(clamped.left - currentFreq0) < 1 &&
@@ -2619,7 +2785,12 @@
                 currentFreq1 = clamped.right;
                 pendingViewChange = true;
                 binRangeCache = null;
-                transformVisibleDisplay(prevFreq0, prevFreq1, currentFreq0, currentFreq1);
+                transformVisibleDisplay(
+                    prevFreq0,
+                    prevFreq1,
+                    currentFreq0,
+                    currentFreq1,
+                );
                 scheduleCurrentViewRedraw();
                 updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
                 document.getElementById("infoRange").textContent =
@@ -2661,7 +2832,8 @@
                 const canvas = zoomWheelCanvas;
                 const clientX = zoomWheelClientX;
                 const signedSteps =
-                    zoomWheelDirection * Math.max(1, Math.min(8, zoomWheelSteps));
+                    zoomWheelDirection *
+                    Math.max(1, Math.min(8, zoomWheelSteps));
                 zoomWheelFrame = 0;
                 zoomWheelSteps = 0;
                 zoomWheelDirection = 0;
@@ -2679,10 +2851,17 @@
                 const signedStep = wheelZoomStep(evt);
                 if (signedStep === 0) return;
                 const direction = signedStep < 0 ? -1 : 1;
-                if (zoomWheelFrame && zoomWheelDirection && direction !== zoomWheelDirection)
+                if (
+                    zoomWheelFrame &&
+                    zoomWheelDirection &&
+                    direction !== zoomWheelDirection
+                )
                     return;
                 zoomWheelDirection = direction;
-                zoomWheelSteps = Math.min(8, zoomWheelSteps + Math.abs(signedStep));
+                zoomWheelSteps = Math.min(
+                    8,
+                    zoomWheelSteps + Math.abs(signedStep),
+                );
                 zoomWheelCanvas = evt.currentTarget;
                 zoomWheelClientX = evt.clientX;
                 if (!zoomWheelFrame)
@@ -2762,7 +2941,12 @@
                 currentFreq1 = clamped.right;
                 pendingViewChange = true;
                 binRangeCache = null;
-                transformVisibleDisplay(prevFreq0, prevFreq1, currentFreq0, currentFreq1);
+                transformVisibleDisplay(
+                    prevFreq0,
+                    prevFreq1,
+                    currentFreq0,
+                    currentFreq1,
+                );
                 scheduleCurrentViewRedraw();
                 updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
                 document.getElementById("infoRange").textContent =
@@ -2790,7 +2974,9 @@
             function isEditingElement(target) {
                 if (!target) return false;
                 const tag = target.tagName;
-                return tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA";
+                return (
+                    tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA"
+                );
             }
 
             window.addEventListener("keydown", (evt) => {
@@ -2827,6 +3013,9 @@
                 if (evt.key === "Shift") setZoomCursor(false);
             });
             window.addEventListener("blur", () => setZoomCursor(false));
+            window.addEventListener("beforeunload", () => {
+                saveVisibleView(true);
+            });
 
             wfCanvas.addEventListener("wheel", handleZoomWheel, {
                 passive: false,
@@ -2842,18 +3031,22 @@
             document.getElementById("panLeft").addEventListener("click", () => {
                 panByFraction(-0.2);
             });
-            document.getElementById("panRight").addEventListener("click", () => {
-                panByFraction(0.2);
-            });
+            document
+                .getElementById("panRight")
+                .addEventListener("click", () => {
+                    panByFraction(0.2);
+                });
             document.getElementById("zoomIn").addEventListener("click", () => {
                 zoomByFactor(1 / 1.35);
             });
             document.getElementById("zoomOut").addEventListener("click", () => {
                 zoomByFactor(1.35);
             });
-            document.getElementById("zoomReset").addEventListener("click", () => {
-                resetZoomView();
-            });
+            document
+                .getElementById("zoomReset")
+                .addEventListener("click", () => {
+                    resetZoomView();
+                });
 
             // ===================================================================
             //  API calls
@@ -2866,7 +3059,26 @@
                         ...options,
                         signal: controller.signal,
                     });
-                    if (!resp.ok) return null;
+                    if (!resp.ok) {
+                        let payload = null;
+                        let text = "";
+                        try {
+                            text = await resp.text();
+                            payload = text ? JSON.parse(text) : null;
+                        } catch (e) {
+                            payload = null;
+                        }
+                        return {
+                            ...(payload || {}),
+                            status: "error",
+                            http_status: resp.status,
+                            message:
+                                (payload && payload.message) ||
+                                text ||
+                                resp.statusText ||
+                                "HTTP error",
+                        };
+                    }
                     return await resp.json();
                 } catch (e) {
                     return null;
@@ -2891,7 +3103,9 @@
                 if (!plan) return;
 
                 const nextView =
-                    plan.view_id !== undefined ? Number(plan.view_id) : currentViewId;
+                    plan.view_id !== undefined
+                        ? Number(plan.view_id)
+                        : currentViewId;
                 const viewChanged = nextView && nextView !== currentViewId;
                 if (nextView) currentViewId = nextView;
 
@@ -2941,19 +3155,27 @@
                 zoomLeft = 0;
                 zoomRight = 1;
                 pendingViewChange = false;
-                if (clearOnViewChange && viewChanged) scheduleCurrentViewRedraw();
+                if (clearOnViewChange && viewChanged)
+                    scheduleCurrentViewRedraw();
                 if (hasFrequencyWindow() && currentSteps) {
-                    updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
+                    updateFrequencyLabels(
+                        currentFreq0,
+                        currentFreq1,
+                        currentSteps,
+                    );
                     document.getElementById("infoRange").textContent =
                         formatScanRange(currentFreq0, currentFreq1);
                     saveVisibleView();
                 }
             }
 
-            function scheduleViewUpdate(visibleStart, visibleEnd, visibleChanged) {
+            function scheduleViewUpdate(
+                visibleStart,
+                visibleEnd,
+                visibleChanged,
+            ) {
                 if (!backendOnline || !scanRunning) return;
-                if (!hasFrequencyWindow(visibleStart, visibleEnd))
-                    return;
+                if (!hasFrequencyWindow(visibleStart, visibleEnd)) return;
 
                 pendingView = {
                     visible_start_hz: visibleStart,
@@ -3039,7 +3261,9 @@
             function setRateLimitValue(value) {
                 const sel = document.getElementById("rateLimit");
                 const selectedText = String(value || 20);
-                if ([...sel.options].some((opt) => opt.value === selectedText)) {
+                if (
+                    [...sel.options].some((opt) => opt.value === selectedText)
+                ) {
                     sel.value = selectedText;
                 } else {
                     sel.value = "20";
@@ -3049,7 +3273,9 @@
             function setMinRateValue(value) {
                 const sel = document.getElementById("minRate");
                 const selectedText = String(value || 0);
-                if ([...sel.options].some((opt) => opt.value === selectedText)) {
+                if (
+                    [...sel.options].some((opt) => opt.value === selectedText)
+                ) {
                     sel.value = selectedText;
                 } else {
                     sel.value = "0";
@@ -3057,7 +3283,8 @@
             }
 
             function setClockSourceValue(value) {
-                document.getElementById("clockIn").checked = Number(value) !== 0;
+                document.getElementById("clockIn").checked =
+                    Number(value) !== 0;
             }
 
             function updateScanInfo(plan) {
@@ -3071,9 +3298,7 @@
                           ? Number(plan.b)
                           : 0;
                 el.textContent =
-                    mode === "scan" && steps >= 2
-                        ? steps + " steps"
-                        : "Fixed";
+                    mode === "scan" && steps >= 2 ? steps + " steps" : "Fixed";
             }
 
             function updateTrafficInfo(plan) {
@@ -3102,7 +3327,8 @@
                         ? Number(plan.decim_factor)
                         : 1;
                 if (!fft) return;
-                fftInfo.textContent = decim > 1 ? fft + " x" + decim : String(fft);
+                fftInfo.textContent =
+                    decim > 1 ? fft + " x" + decim : String(fft);
                 updateScanInfo(plan);
                 updateTrafficInfo(plan);
             }
@@ -3218,16 +3444,22 @@
                 const request = {
                     freq_start: direct
                         ? 0
-                        : parseFloat(document.getElementById("freqStart").value),
+                        : parseFloat(
+                              document.getElementById("freqStart").value,
+                          ),
                     freq_end: direct
                         ? directMaxHz / 1e6
                         : parseFloat(document.getElementById("freqEnd").value),
                     converter_freq: direct
                         ? 0
-                        : parseFloat(document.getElementById("converterFreq").value),
+                        : parseFloat(
+                              document.getElementById("converterFreq").value,
+                          ),
                     samplerate: direct
                         ? 50000000
-                        : parseFloat(document.getElementById("samplerate").value),
+                        : parseFloat(
+                              document.getElementById("samplerate").value,
+                          ),
                     bw_ratio: direct
                         ? 1.0
                         : parseFloat(document.getElementById("bwRatio").value),
@@ -3249,10 +3481,7 @@
                     ),
                     display_bins: displayBins(),
                 };
-                if (
-                    options.preserveView &&
-                    hasFrequencyWindow()
-                ) {
+                if (options.preserveView && hasFrequencyWindow()) {
                     request.visible_start_hz = currentFreq0;
                     request.visible_end_hz = currentFreq1;
                 }
@@ -3513,8 +3742,14 @@
                     currentFreq1 =
                         status.visible_end_hz || status.freq_end || 0;
                     const savedView =
-                        loadHashViewForConfig(configuredFreq0, configuredFreq1) ||
-                        loadSavedViewForConfig(configuredFreq0, configuredFreq1);
+                        loadHashViewForConfig(
+                            configuredFreq0,
+                            configuredFreq1,
+                        ) ||
+                        loadSavedViewForConfig(
+                            configuredFreq0,
+                            configuredFreq1,
+                        );
                     if (savedView) {
                         currentFreq0 = savedView.left;
                         currentFreq1 = savedView.right;
@@ -3615,7 +3850,10 @@
                     scheduleViewUpdate(
                         currentFreq0,
                         currentFreq1,
-                        !!loadSavedViewForConfig(configuredFreq0, configuredFreq1),
+                        !!loadSavedViewForConfig(
+                            configuredFreq0,
+                            configuredFreq1,
+                        ),
                     );
                     connectSSE();
                 } else {

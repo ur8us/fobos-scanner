@@ -1,4 +1,4 @@
-# Fobos SDR Scanner with a million time zoom
+# Fobos SDR Scanner with a million times zoom
 
 Browser-based spectrum and waterfall scanner for RigExpert Fobos SDR using the agile Fobos SDR API, where you can zoom in a million times.
 
@@ -21,6 +21,7 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Minimum line-rate control for decimated single-stream zoom using FFT-window overlap
 - Editable `bands.ini` spectrum overlays for QO-100 NB/WB transponder ranges
 - Browser status heartbeat that shows `disconnected`, `idle`, or `scanning`
+- Hardened flat-JSON control parser, explicit bad-request responses, validated marker saves, and throttled frontend view persistence
 
 ## Operation
 
@@ -53,6 +54,10 @@ bands.ini
 
 The file is human editable. Use one section per band with `name`, `start_mhz`, and `end_mhz`.
 
+The backend persists the configured scan range and the current visible range in `fobos-scanner.conf`. Pressing Start from the UI intentionally resets the visible range to the full configured band unless the UI sends a preserved view.
+
+Control endpoints accept flat JSON objects. Malformed JSON, invalid numeric fields, unsupported methods, oversized bodies, and invalid marker files return JSON error responses instead of being silently ignored.
+
 ## Browser Traffic
 
 The browser uses ordinary HTTP for the page, settings, and status, plus one long-lived Server-Sent Events stream for live spectrum/waterfall data.
@@ -61,13 +66,14 @@ Frontend to backend:
 
 - `GET /`, `GET /bands.ini`, and `GET /markers.ini` load static UI data.
 - `GET /api/status` is the heartbeat and parameter snapshot. The frontend polls it every `2` seconds.
-- `POST /api/start`, `/api/view`, `/api/fft`, `/api/gain`, `/api/rate-limit`, `/api/min-rate`, `/api/stop`, and marker save endpoints send control changes.
+- `POST /api/start`, `/api/view`, `/api/fft`, `/api/gain`, `/api/rate`, `/api/min-rate`, `/api/stop`, and marker save endpoints send control changes.
 - `GET /api/waterfall` opens the SSE stream. After this request, the backend pushes live lines to the browser.
 
 Backend to frontend:
 
 - `/api/status` returns JSON with scan state, displayed frequency range, FFT/decimation settings, line-rate settings, and `traffic_kbytes_s`.
 - `/api/waterfall` sends one SSE `line` event per displayed waterfall row. The same row is also used by the frontend as the latest spectrum trace.
+- The frontend validates incoming SSE rows before rendering. Rows with malformed data or a stale `display_bins` width are ignored and trigger a debounced view/bin update.
 - Each `line` event contains metadata plus `d`, an array of `display_bins` unsigned 8-bit magnitudes written as decimal JSON numbers:
 
 ```text
@@ -160,6 +166,14 @@ From the `fobos-scanner` directory:
 make
 ```
 
+The Makefile defaults to the sibling agile-library layout above. Override these paths when needed:
+
+```sh
+make FOBOS_SRC=/path/to/libfobos-sdr-agile \
+     FOBOS_BUILD=/path/to/libfobos-sdr-agile/build-local \
+     FOBOS_LOCAL=/path/to/local-agile
+```
+
 This produces:
 
 ```text
@@ -178,7 +192,7 @@ make clean
 Use the included wrapper so the local Fobos SDR libraries are on `LD_LIBRARY_PATH`:
 
 ```sh
-./run.sh
+./run-scanner.sh
 ```
 
 Or use the Makefile target:
@@ -191,6 +205,12 @@ Then open:
 
 ```text
 http://localhost:8080
+```
+
+The run wrappers also accept path overrides:
+
+```sh
+FOBOS_BUILD=/path/to/build-local FOBOS_LOCAL=/path/to/local-agile ./run-scanner.sh
 ```
 
 ## Stream Integrity Test
@@ -210,6 +230,22 @@ Or use the Makefile wrapper:
 ```sh
 make stream-test
 ```
+
+## Checks
+
+Build with the default warning set:
+
+```sh
+make check
+```
+
+With the backend running, run HTTP/API smoke checks:
+
+```sh
+tools/http_smoke_test.sh
+```
+
+The smoke test covers the index page, `/api/status`, bad JSON field handling, invalid visible ranges, and 404 behavior.
 
 Example custom run:
 

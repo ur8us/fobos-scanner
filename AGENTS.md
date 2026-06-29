@@ -7,10 +7,11 @@
 - `main.c` starts an HTTP server on port `8080`, serves `index.html`, exposes JSON API endpoints, and streams scan lines to the browser over Server-Sent Events.
 - `index.html` owns the frontend controls, spectrum canvas, waterfall canvas, hover readout, and scan parameter requests.
 - `Makefile` builds `fobos-scanner` and the standalone `fobos-stream-test` utility against the agile Fobos SDR library and `libusb`.
-- `run.sh` starts the binary with the local agile library paths in `LD_LIBRARY_PATH`.
+- `run-scanner.sh` starts the binary with the local agile library paths in `LD_LIBRARY_PATH`.
 - `fobos-scanner.conf` is a local runtime config file and should stay untracked.
 - `scanner-deepseek` is reference material and should stay untracked.
 - `bands.ini` is a tracked, human-editable band overlay file served to the frontend.
+- `markers.ini` is a tracked, human-editable marker file; `/api/markers/save` must validate syntax and use atomic replacement.
 - `tasks.md`, `PLAN.MD`, and `suggestions.md` are local planning/report files and should stay untracked.
 
 ## Stream Test Utility
@@ -44,11 +45,17 @@ The backend should not auto-start a scan immediately after the server banner. Th
 
 `/api/fft` is for FFT-size changes only. It must not call `start_scan()`, must not call `fobos_sdr_start_scan()`, and must not reset frontend zoom, waterfall history, or brightness settings. The scan worker notices `g_fft_generation`, swaps FFT buffers, drops the partial mixed-size row, and continues processing the current hardware scan.
 
+The backend HTTP layer intentionally uses a small flat-JSON parser for control endpoints. Keep parsing centralized: do not reintroduce repeated endpoint-local `strstr()` plus `sscanf()` scans. Bad JSON, invalid numeric fields, oversized bodies, unsupported methods, and invalid marker files should return explicit JSON error responses.
+
+`fobos-scanner.conf` persists both configured scan range and visible range. Do not reset the visible range while clamping hardware scan limits unless the current visible range is outside the valid configured bounds.
+
 ## Backend/Frontend Traffic
 
 Live display data flows over `GET /api/waterfall` as Server-Sent Events. Each event is named `line` and contains JSON metadata plus a `d` array of `display_bins` unsigned 8-bit magnitudes encoded as decimal JSON numbers. The frontend uses that row for both the latest spectrum trace and one waterfall row.
 
 The backend must reduce processed FFT/source bins to exactly `display_bins` values before sending. Do not send all FFT bins unless the frontend protocol and traffic budget are deliberately redesigned.
+
+`publish_scan_line()` must size its SSE JSON buffer from the actual metadata length plus worst-case row data. Avoid fixed optimistic constants for line payload allocation.
 
 The `traffic_kbytes_s` value reported by `/api/status` is measured from actual bytes successfully written by `sse_broadcast()` over the recent traffic window. It is aggregate SSE payload traffic across connected clients. It does not include most `/api/status` polling, control POSTs, static files, or browser/TCP/IP framing overhead.
 
@@ -98,6 +105,8 @@ The frontend uses peak-per-pixel reduction when more FFT bins exist than canvas 
 - The scan label shows `from - to (bandwidth) MHz`.
 - Waterfall min/max sliders currently allow values up to `400`.
 - `/api/status` is polled as a heartbeat. If the backend is unreachable, the UI must show `disconnected`, not stale `scanning`.
+- SSE line events must be validated before rendering. Ignore malformed rows and stale-width rows; schedule a debounced `/api/view` update when `display_bins` differs.
+- Visible-view persistence in localStorage must be throttled. Do not write once per waterfall row.
 - `bands.ini` is loaded by the frontend from `/bands.ini`; keep its syntax simple key/value sections with `name`, `start_mhz`, and `end_mhz`.
 
 ## Build
@@ -117,10 +126,12 @@ Build from this directory:
 make
 ```
 
+The Makefile supports overriding `FOBOS_SRC`, `FOBOS_BUILD`, and `FOBOS_LOCAL`. Keep these variables working when changing include or library paths.
+
 Run with local library paths:
 
 ```sh
-./run.sh
+./run-scanner.sh
 ```
 
 Equivalent direct command:
@@ -134,6 +145,14 @@ Run the stream integrity tester:
 ```sh
 ./run-stream-test.sh
 ```
+
+Run compile checks:
+
+```sh
+make check
+```
+
+With the backend running, use `tools/http_smoke_test.sh` for parser/error-path smoke checks.
 
 Open the UI at:
 

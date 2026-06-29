@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <math.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -362,6 +363,8 @@ static void force_direct_sampling_defaults(int reset_visible)
 /* ------------------------------------------------------------------ */
 #define CONFIG_FILE "fobos-scanner.conf"
 
+static void clamp_visible_to_config(void);
+
 static void save_config(void)
 {
     FILE *f = fopen(CONFIG_FILE, "w");
@@ -371,6 +374,8 @@ static void save_config(void)
     fprintf(f, "converter_freq = %.0f\n", g_converter_freq);
     fprintf(f, "samplerate = %.0f\n", g_samplerate);
     fprintf(f, "bw_ratio = %g\n", g_bw_ratio);
+    fprintf(f, "visible_start = %.0f\n", g_visible_start);
+    fprintf(f, "visible_end = %.0f\n", g_visible_end);
     fprintf(f, "lna_gain = %u\n", g_lna_gain);
     fprintf(f, "vga_gain = %u\n", g_vga_gain);
     fprintf(f, "direct_sampling = %u\n", g_direct_sampling);
@@ -384,6 +389,8 @@ static void save_config(void)
 static void load_config(void)
 {
     FILE *f = fopen(CONFIG_FILE, "r");
+    int have_visible_start = 0;
+    int have_visible_end = 0;
     if (!f) return;
     char key[64];
     double val;
@@ -394,6 +401,8 @@ static void load_config(void)
         else if (strcmp(key, "converter_freq") == 0)   g_converter_freq = val;
         else if (strcmp(key, "samplerate") == 0)       g_samplerate = val;
         else if (strcmp(key, "bw_ratio") == 0)         g_bw_ratio = val;
+        else if (strcmp(key, "visible_start") == 0)   { g_visible_start = val; have_visible_start = 1; }
+        else if (strcmp(key, "visible_end") == 0)     { g_visible_end = val; have_visible_end = 1; }
         else if (strcmp(key, "lna_gain") == 0)        { uval = (unsigned int)val; g_lna_gain = uval; }
         else if (strcmp(key, "vga_gain") == 0)        { uval = (unsigned int)val; g_vga_gain = uval; }
         else if (strcmp(key, "direct_sampling") == 0) { uval = (unsigned int)val; g_direct_sampling = normalize_direct_sampling(uval); }
@@ -403,30 +412,102 @@ static void load_config(void)
         else if (strcmp(key, "rate_limit_lps") == 0) { uval = (unsigned int)val; g_rate_limit_lps = normalize_rate_limit_lps(uval); }
     }
     fclose(f);
-    g_visible_start = g_freq_start;
-    g_visible_end = g_freq_end;
+    if (!have_visible_start || !have_visible_end) {
+        g_visible_start = g_freq_start;
+        g_visible_end = g_freq_end;
+    }
     if (direct_sampling_enabled())
-        force_direct_sampling_defaults(1);
+        force_direct_sampling_defaults(!have_visible_start || !have_visible_end);
+    else
+        clamp_visible_to_config();
     printf("[SDR] Loaded config from %s\n", CONFIG_FILE);
 }
 
 /* ------------------------------------------------------------------ */
 /* File reader                                                        */
 /* ------------------------------------------------------------------ */
+typedef enum {
+    FILE_READ_OK = 0,
+    FILE_READ_MISSING,
+    FILE_READ_EMPTY,
+    FILE_READ_IO,
+    FILE_READ_MEMORY
+} file_read_status_t;
+
+static const char *file_read_status_text(file_read_status_t status)
+{
+    switch (status) {
+    case FILE_READ_OK: return "ok";
+    case FILE_READ_MISSING: return "missing";
+    case FILE_READ_EMPTY: return "empty";
+    case FILE_READ_IO: return "io_error";
+    case FILE_READ_MEMORY: return "out_of_memory";
+    }
+    return "unknown";
+}
+
+static file_read_status_t read_file_ex(const char *path, char **out_buf, size_t *out_len)
+{
+    FILE *f;
+    long len;
+    size_t got;
+    char *buf;
+
+    if (out_buf)
+        *out_buf = NULL;
+    if (out_len)
+        *out_len = 0;
+
+    f = fopen(path, "rb");
+    if (!f)
+        return errno == ENOENT ? FILE_READ_MISSING : FILE_READ_IO;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return FILE_READ_IO;
+    }
+    len = ftell(f);
+    if (len < 0) {
+        fclose(f);
+        return FILE_READ_IO;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return FILE_READ_IO;
+    }
+    if (len == 0) {
+        fclose(f);
+        return FILE_READ_EMPTY;
+    }
+
+    buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(f);
+        return FILE_READ_MEMORY;
+    }
+    got = fread(buf, 1, (size_t)len, f);
+    if (got != (size_t)len && ferror(f)) {
+        free(buf);
+        fclose(f);
+        return FILE_READ_IO;
+    }
+    buf[got] = 0;
+    fclose(f);
+
+    if (out_buf)
+        *out_buf = buf;
+    else
+        free(buf);
+    if (out_len)
+        *out_len = got;
+    return FILE_READ_OK;
+}
+
 static char *read_file(const char *path, size_t *out_len)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (len <= 0) { fclose(f); return NULL; }
-    char *buf = (char *)malloc((size_t)len + 1);
-    if (!buf) { fclose(f); return NULL; }
-    buf[fread(buf, 1, (size_t)len, f)] = 0;
-    fclose(f);
-    if (out_len) *out_len = (size_t)len;
-    return buf;
+    char *buf = NULL;
+    file_read_status_t status = read_file_ex(path, &buf, out_len);
+    return status == FILE_READ_OK ? buf : NULL;
 }
 
 static void send_json_response(int client_fd, int code, const char *reason,
@@ -549,6 +630,165 @@ static int load_markers(marker_t *markers, int max_markers,
     return count;
 }
 
+static int marker_text_is_safe(const char *value)
+{
+    const unsigned char *p = (const unsigned char *)value;
+    while (*p) {
+        if (*p < 0x20 && *p != '\t')
+            return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int validate_markers_text(const char *body, size_t body_len,
+                                 char *err, size_t err_len)
+{
+    char *copy;
+    char *line;
+    char *saveptr = NULL;
+    int in_section = 0;
+    int have_name = 0;
+    int have_freq = 0;
+    int marker_count = 0;
+
+    if (body_len > MAX_REQUEST) {
+        snprintf(err, err_len, "markers.ini payload is too large");
+        return -1;
+    }
+    copy = (char *)malloc(body_len + 1);
+    if (!copy) {
+        snprintf(err, err_len, "out of memory validating markers");
+        return -1;
+    }
+    memcpy(copy, body, body_len);
+    copy[body_len] = 0;
+
+    for (line = strtok_r(copy, "\n", &saveptr);
+         line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        char *trimmed = trim_ws(line);
+        char *eq;
+
+        if (!*trimmed || *trimmed == '#' || *trimmed == ';')
+            continue;
+
+        if (trimmed[0] == '[') {
+            size_t len = strlen(trimmed);
+            if (len < 3 || trimmed[len - 1] != ']') {
+                snprintf(err, err_len, "invalid marker section header");
+                free(copy);
+                return -1;
+            }
+            if (in_section && (!have_name || !have_freq)) {
+                snprintf(err, err_len, "marker section missing name or frequency");
+                free(copy);
+                return -1;
+            }
+            marker_count++;
+            if (marker_count > MAX_MARKERS) {
+                snprintf(err, err_len, "too many markers");
+                free(copy);
+                return -1;
+            }
+            in_section = 1;
+            have_name = 0;
+            have_freq = 0;
+            continue;
+        }
+
+        if (!in_section) {
+            snprintf(err, err_len, "marker key outside section");
+            free(copy);
+            return -1;
+        }
+
+        eq = strchr(trimmed, '=');
+        if (!eq) {
+            snprintf(err, err_len, "marker line is missing '='");
+            free(copy);
+            return -1;
+        }
+        *eq = 0;
+        {
+            char *key = trim_ws(trimmed);
+            char *value = trim_ws(eq + 1);
+            char *after = NULL;
+            double freq;
+
+            if (!marker_text_is_safe(value)) {
+                snprintf(err, err_len, "marker value contains control characters");
+                free(copy);
+                return -1;
+            }
+
+            if (strcmp(key, "name") == 0) {
+                if (!*value || strlen(value) >= MARKER_NAME_MAX) {
+                    snprintf(err, err_len, "marker name is invalid");
+                    free(copy);
+                    return -1;
+                }
+                have_name = 1;
+            } else if (strcmp(key, "group") == 0) {
+                if (strlen(value) >= MARKER_NAME_MAX) {
+                    snprintf(err, err_len, "marker group is too long");
+                    free(copy);
+                    return -1;
+                }
+            } else if (strcmp(key, "frequency_hz") == 0 ||
+                       strcmp(key, "frequency_mhz") == 0) {
+                errno = 0;
+                freq = strtod(value, &after);
+                if (errno != 0 || after == value || *trim_ws(after) != 0 ||
+                    !isfinite(freq) || freq <= 0.0) {
+                    snprintf(err, err_len, "marker frequency is invalid");
+                    free(copy);
+                    return -1;
+                }
+                have_freq = 1;
+            } else {
+                snprintf(err, err_len, "unsupported marker key '%s'", key);
+                free(copy);
+                return -1;
+            }
+        }
+    }
+
+    if (in_section && (!have_name || !have_freq)) {
+        snprintf(err, err_len, "marker section missing name or frequency");
+        free(copy);
+        return -1;
+    }
+
+    free(copy);
+    return 0;
+}
+
+static int write_file_atomic(const char *path, const char *body, size_t body_len)
+{
+    char tmp_path[MAX_PATH];
+    FILE *f;
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    f = fopen(tmp_path, "wb");
+    if (!f)
+        return -1;
+    if (body_len > 0 && fwrite(body, 1, body_len, f) != body_len) {
+        fclose(f);
+        unlink(tmp_path);
+        return -1;
+    }
+    if (fclose(f) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+    if (rename(tmp_path, path) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+    return 0;
+}
+
 static int append_json_escaped(char *dst, size_t dst_size, int pos, const char *src)
 {
     const unsigned char *s = (const unsigned char *)(src ? src : "");
@@ -646,18 +886,80 @@ static void chdir_to_executable_dir(const char *argv0)
         fprintf(stderr, "[SDR] chdir(%s) failed: %s\n", path, strerror(errno));
 }
 
+static int ascii_case_equal_n(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        if (tolower(ca) != tolower(cb))
+            return 0;
+    }
+    return 1;
+}
+
+static int http_content_length_n(const char *req, size_t len, int *out_len)
+{
+    const char *p = req;
+    const char *end = req + len;
+
+    if (out_len)
+        *out_len = 0;
+
+    while (p < end) {
+        const char *line_end = NULL;
+        const char *colon;
+        size_t line_len;
+
+        for (const char *q = p; q + 1 < end; q++) {
+            if (q[0] == '\r' && q[1] == '\n') {
+                line_end = q;
+                break;
+            }
+        }
+        if (!line_end)
+            return -1;
+        if (line_end == p)
+            return 0;
+
+        line_len = (size_t)(line_end - p);
+        colon = memchr(p, ':', line_len);
+        if (colon) {
+            size_t name_len = (size_t)(colon - p);
+            if (name_len == strlen("Content-Length") &&
+                ascii_case_equal_n(p, "Content-Length", name_len)) {
+                const char *v = colon + 1;
+                char *after = NULL;
+                long parsed;
+                while (v < line_end && isspace((unsigned char)*v))
+                    v++;
+                errno = 0;
+                parsed = strtol(v, &after, 10);
+                if (errno != 0 || after == v || parsed < 0 || parsed > MAX_REQUEST)
+                    return -1;
+                while (after < line_end && isspace((unsigned char)*after))
+                    after++;
+                if (after != line_end)
+                    return -1;
+                if (out_len)
+                    *out_len = (int)parsed;
+                return 0;
+            }
+        }
+        p = line_end + 2;
+    }
+
+    return -1;
+}
+
 static int http_content_length(const char *req)
 {
-    const char *headers[] = { "Content-Length:", "content-length:" };
-    for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
-        const char *p = strstr(req, headers[i]);
-        if (p) {
-            int len = 0;
-            if (sscanf(p + strlen(headers[i]), " %d", &len) == 1 && len > 0)
-                return len;
-        }
-    }
-    return 0;
+    const char *header_end = strstr(req, "\r\n\r\n");
+    int len = 0;
+    if (!header_end)
+        return 0;
+    if (http_content_length_n(req, (size_t)(header_end - req) + 4, &len) != 0)
+        return -1;
+    return len;
 }
 
 static void load_sample_rates(struct fobos_sdr_dev_t *dev)
@@ -990,8 +1292,7 @@ static void clamp_scan_end_to_hardware_limit(void)
     max_end = g_freq_start + (double)MAX_FREQS * step;
     if (g_freq_end > max_end)
         g_freq_end = max_end;
-    g_visible_start = g_freq_start;
-    g_visible_end = g_freq_end;
+    clamp_visible_to_config();
 }
 
 static int current_scan_plan(double *out_step, double *out_freq_end)
@@ -1845,6 +2146,16 @@ static void publish_scan_line(scan_ctx_t *ctx)
     uint8_t *line_packed;
     char *json;
     int pos;
+    int prefix_len;
+    size_t json_size;
+    const char *prefix_fmt =
+        "event: line\ndata: {\"view\":%u,\"n\":%d,\"b\":%d,"
+        "\"mode\":\"%s\","
+        "\"f0\":%.0f,\"f1\":%.0f,"
+        "\"full_f0\":%.0f,\"full_f1\":%.0f,"
+        "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
+        "\"display_bins\":%d,\"source_bins\":%d,\"effective_fft_size\":%d,"
+        "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,\"d\":[";
 
     if (source_bins <= 0 || display_bins <= 0 || source_span <= 0.0 || visible_span <= 0.0)
         return;
@@ -1872,20 +2183,26 @@ static void publish_scan_line(scan_ctx_t *ctx)
         line_packed[x] = magnitude_to_u8(peak);
     }
 
-    json = malloc((size_t)display_bins * 5 + 1024);
+    prefix_len = snprintf(NULL, 0, prefix_fmt,
+        ctx->view_id, ctx->line_num, ctx->total_steps,
+        ctx->single_mode ? "single" : "scan",
+        ctx->visible_start, ctx->visible_end,
+        ctx->configured_start, ctx->configured_end,
+        ctx->visible_start, ctx->visible_end,
+        display_bins, source_bins, ctx->fft_size,
+        ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor);
+    if (prefix_len < 0) {
+        free(line_packed);
+        return;
+    }
+    json_size = (size_t)prefix_len + (size_t)display_bins * 4 + 8;
+    json = malloc(json_size);
     if (!json) {
         free(line_packed);
         return;
     }
 
-    pos = snprintf(json, 1024,
-        "event: line\ndata: {\"view\":%u,\"n\":%d,\"b\":%d,"
-        "\"mode\":\"%s\","
-        "\"f0\":%.0f,\"f1\":%.0f,"
-        "\"full_f0\":%.0f,\"full_f1\":%.0f,"
-        "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
-        "\"display_bins\":%d,\"source_bins\":%d,\"effective_fft_size\":%d,"
-        "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,\"d\":[",
+    pos = snprintf(json, json_size, prefix_fmt,
         ctx->view_id, ctx->line_num, ctx->total_steps,
         ctx->single_mode ? "single" : "scan",
         ctx->visible_start, ctx->visible_end,
@@ -1895,9 +2212,10 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor);
 
     for (int i = 0; i < display_bins; i++)
-        pos += snprintf(json + pos, 5, "%s%d", (i ? "," : ""), line_packed[i]);
+        pos += snprintf(json + pos, json_size - (size_t)pos,
+                        "%s%d", (i ? "," : ""), line_packed[i]);
 
-    pos += snprintf(json + pos, 16, "]}\n\n");
+    pos += snprintf(json + pos, json_size - (size_t)pos, "]}\n\n");
     record_frontend_traffic(sse_broadcast(json, pos));
     free(line_packed);
     free(json);
@@ -2586,19 +2904,539 @@ static void send_json_response(int client_fd, int code, const char *reason,
     WRITE(client_fd, body, len);
 }
 
-static void handle_request(int client_fd, const char *req)
+static void send_empty_response(int client_fd, int code, const char *reason,
+                                const char *cors)
 {
-    char method[16], path[MAX_PATH];
-    if (sscanf(req, "%15s %1023s", method, path) < 2) { close(client_fd); return; }
-    url_decode(path);
-    char *qs = strchr(path, '?');
-    if (qs) *qs = 0;
+    char header[512];
+    int n = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "%s\r\n",
+        code, reason, cors ? cors : "");
+    WRITE(client_fd, header, (size_t)n);
+}
+
+static void send_text_response(int client_fd, int code, const char *reason,
+                               const char *cors, const char *content_type,
+                               const char *body, size_t len)
+{
+    char header[512];
+    int n = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "%s\r\n",
+        code, reason, content_type, len, cors ? cors : "");
+    WRITE(client_fd, header, (size_t)n);
+    if (body && len > 0)
+        WRITE(client_fd, body, len);
+}
+
+static void send_json_error(int client_fd, int code, const char *reason,
+                            const char *cors, const char *message)
+{
+    char escaped[512];
+    char body[768];
+    append_json_escaped(escaped, sizeof(escaped), 0, message ? message : "error");
+    snprintf(body, sizeof(body),
+             "{\"status\":\"error\",\"message\":\"%s\"}", escaped);
+    send_json_response(client_fd, code, reason, cors, body);
+}
+
+static void send_file_response(int client_fd, const char *cors, const char *path,
+                               const char *content_type, int missing_code,
+                               const char *missing_reason)
+{
+    char *body = NULL;
+    size_t len = 0;
+    file_read_status_t status = read_file_ex(path, &body, &len);
+
+    if (status == FILE_READ_OK) {
+        send_text_response(client_fd, 200, "OK", cors, content_type, body, len);
+        free(body);
+        return;
+    }
+    if (status == FILE_READ_EMPTY) {
+        send_text_response(client_fd, 200, "OK", cors, content_type, "", 0);
+        return;
+    }
+    if (status == FILE_READ_MISSING) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "%s is missing", path);
+        send_json_error(client_fd, missing_code, missing_reason, cors, msg);
+        return;
+    }
+    {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Could not read %s: %s",
+                 path, file_read_status_text(status));
+        send_json_error(client_fd, 500, "Internal Server Error", cors, msg);
+    }
+}
+
+typedef struct {
+    char method[16];
+    char path[MAX_PATH];
+    char version[16];
+    const char *body;
+    size_t body_len;
+} http_request_t;
+
+typedef struct {
+    const char *body;
+    size_t len;
+} json_doc_t;
+
+static const char *skip_ws_range(const char *p, const char *end)
+{
+    while (p < end && isspace((unsigned char)*p))
+        p++;
+    return p;
+}
+
+static int parse_http_request(const char *raw, size_t raw_len, int truncated,
+                              http_request_t *out, char *err, size_t err_len)
+{
+    const char *header_end;
+    const char *line_end;
+    const char *sp1;
+    const char *sp2;
+    int content_len = 0;
+    size_t header_len;
+    size_t method_len;
+    size_t path_len;
+    size_t version_len;
+
+    if (err && err_len)
+        err[0] = 0;
+    memset(out, 0, sizeof(*out));
+
+    header_end = strstr(raw, "\r\n\r\n");
+    if (!header_end) {
+        snprintf(err, err_len, "HTTP headers are incomplete");
+        return -1;
+    }
+    header_len = (size_t)(header_end - raw) + 4;
+    if (truncated) {
+        snprintf(err, err_len, "HTTP request exceeds %d bytes", MAX_REQUEST);
+        return -1;
+    }
+    if (http_content_length_n(raw, header_len, &content_len) != 0) {
+        snprintf(err, err_len, "Invalid Content-Length header");
+        return -1;
+    }
+    if (content_len < 0 || (size_t)content_len > MAX_REQUEST - header_len) {
+        snprintf(err, err_len, "Request body is too large");
+        return -1;
+    }
+    if (raw_len < header_len + (size_t)content_len) {
+        snprintf(err, err_len, "HTTP request body is incomplete");
+        return -1;
+    }
+
+    line_end = strstr(raw, "\r\n");
+    if (!line_end || line_end == raw) {
+        snprintf(err, err_len, "Invalid HTTP request line");
+        return -1;
+    }
+    sp1 = memchr(raw, ' ', (size_t)(line_end - raw));
+    if (!sp1) {
+        snprintf(err, err_len, "Invalid HTTP request line");
+        return -1;
+    }
+    sp2 = memchr(sp1 + 1, ' ', (size_t)(line_end - sp1 - 1));
+    if (!sp2) {
+        snprintf(err, err_len, "Invalid HTTP request line");
+        return -1;
+    }
+
+    method_len = (size_t)(sp1 - raw);
+    path_len = (size_t)(sp2 - sp1 - 1);
+    version_len = (size_t)(line_end - sp2 - 1);
+    if (method_len == 0 || method_len >= sizeof(out->method) ||
+        path_len == 0 || path_len >= sizeof(out->path) ||
+        version_len == 0 || version_len >= sizeof(out->version)) {
+        snprintf(err, err_len, "HTTP request line is too long");
+        return -1;
+    }
+
+    memcpy(out->method, raw, method_len);
+    out->method[method_len] = 0;
+    memcpy(out->path, sp1 + 1, path_len);
+    out->path[path_len] = 0;
+    memcpy(out->version, sp2 + 1, version_len);
+    out->version[version_len] = 0;
+    url_decode(out->path);
+    {
+        char *qs = strchr(out->path, '?');
+        if (qs)
+            *qs = 0;
+    }
+    out->body = raw + header_len;
+    out->body_len = (size_t)content_len;
+    return 0;
+}
+
+static int json_skip_string(const char **pp, const char *end)
+{
+    const char *p = *pp;
+    if (p >= end || *p != '"')
+        return -1;
+    p++;
+    while (p < end) {
+        unsigned char c = (unsigned char)*p++;
+        if (c == '"') {
+            *pp = p;
+            return 0;
+        }
+        if (c == '\\') {
+            if (p >= end)
+                return -1;
+            c = (unsigned char)*p++;
+            if (c == 'u') {
+                for (int i = 0; i < 4; i++) {
+                    if (p >= end || !isxdigit((unsigned char)*p))
+                        return -1;
+                    p++;
+                }
+            } else if (!(c == '"' || c == '\\' || c == '/' || c == 'b' ||
+                         c == 'f' || c == 'n' || c == 'r' || c == 't')) {
+                return -1;
+            }
+        } else if (c < 0x20) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+static int json_read_key(const char **pp, const char *end, char *key, size_t key_len)
+{
+    const char *p = *pp;
+    size_t pos = 0;
+    if (p >= end || *p != '"')
+        return -1;
+    p++;
+    while (p < end) {
+        unsigned char c = (unsigned char)*p++;
+        if (c == '"') {
+            key[pos] = 0;
+            *pp = p;
+            return 0;
+        }
+        if (c == '\\') {
+            if (p >= end)
+                return -1;
+            c = (unsigned char)*p++;
+            if (c == 'u') {
+                for (int i = 0; i < 4; i++) {
+                    if (p >= end || !isxdigit((unsigned char)*p))
+                        return -1;
+                    p++;
+                }
+                c = '?';
+            } else if (!(c == '"' || c == '\\' || c == '/' || c == 'b' ||
+                         c == 'f' || c == 'n' || c == 'r' || c == 't')) {
+                return -1;
+            }
+        } else if (c < 0x20) {
+            return -1;
+        }
+        if (pos + 1 < key_len)
+            key[pos++] = (char)c;
+    }
+    return -1;
+}
+
+static int json_skip_number(const char **pp, const char *end)
+{
+    const char *p = *pp;
+    if (p < end && *p == '-')
+        p++;
+    if (p >= end)
+        return -1;
+    if (*p == '0') {
+        p++;
+    } else if (isdigit((unsigned char)*p)) {
+        while (p < end && isdigit((unsigned char)*p))
+            p++;
+    } else {
+        return -1;
+    }
+    if (p < end && *p == '.') {
+        p++;
+        if (p >= end || !isdigit((unsigned char)*p))
+            return -1;
+        while (p < end && isdigit((unsigned char)*p))
+            p++;
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        if (p < end && (*p == '+' || *p == '-'))
+            p++;
+        if (p >= end || !isdigit((unsigned char)*p))
+            return -1;
+        while (p < end && isdigit((unsigned char)*p))
+            p++;
+    }
+    *pp = p;
+    return 0;
+}
+
+static int json_skip_literal(const char **pp, const char *end,
+                             const char *literal)
+{
+    size_t len = strlen(literal);
+    if ((size_t)(end - *pp) < len || memcmp(*pp, literal, len) != 0)
+        return -1;
+    *pp += len;
+    return 0;
+}
+
+static int json_skip_value(const char **pp, const char *end)
+{
+    const char *p = skip_ws_range(*pp, end);
+    if (p >= end)
+        return -1;
+    if (*p == '"') {
+        if (json_skip_string(&p, end) != 0)
+            return -1;
+    } else if (*p == '-' || isdigit((unsigned char)*p)) {
+        if (json_skip_number(&p, end) != 0)
+            return -1;
+    } else if (*p == 't') {
+        if (json_skip_literal(&p, end, "true") != 0)
+            return -1;
+    } else if (*p == 'f') {
+        if (json_skip_literal(&p, end, "false") != 0)
+            return -1;
+    } else if (*p == 'n') {
+        if (json_skip_literal(&p, end, "null") != 0)
+            return -1;
+    } else {
+        return -1;
+    }
+    *pp = p;
+    return 0;
+}
+
+static int json_find_value(const json_doc_t *doc, const char *wanted,
+                           const char **out_start, size_t *out_len)
+{
+    const char *p = doc->body;
+    const char *end = doc->body + doc->len;
+    int found = 0;
+
+    if (out_start)
+        *out_start = NULL;
+    if (out_len)
+        *out_len = 0;
+
+    p = skip_ws_range(p, end);
+    if (p >= end || *p != '{')
+        return -1;
+    p++;
+    p = skip_ws_range(p, end);
+    if (p < end && *p == '}') {
+        p++;
+        p = skip_ws_range(p, end);
+        return p == end ? 0 : -1;
+    }
+
+    for (;;) {
+        char key[96];
+        const char *value_start;
+        const char *value_end;
+
+        p = skip_ws_range(p, end);
+        if (json_read_key(&p, end, key, sizeof(key)) != 0)
+            return -1;
+        p = skip_ws_range(p, end);
+        if (p >= end || *p != ':')
+            return -1;
+        p++;
+        value_start = skip_ws_range(p, end);
+        p = value_start;
+        if (json_skip_value(&p, end) != 0)
+            return -1;
+        value_end = p;
+        if (strcmp(key, wanted) == 0) {
+            found = 1;
+            if (out_start)
+                *out_start = value_start;
+            if (out_len)
+                *out_len = (size_t)(value_end - value_start);
+        }
+        p = skip_ws_range(p, end);
+        if (p < end && *p == ',') {
+            p++;
+            continue;
+        }
+        if (p < end && *p == '}') {
+            p++;
+            p = skip_ws_range(p, end);
+            return p == end ? found : -1;
+        }
+        return -1;
+    }
+}
+
+static int json_get_double(const json_doc_t *doc, const char *key,
+                           double *out_value, int *out_present)
+{
+    const char *start;
+    size_t len;
+    char tmp[128];
+    char *after = NULL;
+    double value;
+    int status = json_find_value(doc, key, &start, &len);
+    if (out_present)
+        *out_present = 0;
+    if (status < 0)
+        return -1;
+    if (status == 0)
+        return 0;
+    if (len == 0 || len >= sizeof(tmp))
+        return -1;
+    memcpy(tmp, start, len);
+    tmp[len] = 0;
+    errno = 0;
+    value = strtod(tmp, &after);
+    if (errno != 0 || after == tmp || *after != 0 || !isfinite(value))
+        return -1;
+    if (out_value)
+        *out_value = value;
+    if (out_present)
+        *out_present = 1;
+    return 0;
+}
+
+static int json_get_uint(const json_doc_t *doc, const char *key,
+                         uint32_t *out_value, int *out_present)
+{
+    const char *start;
+    size_t len;
+    char tmp[64];
+    char *after = NULL;
+    unsigned long value;
+    int status = json_find_value(doc, key, &start, &len);
+    if (out_present)
+        *out_present = 0;
+    if (status < 0)
+        return -1;
+    if (status == 0)
+        return 0;
+    if (len == 0 || len >= sizeof(tmp))
+        return -1;
+    memcpy(tmp, start, len);
+    tmp[len] = 0;
+    if (tmp[0] == '-')
+        return -1;
+    errno = 0;
+    value = strtoul(tmp, &after, 10);
+    if (errno != 0 || after == tmp || *after != 0 || value > UINT32_MAX)
+        return -1;
+    if (out_value)
+        *out_value = (uint32_t)value;
+    if (out_present)
+        *out_present = 1;
+    return 0;
+}
+
+static int json_validate_object(const json_doc_t *doc)
+{
+    return json_find_value(doc, "", NULL, NULL) >= 0 ? 0 : -1;
+}
+
+static int validate_scan_settings(double freq_start, double freq_end,
+                                  double converter_freq, double samplerate,
+                                  double bw_ratio, uint32_t lna_gain,
+                                  uint32_t vga_gain, uint32_t direct_sampling,
+                                  uint32_t clk_source, char *err, size_t err_len)
+{
+    if (direct_sampling > 2) {
+        snprintf(err, err_len, "direct_sampling must be 0, 1, or 2");
+        return -1;
+    }
+    if (clk_source > 1) {
+        snprintf(err, err_len, "clock source must be internal or external");
+        return -1;
+    }
+    if (lna_gain > 2) {
+        snprintf(err, err_len, "lna_gain must be 0..2");
+        return -1;
+    }
+    if (vga_gain > 15) {
+        snprintf(err, err_len, "vga_gain must be 0..15");
+        return -1;
+    }
+    if (!isfinite(samplerate) || samplerate < 1.0 || samplerate > 500.0e6) {
+        snprintf(err, err_len, "samplerate is out of range");
+        return -1;
+    }
+    if (!isfinite(bw_ratio) || bw_ratio <= 0.0 || bw_ratio > 1.0) {
+        snprintf(err, err_len, "bw_ratio must be greater than 0 and at most 1");
+        return -1;
+    }
+    if (!isfinite(converter_freq) || fabs(converter_freq) > 1.0e12) {
+        snprintf(err, err_len, "converter frequency is out of range");
+        return -1;
+    }
+    if (!direct_sampling &&
+        (!isfinite(freq_start) || !isfinite(freq_end) ||
+         freq_start < MIN_FREQ_START_HZ || freq_end <= freq_start)) {
+        snprintf(err, err_len, "frequency range is invalid");
+        return -1;
+    }
+    return 0;
+}
+
+static int validate_visible_range(double start, double end,
+                                  char *err, size_t err_len)
+{
+    if (!isfinite(start) || !isfinite(end) || end <= start) {
+        snprintf(err, err_len, "visible frequency range is invalid");
+        return -1;
+    }
+    return 0;
+}
+
+static int json_body_for_request(const http_request_t *http, json_doc_t *doc,
+                                 char *err, size_t err_len)
+{
+    doc->body = http->body;
+    doc->len = http->body_len;
+    if (doc->len == 0) {
+        snprintf(err, err_len, "Missing JSON body");
+        return -1;
+    }
+    if (json_validate_object(doc) != 0) {
+        snprintf(err, err_len, "Malformed JSON body");
+        return -1;
+    }
+    return 0;
+}
+
+static void handle_request(int client_fd, const char *req, size_t req_len,
+                           int truncated)
+{
+    http_request_t http;
+    char parse_error[160];
 
     const char *cors = "Access-Control-Allow-Origin: *\r\n"
                        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                        "Access-Control-Allow-Headers: Content-Type\r\n";
 
-    if (strcmp(method, "OPTIONS") == 0) {
+    if (parse_http_request(req, req_len, truncated, &http,
+                           parse_error, sizeof(parse_error)) != 0) {
+        send_json_error(client_fd, 400, "Bad Request", cors, parse_error);
+        close(client_fd);
+        return;
+    }
+
+    if (strcmp(http.method, "OPTIONS") == 0) {
         char resp[512];
         int n = snprintf(resp, sizeof(resp),
             "HTTP/1.1 204 No Content\r\n%s\r\n", cors);
@@ -2608,108 +3446,84 @@ static void handle_request(int client_fd, const char *req)
     }
 
     /* GET / or /index.html */
-    if (strcmp(method, "GET") == 0 && (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0)) {
-        size_t len;
-        char *html = read_file(HTML_PATH, &len);
-        if (!html) {
-            const char *err = "HTTP/1.1 500\r\nContent-Length: 0\r\n\r\n";
-            WRITE(client_fd, err, strlen(err));
-            close(client_fd);
-            return;
-        }
-        char resp[512];
-        int n = snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html; charset=utf-8\r\n"
-            "Content-Length: %zu\r\n%s\r\n", len, cors);
-        WRITE(client_fd, resp, (size_t)n);
-        WRITE(client_fd, html, len);
-        free(html);
+    if (strcmp(http.method, "GET") == 0 && (strcmp(http.path, "/") == 0 || strcmp(http.path, "/index.html") == 0)) {
+        send_file_response(client_fd, cors, HTML_PATH,
+                           "text/html; charset=utf-8",
+                           500, "Internal Server Error");
         close(client_fd);
         return;
     }
 
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/bands.ini") == 0) {
-        size_t len;
-        char *text = read_file(BANDS_PATH, &len);
-        if (!text) {
-            const char *err = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-            WRITE(client_fd, err, strlen(err));
-            close(client_fd);
-            return;
-        }
-        char resp[512];
-        int n = snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain; charset=utf-8\r\n"
-            "Content-Length: %zu\r\n%s\r\n", len, cors);
-        WRITE(client_fd, resp, (size_t)n);
-        WRITE(client_fd, text, len);
-        free(text);
+    if (strcmp(http.method, "GET") == 0 && strcmp(http.path, "/bands.ini") == 0) {
+        send_file_response(client_fd, cors, BANDS_PATH,
+                           "text/plain; charset=utf-8",
+                           404, "Not Found");
         close(client_fd);
         return;
     }
 
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/markers.ini") == 0) {
+    if (strcmp(http.method, "GET") == 0 && strcmp(http.path, "/markers.ini") == 0) {
         size_t len;
-        char *text = read_file(MARKERS_PATH, &len);
-        if (!text) {
+        char *text = NULL;
+        file_read_status_t status = read_file_ex(MARKERS_PATH, &text, &len);
+        if (status == FILE_READ_MISSING) {
             const char *empty =
                 "# Human-editable frequency markers\n"
                 "# Each marker section supports name, group, frequency_hz or frequency_mhz.\n";
-            char resp[512];
-            int n = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/plain; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n%s\r\n",
-                strlen(empty), cors);
-            WRITE(client_fd, resp, (size_t)n);
-            WRITE(client_fd, empty, strlen(empty));
+            send_text_response(client_fd, 200, "OK", cors,
+                               "text/plain; charset=utf-8",
+                               empty, strlen(empty));
             close(client_fd);
             return;
         }
-        char resp[512];
-        int n = snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain; charset=utf-8\r\n"
-            "Content-Length: %zu\r\n%s\r\n", len, cors);
-        WRITE(client_fd, resp, (size_t)n);
-        WRITE(client_fd, text, len);
+        if (status == FILE_READ_EMPTY) {
+            send_text_response(client_fd, 200, "OK", cors,
+                               "text/plain; charset=utf-8", "", 0);
+            close(client_fd);
+            return;
+        }
+        if (status != FILE_READ_OK) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Could not read %s: %s",
+                     MARKERS_PATH, file_read_status_text(status));
+            send_json_error(client_fd, 500, "Internal Server Error", cors, msg);
+            close(client_fd);
+            return;
+        }
+        send_text_response(client_fd, 200, "OK", cors,
+                           "text/plain; charset=utf-8", text, len);
         free(text);
         close(client_fd);
         return;
     }
 
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/markers") == 0) {
+    if (strcmp(http.method, "GET") == 0 && strcmp(http.path, "/api/markers") == 0) {
         send_markers_json(client_fd, cors);
         close(client_fd);
         return;
     }
 
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/markers/save") == 0) {
-        const char *body = strstr(req, "\r\n\r\n");
-        int content_len = http_content_length(req);
-        FILE *f;
-        if (!body) { close(client_fd); return; }
-        body += 4;
-        if (content_len <= 0)
-            content_len = (int)strlen(body);
-        f = fopen(MARKERS_PATH, "wb");
-        if (!f) {
-            send_json_response(client_fd, 500, "Internal Server Error", cors,
-                               "{\"status\":\"error\"}");
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/markers/save") == 0) {
+        char err[160];
+        if (validate_markers_text(http.body, http.body_len,
+                                  err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
             close(client_fd);
             return;
         }
-        fwrite(body, 1, (size_t)content_len, f);
-        fclose(f);
+        if (write_file_atomic(MARKERS_PATH, http.body, http.body_len) != 0) {
+            send_json_response(client_fd, 500, "Internal Server Error", cors,
+                               "{\"status\":\"error\",\"message\":\"could not save markers\"}");
+            close(client_fd);
+            return;
+        }
         send_json_response(client_fd, 200, "OK", cors, "{\"status\":\"ok\"}");
         close(client_fd);
         return;
     }
 
     /* GET /api/status */
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
+    if (strcmp(http.method, "GET") == 0 && strcmp(http.path, "/api/status") == 0) {
         char body[4096];
         char sample_rates[1024];
         double step = 0.0;
@@ -2811,7 +3625,7 @@ static void handle_request(int client_fd, const char *req)
     }
 
     /* GET /api/waterfall (SSE) */
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/waterfall") == 0) {
+    if (strcmp(http.method, "GET") == 0 && strcmp(http.path, "/api/waterfall") == 0) {
         char resp[512];
         int n = snprintf(resp, sizeof(resp),
             "HTTP/1.1 200 OK\r\n"
@@ -2824,77 +3638,107 @@ static void handle_request(int client_fd, const char *req)
     }
 
     /* POST /api/start */
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/start") == 0) {
-        uint32_t fft_tmp = 0;
-        uint32_t display_tmp = 0;
-        uint32_t min_rate_tmp = 0;
-        uint32_t rate_tmp = 0;
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/start") == 0) {
+        json_doc_t json;
+        char err[160];
+        double freq_start_tmp = g_freq_start;
+        double freq_end_tmp = g_freq_end;
+        double converter_tmp = g_converter_freq;
+        double samplerate_tmp = g_samplerate;
+        double bw_ratio_tmp = g_bw_ratio;
         double visible_start_tmp = 0.0;
         double visible_end_tmp = 0.0;
+        uint32_t lna_tmp = g_lna_gain;
+        uint32_t vga_tmp = g_vga_gain;
+        uint32_t direct_tmp = g_direct_sampling;
+        uint32_t clk_tmp = g_clk_source;
+        uint32_t fft_tmp = (uint32_t)current_fft_size();
+        uint32_t display_tmp = (uint32_t)current_display_bins();
+        uint32_t min_rate_tmp = g_min_rate_lps;
+        uint32_t rate_tmp = g_rate_limit_lps;
+        double number_tmp;
+        uint32_t uint_tmp;
+        int present = 0;
         int have_visible_start = 0;
         int have_visible_end = 0;
-        const char *body = strstr(req, "\r\n\r\n");
-        if (!body) { close(client_fd); return; }
-        body += 4;
 
-        #define GET_DOUBLE(key, target, scale, minval) do { \
-            const char *k = strstr(body, key); \
-            if (k) { \
-                k = strchr(k, ':'); \
-                if (k) { \
-                    double v; \
-                    if (sscanf(k+1, " %lf", &v) == 1 && v >= (minval)) \
-                        (target) = v * (scale); \
-                } \
-            } \
-        } while(0)
-        #define GET_UINT(key, target) do { \
-            const char *k = strstr(body, key); \
-            if (k) { \
-                k = strchr(k, ':'); \
-                if (k) { \
-                    unsigned int v; \
-                    if (sscanf(k+1, " %u", &v) == 1) \
-                        (target) = (uint32_t)v; \
-                } \
-            } \
-        } while(0)
-        #define GET_DOUBLE_RAW_OPT(key, target, flag) do { \
-            const char *k = strstr(body, key); \
-            if (k) { \
-                k = strchr(k, ':'); \
-                if (k) { \
-                    double v; \
-                    if (sscanf(k+1, " %lf", &v) == 1) { \
-                        (target) = v; \
-                        (flag) = 1; \
-                    } \
-                } \
-            } \
-        } while(0)
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
 
-        GET_DOUBLE("\"freq_start\"", g_freq_start, 1.0e6, 1.0);
-        GET_DOUBLE("\"freq_end\"", g_freq_end, 1.0e6, 1.0);
-        GET_DOUBLE("\"converter_freq\"", g_converter_freq, 1.0e6, -1.0e12);
-        GET_DOUBLE("\"samplerate\"", g_samplerate, 1.0, 1.0);
-        GET_DOUBLE("\"bw_ratio\"", g_bw_ratio, 1.0, 0.000001);
-        GET_UINT("\"lna_gain\"", g_lna_gain);
-        GET_UINT("\"vga_gain\"", g_vga_gain);
-        GET_UINT("direct_sampling", g_direct_sampling);
-        GET_UINT("\"clk_source\"", g_clk_source);
-        GET_UINT("\"clock_source\"", g_clk_source);
-        GET_UINT("fft_size", fft_tmp);
-        GET_UINT("display_bins", display_tmp);
-        GET_UINT("min_rate_lps", min_rate_tmp);
-        GET_UINT("rate_limit_lps", rate_tmp);
-        GET_DOUBLE_RAW_OPT("\"visible_start_hz\"", visible_start_tmp, have_visible_start);
-        GET_DOUBLE_RAW_OPT("\"visible_end_hz\"", visible_end_tmp, have_visible_end);
-        if (fft_tmp >= FFT_SIZE_MIN && fft_tmp <= FFT_SIZE_MAX)
-            update_fft_size((int)fft_tmp);
+        if (json_get_double(&json, "freq_start", &number_tmp, &present) != 0) goto start_bad_json;
+        if (present) freq_start_tmp = number_tmp * 1.0e6;
+        if (json_get_double(&json, "freq_end", &number_tmp, &present) != 0) goto start_bad_json;
+        if (present) freq_end_tmp = number_tmp * 1.0e6;
+        if (json_get_double(&json, "converter_freq", &number_tmp, &present) != 0) goto start_bad_json;
+        if (present) converter_tmp = number_tmp * 1.0e6;
+        if (json_get_double(&json, "samplerate", &number_tmp, &present) != 0) goto start_bad_json;
+        if (present) samplerate_tmp = number_tmp;
+        if (json_get_double(&json, "bw_ratio", &number_tmp, &present) != 0) goto start_bad_json;
+        if (present) bw_ratio_tmp = number_tmp;
+        if (json_get_uint(&json, "lna_gain", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) lna_tmp = uint_tmp;
+        if (json_get_uint(&json, "vga_gain", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) vga_tmp = uint_tmp;
+        if (json_get_uint(&json, "direct_sampling", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) direct_tmp = uint_tmp;
+        if (json_get_uint(&json, "clk_source", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) clk_tmp = uint_tmp;
+        if (json_get_uint(&json, "clock_source", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) clk_tmp = uint_tmp;
+        if (json_get_uint(&json, "fft_size", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) fft_tmp = uint_tmp;
+        if (json_get_uint(&json, "display_bins", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) display_tmp = uint_tmp;
+        if (json_get_uint(&json, "min_rate_lps", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) min_rate_tmp = uint_tmp;
+        if (json_get_uint(&json, "rate_limit_lps", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) rate_tmp = uint_tmp;
+        if (json_get_double(&json, "visible_start_hz", &visible_start_tmp, &have_visible_start) != 0) goto start_bad_json;
+        if (json_get_double(&json, "visible_end_hz", &visible_end_tmp, &have_visible_end) != 0) goto start_bad_json;
+
+        if (have_visible_start != have_visible_end) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "visible_start_hz and visible_end_hz must be sent together");
+            close(client_fd);
+            return;
+        }
+        if (have_visible_start &&
+            validate_visible_range(visible_start_tmp, visible_end_tmp,
+                                   err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (fft_tmp < FFT_SIZE_MIN || fft_tmp > FFT_SIZE_MAX) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "fft_size is out of range");
+            close(client_fd);
+            return;
+        }
+        if (validate_scan_settings(freq_start_tmp, freq_end_tmp, converter_tmp,
+                                   samplerate_tmp, bw_ratio_tmp, lna_tmp,
+                                   vga_tmp, direct_tmp, clk_tmp,
+                                   err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+
+        g_freq_start = freq_start_tmp;
+        g_freq_end = freq_end_tmp;
+        g_converter_freq = converter_tmp;
+        g_samplerate = samplerate_tmp;
+        g_bw_ratio = bw_ratio_tmp;
+        g_lna_gain = lna_tmp;
+        g_vga_gain = vga_tmp;
+        g_direct_sampling = normalize_direct_sampling(direct_tmp);
+        g_clk_source = normalize_clk_source(clk_tmp);
+        update_fft_size((int)fft_tmp);
         if (display_tmp > 0)
             g_display_bins = normalize_display_bins((int)display_tmp);
-        g_direct_sampling = normalize_direct_sampling(g_direct_sampling);
-        g_clk_source = normalize_clk_source(g_clk_source);
         g_min_rate_lps = normalize_min_rate_lps(min_rate_tmp);
         if (rate_tmp > 0)
             g_rate_limit_lps = normalize_rate_limit_lps(rate_tmp);
@@ -2920,10 +3764,6 @@ static void handle_request(int client_fd, const char *req)
             }
         }
         g_view_id++;
-
-        #undef GET_DOUBLE
-        #undef GET_UINT
-        #undef GET_DOUBLE_RAW_OPT
 
         save_config();
 
@@ -2974,48 +3814,60 @@ static void handle_request(int client_fd, const char *req)
         send_json_response(client_fd, 200, "OK", cors, json_body);
         close(client_fd);
         return;
+
+start_bad_json:
+        send_json_error(client_fd, 400, "Bad Request", cors,
+                        "Malformed JSON field in start request");
+        close(client_fd);
+        return;
     }
 
     /* POST /api/view */
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/view") == 0) {
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/view") == 0) {
+        json_doc_t json;
+        char err[160];
         double visible_start = g_visible_start;
         double visible_end = g_visible_end;
         uint32_t display_tmp = 0;
+        double number_tmp;
+        uint32_t uint_tmp;
+        int present = 0;
         int visible_changed;
         int ret = 0;
-        const char *body = strstr(req, "\r\n\r\n");
-        if (!body) { close(client_fd); return; }
-        body += 4;
 
-        #define GET_DOUBLE_RAW(key, target) do { \
-            const char *k = strstr(body, key); \
-            if (k) { \
-                k = strchr(k, ':'); \
-                if (k) { \
-                    double v; \
-                    if (sscanf(k+1, " %lf", &v) == 1) \
-                        (target) = v; \
-                } \
-            } \
-        } while(0)
-        #define GET_UINT_RAW(key, target) do { \
-            const char *k = strstr(body, key); \
-            if (k) { \
-                k = strchr(k, ':'); \
-                if (k) { \
-                    unsigned int v; \
-                    if (sscanf(k+1, " %u", &v) == 1) \
-                        (target) = (uint32_t)v; \
-                } \
-            } \
-        } while(0)
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (json_get_double(&json, "visible_start_hz", &number_tmp, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed visible_start_hz");
+            close(client_fd);
+            return;
+        }
+        if (present) visible_start = number_tmp;
+        if (json_get_double(&json, "visible_end_hz", &number_tmp, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed visible_end_hz");
+            close(client_fd);
+            return;
+        }
+        if (present) visible_end = number_tmp;
+        if (json_get_uint(&json, "display_bins", &uint_tmp, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed display_bins");
+            close(client_fd);
+            return;
+        }
+        if (present) display_tmp = uint_tmp;
 
-        GET_DOUBLE_RAW("\"visible_start_hz\"", visible_start);
-        GET_DOUBLE_RAW("\"visible_end_hz\"", visible_end);
-        GET_UINT_RAW("\"display_bins\"", display_tmp);
-
-        #undef GET_DOUBLE_RAW
-        #undef GET_UINT_RAW
+        if (validate_visible_range(visible_start, visible_end,
+                                   err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
 
         if (display_tmp > 0)
             g_display_bins = normalize_display_bins((int)display_tmp);
@@ -3036,6 +3888,8 @@ static void handle_request(int client_fd, const char *req)
             if (g_scanning)
                 ret = start_scan();
         }
+        if (visible_changed || display_tmp > 0)
+            save_config();
 
         {
             double step = 0.0;
@@ -3087,20 +3941,22 @@ static void handle_request(int client_fd, const char *req)
     }
 
     /* POST /api/fft */
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/fft") == 0) {
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/fft") == 0) {
+        json_doc_t json;
+        char err[160];
         uint32_t fft_tmp = 0;
-        const char *body = strstr(req, "\r\n\r\n");
-        if (!body) { close(client_fd); return; }
-        body += 4;
+        int present = 0;
 
-        const char *k = strstr(body, "fft_size");
-        if (k) {
-            k = strchr(k, ':');
-            if (k) {
-                unsigned int v;
-                if (sscanf(k + 1, " %u", &v) == 1)
-                    fft_tmp = (uint32_t)v;
-            }
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (json_get_uint(&json, "fft_size", &fft_tmp, &present) != 0 || !present) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "fft_size is required");
+            close(client_fd);
+            return;
         }
 
         if (fft_tmp >= FFT_SIZE_MIN && fft_tmp <= FFT_SIZE_MAX) {
@@ -3127,29 +3983,37 @@ static void handle_request(int client_fd, const char *req)
     }
 
     /* POST /api/gain */
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/gain") == 0) {
-        const char *body = strstr(req, "\r\n\r\n");
-        if (!body) { close(client_fd); return; }
-        body += 4;
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/gain") == 0) {
+        json_doc_t json;
+        char err[160];
+        uint32_t value;
+        int present = 0;
 
-        #define GET_UINT_LIMITED(key, target, maxval) do { \
-            const char *k = strstr(body, key); \
-            if (k) { \
-                k = strchr(k, ':'); \
-                if (k) { \
-                    unsigned int v; \
-                    if (sscanf(k+1, " %u", &v) == 1) { \
-                        if (v > (maxval)) v = (maxval); \
-                        (target) = (uint32_t)v; \
-                    } \
-                } \
-            } \
-        } while(0)
-
-        GET_UINT_LIMITED("\"lna_gain\"", g_lna_gain, 2);
-        GET_UINT_LIMITED("\"vga_gain\"", g_vga_gain, 15);
-
-        #undef GET_UINT_LIMITED
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (json_get_uint(&json, "lna_gain", &value, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed lna_gain");
+            close(client_fd);
+            return;
+        }
+        if (present) {
+            if (value > 2) value = 2;
+            g_lna_gain = value;
+        }
+        if (json_get_uint(&json, "vga_gain", &value, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed vga_gain");
+            close(client_fd);
+            return;
+        }
+        if (present) {
+            if (value > 15) value = 15;
+            g_vga_gain = value;
+        }
 
         int ret = apply_gain_settings();
         const char *status = (ret == FOBOS_ERR_OK) ? "ok" : "error";
@@ -3163,21 +4027,23 @@ static void handle_request(int client_fd, const char *req)
     }
 
     /* POST /api/rate */
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/rate") == 0) {
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/rate") == 0) {
+        json_doc_t json;
+        char err[160];
         uint32_t rate_tmp = 0;
+        int present = 0;
         int ret = 0;
-        const char *body = strstr(req, "\r\n\r\n");
-        if (!body) { close(client_fd); return; }
-        body += 4;
 
-        const char *k = strstr(body, "rate_limit_lps");
-        if (k) {
-            k = strchr(k, ':');
-            if (k) {
-                unsigned int v;
-                if (sscanf(k + 1, " %u", &v) == 1)
-                    rate_tmp = (uint32_t)v;
-            }
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (json_get_uint(&json, "rate_limit_lps", &rate_tmp, &present) != 0 || !present) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "rate_limit_lps is required");
+            close(client_fd);
+            return;
         }
 
         if (rate_tmp > 0) {
@@ -3225,21 +4091,23 @@ static void handle_request(int client_fd, const char *req)
     }
 
     /* POST /api/min-rate */
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/min-rate") == 0) {
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/min-rate") == 0) {
+        json_doc_t json;
+        char err[160];
         uint32_t min_rate_tmp = 0;
+        int present = 0;
         int ret = 0;
-        const char *body = strstr(req, "\r\n\r\n");
-        if (!body) { close(client_fd); return; }
-        body += 4;
 
-        const char *k = strstr(body, "min_rate_lps");
-        if (k) {
-            k = strchr(k, ':');
-            if (k) {
-                unsigned int v;
-                if (sscanf(k + 1, " %u", &v) == 1)
-                    min_rate_tmp = (uint32_t)v;
-            }
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (json_get_uint(&json, "min_rate_lps", &min_rate_tmp, &present) != 0 || !present) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "min_rate_lps is required");
+            close(client_fd);
+            return;
         }
 
         g_min_rate_lps = normalize_min_rate_lps(min_rate_tmp);
@@ -3284,16 +4152,23 @@ static void handle_request(int client_fd, const char *req)
     }
 
     /* POST /api/stop */
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/stop") == 0) {
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/stop") == 0) {
         stop_scan();
         send_json_response(client_fd, 200, "OK", cors, "{\"status\":\"ok\"}");
         close(client_fd);
         return;
     }
 
+    if (strcmp(http.method, "GET") != 0 &&
+        strcmp(http.method, "POST") != 0) {
+        send_json_error(client_fd, 405, "Method Not Allowed", cors,
+                        "Unsupported HTTP method");
+        close(client_fd);
+        return;
+    }
+
     /* 404 */
-    const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-    WRITE(client_fd, nf, strlen(nf));
+    send_empty_response(client_fd, 404, "Not Found", cors);
     close(client_fd);
 }
 
@@ -3451,6 +4326,7 @@ int main(int argc, char **argv)
         int total = 0;
         int header_len = 0;
         int body_len = 0;
+        int truncated = 0;
 
         while (total < MAX_REQUEST) {
             int n = (int)read(client_fd, req + total, (size_t)(MAX_REQUEST - total));
@@ -3462,13 +4338,17 @@ int main(int argc, char **argv)
                 if (header_end) {
                     header_len = (int)(header_end - req) + 4;
                     body_len = http_content_length(req);
+                    if (body_len < 0)
+                        break;
                 }
             }
-            if (header_len && total >= header_len + body_len)
+            if (header_len && body_len >= 0 && total >= header_len + body_len)
                 break;
         }
+        if (total >= MAX_REQUEST)
+            truncated = 1;
 
-        if (total > 0) handle_request(client_fd, req);
+        if (total > 0) handle_request(client_fd, req, (size_t)total, truncated);
         else close(client_fd);
     }
 
