@@ -356,7 +356,7 @@
                     </select>
                 </div>
                 <div class="ctrl-group">
-                    <label>Min Rate</label>
+                    <label>Min Rate (if possible)</label>
                     <select id="minRate">
                         <option value="0" selected>As is</option>
                         <option value="1">1 line/s</option>
@@ -415,8 +415,9 @@
                 <div class="ctrl-group">
                     <label>Direct Sampling</label>
                     <select id="directSampling">
-                        <option value="0">Off (RF)</option>
-                        <option value="1">On (HF)</option>
+                        <option value="0">Off (RF input)</option>
+                        <option value="1">On (HF1 input)</option>
+                        <option value="2">On (HF2 input)</option>
                     </select>
                 </div>
                 <div class="ctrl-group">
@@ -490,6 +491,7 @@
             let currentFreq1 = 0;
             let currentSteps = 0;
             let currentConverterFreq = 0;
+            let currentDirectSamplingMaxHz = 25000000;
             let currentViewId = 0;
             let viewRequestSerial = 0;
             let viewUpdateTimer = null;
@@ -503,7 +505,12 @@
             let waterfallRenderToken = 0;
             let waterfallRenderActiveToken = 0;
             let binRangeCache = null;
+            let zoomWheelFrame = 0;
+            let zoomWheelDelta = 0;
+            let zoomWheelCanvas = null;
+            let zoomWheelClientX = 0;
             const MAX_ZOOM_FACTOR = 1000000;
+            const DIRECT_SAMPLING_HARD_MAX_HZ = 25000000;
             const TICK_MIN_COUNT = 5;
             const TICK_MAX_COUNT = 13;
             const MAX_WF_HISTORY_BINS = 12000000;
@@ -541,6 +548,61 @@
 
             function displayBins() {
                 return Math.max(1, Math.floor(wfCanvas.width || 1));
+            }
+
+            function selectedDirectSampling() {
+                return parseInt(
+                    document.getElementById("directSampling").value || "0",
+                    10,
+                );
+            }
+
+            function computedDirectSamplingMaxHz() {
+                const samplerate =
+                    parseFloat(document.getElementById("samplerate").value) ||
+                    50000000;
+                return Math.max(
+                    1,
+                    Math.min(DIRECT_SAMPLING_HARD_MAX_HZ, samplerate * 0.5),
+                );
+            }
+
+            function directSamplingMaxHz() {
+                const maxHz = computedDirectSamplingMaxHz();
+                return Math.max(
+                    1,
+                    Math.min(currentDirectSamplingMaxHz || maxHz, maxHz),
+                );
+            }
+
+            function refreshComputedDirectSamplingMax() {
+                currentDirectSamplingMaxHz = computedDirectSamplingMaxHz();
+            }
+
+            function syncDirectSamplingFields(forceValues = false) {
+                const direct = selectedDirectSampling() !== 0;
+                const startEl = document.getElementById("freqStart");
+                const endEl = document.getElementById("freqEnd");
+                startEl.disabled = direct;
+                endEl.disabled = direct;
+                if (direct || forceValues) {
+                    const maxHz = directSamplingMaxHz();
+                    startEl.value = "0";
+                    endEl.value = mhzInputValue(maxHz);
+                    configuredFreq0 = 0;
+                    configuredFreq1 = maxHz;
+                }
+            }
+
+            function handleDirectSamplingChanged() {
+                refreshComputedDirectSamplingMax();
+                syncDirectSamplingFields(selectedDirectSampling() !== 0);
+            }
+
+            function handleSamplerateChanged() {
+                refreshComputedDirectSamplingMax();
+                if (selectedDirectSampling() !== 0)
+                    syncDirectSamplingFields(true);
             }
 
             function sameStoredFrequency(a, b) {
@@ -954,6 +1016,7 @@
 
             function decimalsForSpan(spanHz) {
                 const perPixel = Math.abs(spanHz) / Math.max(1, displayBins());
+                if (perPixel < 100) return 5;
                 if (perPixel < 1000) return 4;
                 return 3;
             }
@@ -995,7 +1058,7 @@
                 const px = width || wfCanvas.width || 800;
                 return Math.max(
                     TICK_MIN_COUNT,
-                    Math.min(TICK_MAX_COUNT, Math.floor(px / 80) + 1),
+                    Math.min(TICK_MAX_COUNT, Math.floor(px / 95) + 1),
                 );
             }
 
@@ -1011,14 +1074,18 @@
             function niceFrequencySteps(span) {
                 const steps = [];
                 if (span <= 0) return steps;
-                const minPow = Math.floor(Math.log10(span)) - 6;
-                const maxPow = Math.floor(Math.log10(span)) + 1;
-                const bases = [1, 2, 2.5, 5, 10];
+                const targetMin = span / Math.max(1, TICK_MAX_COUNT - 1);
+                const targetMax = span / Math.max(1, TICK_MIN_COUNT - 1);
+                const minPow =
+                    Math.floor(Math.log10(Math.max(1e-9, targetMin))) - 1;
+                const maxPow =
+                    Math.ceil(Math.log10(Math.max(1, targetMax))) + 1;
+                const bases = [1, 2, 5];
                 for (let pow = minPow; pow <= maxPow; pow++) {
                     const scale = Math.pow(10, pow);
                     for (const base of bases) {
                         const step = base * scale;
-                        if (step >= 1000) steps.push(step);
+                        if (step >= 1) steps.push(step);
                     }
                 }
                 return [...new Set(steps)].sort((a, b) => a - b);
@@ -1027,38 +1094,41 @@
             function chooseFrequencyStep(left, right, width) {
                 const span = right - left;
                 const target = tickTargetCount(width);
+                const desired = span / Math.max(1, target - 1);
                 let best = null;
                 for (const step of niceFrequencySteps(span)) {
                     const count = countTicksForStep(left, right, step);
                     if (count < TICK_MIN_COUNT || count > TICK_MAX_COUNT) {
                         continue;
                     }
-                    const score = Math.abs(count - target);
+                    const score =
+                        Math.abs(count - target) * 10 +
+                        Math.abs(Math.log10(step / desired));
                     if (
                         !best ||
                         score < best.score ||
-                        (score === best.score && count > best.count)
+                        (Math.abs(score - best.score) < 1e-9 &&
+                            count > best.count)
                     ) {
                         best = { step, count, score };
                     }
                 }
                 if (best) return best.step;
 
-                const fallback = span / Math.max(1, TICK_MIN_COUNT - 1);
-                return niceFrequencySteps(span).reduce((chosen, step) => {
-                    if (step <= fallback) return step;
-                    return chosen;
-                }, fallback);
+                return (
+                    niceFrequencySteps(span).find((step) => step >= desired) ||
+                    desired
+                );
             }
 
             function decimalsForFrequencyStep(stepHz) {
                 const stepMHz = stepHz / 1e6;
-                for (let decimals = 0; decimals <= 4; decimals++) {
+                for (let decimals = 0; decimals <= 5; decimals++) {
                     const scaled = stepMHz * Math.pow(10, decimals);
                     if (Math.abs(scaled - Math.round(scaled)) < 1e-6)
                         return decimals;
                 }
-                return 4;
+                return 5;
             }
 
             function formatTickMHz(freq, stepHz) {
@@ -1152,6 +1222,7 @@
                     "#ffe49a",
                 ];
                 const span = axis.right - axis.left;
+                const visibleBands = [];
 
                 bands.forEach((band, idx) => {
                     const left = Math.max(axis.left, band.start_hz);
@@ -1165,21 +1236,47 @@
 
                     scCtx.fillStyle = colors[colorIdx];
                     scCtx.fillRect(x0, 0, w, height);
-                    scCtx.fillStyle = headerColors[colorIdx];
-                    scCtx.fillRect(x0, 0, w, 18);
+                    visibleBands.push({ band, x0, x1, w, colorIdx });
+                });
 
-                    if (w >= 38) {
-                        scCtx.save();
-                        scCtx.beginPath();
-                        scCtx.rect(x0, 0, w, 18);
-                        scCtx.clip();
-                        scCtx.fillStyle = labelColors[colorIdx];
-                        scCtx.font = "10px monospace";
-                        scCtx.textAlign = "center";
-                        scCtx.textBaseline = "top";
-                        scCtx.fillText(band.name, x0 + w * 0.5, 3);
-                        scCtx.restore();
+                if (!visibleBands.length) return;
+
+                scCtx.font = "10px monospace";
+                scCtx.textAlign = "center";
+                scCtx.textBaseline = "top";
+                const rows = [];
+                const maxRows = 4;
+                visibleBands.forEach((entry) => {
+                    if (entry.w < 24) return;
+                    const labelWidth = Math.min(
+                        entry.w,
+                        scCtx.measureText(entry.band.name).width + 8,
+                    );
+                    const idealLeft = entry.x0 + (entry.w - labelWidth) * 0.5;
+                    const labelLeft = Math.max(
+                        entry.x0,
+                        Math.min(entry.x1 - labelWidth, idealLeft),
+                    );
+                    const labelRight = labelLeft + labelWidth;
+                    let row = rows.findIndex((right) => labelLeft > right + 4);
+                    if (row < 0 && rows.length < maxRows) {
+                        row = rows.length;
+                        rows.push(-Infinity);
                     }
+                    if (row < 0) return;
+                    rows[row] = labelRight;
+
+                    const y = 2 + row * 12;
+                    const colorIdx = entry.colorIdx;
+                    scCtx.save();
+                    scCtx.beginPath();
+                    scCtx.rect(entry.x0, y, entry.w, 12);
+                    scCtx.clip();
+                    scCtx.fillStyle = headerColors[colorIdx];
+                    scCtx.fillRect(entry.x0, y, entry.w, 12);
+                    scCtx.fillStyle = labelColors[colorIdx];
+                    scCtx.fillText(entry.band.name, entry.x0 + entry.w * 0.5, y + 1);
+                    scCtx.restore();
                 });
             }
 
@@ -1200,7 +1297,7 @@
             }
 
             function tickKey(freq) {
-                return Math.round(freq);
+                return Math.round(freq * 1000);
             }
 
             function buildFrequencyMarks(left, right, width) {
@@ -1875,18 +1972,15 @@
             wfCanvas.addEventListener("mouseleave", hideHoverReadout);
             scCanvas.addEventListener("mouseleave", hideHoverReadout);
 
-            function handleZoomWheel(evt) {
-                if (!evt.shiftKey || !currentFreq0 || !currentFreq1) {
-                    return;
-                }
+            function applyZoomAtCursor(canvas, clientX, deltaY) {
+                if (!canvas || !currentFreq0 || !currentFreq1) return;
 
-                const rect = evt.currentTarget.getBoundingClientRect();
+                const rect = canvas.getBoundingClientRect();
                 if (rect.width <= 0) return;
 
-                evt.preventDefault();
                 const cursor = Math.max(
                     0,
-                    Math.min(1, (evt.clientX - rect.left) / rect.width),
+                    Math.min(1, (clientX - rect.left) / rect.width),
                 );
                 const fullStart = configuredFreq0 || currentFreq0;
                 const fullEnd = configuredFreq1 || currentFreq1;
@@ -1895,7 +1989,15 @@
 
                 const currentSpan = currentFreq1 - currentFreq0;
                 const anchor = currentFreq0 + cursor * currentSpan;
-                const factor = evt.deltaY < 0 ? 1 / 1.25 : 1.25;
+                const steps = Math.max(
+                    1,
+                    Math.min(6, Math.round(Math.abs(deltaY) / 80)),
+                );
+                const factorPerStep = 1.18;
+                const factor =
+                    deltaY < 0
+                        ? Math.pow(1 / factorPerStep, steps)
+                        : Math.pow(factorPerStep, steps);
                 const minSpan = Math.max(1, fullSpan / MAX_ZOOM_FACTOR);
                 let span = Math.max(minSpan, Math.min(fullSpan, currentSpan * factor));
                 let left = anchor - cursor * span;
@@ -1928,6 +2030,31 @@
                     formatScanRange(currentFreq0, currentFreq1);
                 saveVisibleView();
                 scheduleViewUpdate(left, right, true);
+            }
+
+            function flushZoomWheel() {
+                const canvas = zoomWheelCanvas;
+                const clientX = zoomWheelClientX;
+                const delta = Math.max(-480, Math.min(480, zoomWheelDelta));
+                zoomWheelFrame = 0;
+                zoomWheelDelta = 0;
+                zoomWheelCanvas = null;
+                if (delta !== 0) applyZoomAtCursor(canvas, clientX, delta);
+            }
+
+            function handleZoomWheel(evt) {
+                if (!evt.shiftKey || !currentFreq0 || !currentFreq1) {
+                    return;
+                }
+
+                evt.preventDefault();
+                const delta = Math.max(-240, Math.min(240, evt.deltaY || 0));
+                if (delta === 0) return;
+                zoomWheelDelta += delta;
+                zoomWheelCanvas = evt.currentTarget;
+                zoomWheelClientX = evt.clientX;
+                if (!zoomWheelFrame)
+                    zoomWheelFrame = requestAnimationFrame(flushZoomWheel);
             }
 
             function setPanningCursor(active) {
@@ -2112,6 +2239,17 @@
                 }
                 if (plan.min_rate_lps !== undefined) {
                     setMinRateValue(plan.min_rate_lps);
+                }
+                if (plan.direct_sampling_max_hz !== undefined) {
+                    currentDirectSamplingMaxHz = Number(
+                        plan.direct_sampling_max_hz,
+                    );
+                }
+                if (plan.direct_sampling !== undefined) {
+                    document.getElementById("directSampling").value = String(
+                        plan.direct_sampling,
+                    );
+                    syncDirectSamplingFields(plan.direct_sampling !== 0);
                 }
                 updateFFTInfo(plan);
 
@@ -2329,6 +2467,17 @@
                 if (plan.min_rate_lps !== undefined) {
                     setMinRateValue(plan.min_rate_lps);
                 }
+                if (plan.direct_sampling_max_hz !== undefined) {
+                    currentDirectSamplingMaxHz = Number(
+                        plan.direct_sampling_max_hz,
+                    );
+                }
+                if (plan.direct_sampling !== undefined) {
+                    document.getElementById("directSampling").value = String(
+                        plan.direct_sampling,
+                    );
+                    syncDirectSamplingFields(plan.direct_sampling !== 0);
+                }
                 updateFFTInfo(plan);
                 if (currentFreq0 && currentFreq1) {
                     updateFrequencyLabels(
@@ -2343,13 +2492,15 @@
             }
 
             function buildScanRequest(options = {}) {
+                const direct = selectedDirectSampling();
+                const directMaxHz = direct ? directSamplingMaxHz() : 0;
                 const request = {
-                    freq_start: parseFloat(
-                        document.getElementById("freqStart").value,
-                    ),
-                    freq_end: parseFloat(
-                        document.getElementById("freqEnd").value,
-                    ),
+                    freq_start: direct
+                        ? 0
+                        : parseFloat(document.getElementById("freqStart").value),
+                    freq_end: direct
+                        ? directMaxHz / 1e6
+                        : parseFloat(document.getElementById("freqEnd").value),
                     converter_freq: parseFloat(
                         document.getElementById("converterFreq").value,
                     ),
@@ -2365,9 +2516,7 @@
                     vga_gain: parseInt(
                         document.getElementById("vgaGain").value,
                     ),
-                    direct_sampling: parseInt(
-                        document.getElementById("directSampling").value,
-                    ),
+                    direct_sampling: direct,
                     min_rate_lps: parseInt(
                         document.getElementById("minRate").value,
                     ),
@@ -2410,6 +2559,8 @@
                 }
                 if (options.resetView !== false) {
                     clearSavedView();
+                    if (selectedDirectSampling() !== 0)
+                        syncDirectSamplingFields(true);
                     configuredFreq0 =
                         parseFloat(document.getElementById("freqStart").value) *
                         1e6;
@@ -2559,6 +2710,12 @@
             document
                 .getElementById("rateLimit")
                 .addEventListener("change", updateBackendRateLimit);
+            document
+                .getElementById("directSampling")
+                .addEventListener("change", handleDirectSamplingChanged);
+            document
+                .getElementById("samplerate")
+                .addEventListener("change", handleSamplerateChanged);
             function syncWaterfallBrightness(changed) {
                 const minEl = document.getElementById("wfMin");
                 const maxEl = document.getElementById("wfMax");
@@ -2648,6 +2805,13 @@
                         status.sample_rates,
                         status.samplerate,
                     );
+                    if (status.direct_sampling_max_hz !== undefined) {
+                        currentDirectSamplingMaxHz = Number(
+                            status.direct_sampling_max_hz,
+                        );
+                    } else {
+                        refreshComputedDirectSamplingMax();
+                    }
                     if (status.rate_limit_lps !== undefined) {
                         setRateLimitValue(status.rate_limit_lps);
                     }
@@ -2674,9 +2838,13 @@
                         document.getElementById("vgaVal").textContent =
                             status.vga_gain;
                     }
-                    if (status.direct_sampling !== undefined)
+                    if (status.direct_sampling !== undefined) {
                         document.getElementById("directSampling").value =
                             status.direct_sampling;
+                        syncDirectSamplingFields(status.direct_sampling !== 0);
+                    } else {
+                        syncDirectSamplingFields(false);
+                    }
                 }
 
                 /* Restore waterfall brightness from localStorage */
