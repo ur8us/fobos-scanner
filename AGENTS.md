@@ -110,7 +110,7 @@ LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./fobos-sca
 Run the stream integrity tester:
 
 ```sh
-make stream-test
+./run-stream-test.sh
 ```
 
 Open the UI at:

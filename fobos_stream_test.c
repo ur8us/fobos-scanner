@@ -350,7 +350,7 @@ static void stream_callback(float *buf, uint32_t buf_length,
             st->max_gap_ns = gap;
 
         if (st->first_buf_len > 0 && st->cfg.samplerate > 0.0) {
-            expected_gap = ((double)st->first_buf_len * 2.0e9) / st->cfg.samplerate;
+            expected_gap = ((double)st->first_buf_len * 1.0e9) / st->cfg.samplerate;
             if (gap_d > expected_gap * 1.75) {
                 uint64_t missing = 0;
                 double rounded = floor((gap_d / expected_gap) + 0.5);
@@ -481,7 +481,7 @@ static void print_report(const stream_stats_t *st, int read_result)
         observed_rate = (double)st->total_samples / callback_span;
     if (st->first_buf_len > 0 && st->cfg.samplerate > 0.0 && callback_span > 0.0)
         expected_callbacks =
-            callback_span * st->cfg.samplerate / (2.0 * (double)st->first_buf_len);
+            callback_span * st->cfg.samplerate / (double)st->first_buf_len;
     if (expected_callbacks > 0.0)
         callback_ratio = 100.0 * (double)st->callbacks / expected_callbacks;
     if (st->gap_count > 0) {
@@ -543,9 +543,8 @@ static void print_report(const stream_stats_t *st, int read_result)
            (double)st->max_gap_ns / 1.0e6);
     printf("Samples: %llu complex, observed %.3f MS/s\n",
            (unsigned long long)st->total_samples, observed_rate / 1.0e6);
-    printf("Observed rate vs samplerate: %.1f%%; vs samplerate/2: %.1f%%\n",
-           safe_percent(observed_rate, st->cfg.samplerate),
-           safe_percent(observed_rate, st->cfg.samplerate * 0.5));
+    printf("Observed rate vs samplerate: %.1f%%\n",
+           safe_percent(observed_rate, st->cfg.samplerate));
     printf("Signal: RMS %.6f, mean I %.6g, mean Q %.6g, max abs %.6f\n",
            rms, mean_re, mean_im, st->max_abs);
     printf("Sample issues: non-finite %llu, clipped-ish %llu (%.4f%%), zero IQ pairs %llu\n",

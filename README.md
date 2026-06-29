@@ -136,7 +136,7 @@ The Fobos agile public callback does not expose hardware sequence numbers, so mi
 Run with defaults, `100 MHz`, `50 MHz` sample rate, and `10` seconds:
 
 ```sh
-LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./fobos-stream-test
+./run-stream-test.sh
 ```
 
 Or use the Makefile wrapper:
@@ -148,7 +148,7 @@ make stream-test
 Example custom run:
 
 ```sh
-LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./fobos-stream-test --freq-mhz 315 --samplerate 50M --seconds 60
+./run-stream-test.sh --freq-mhz 315 --samplerate 50M --seconds 60
 ```
 
 Useful options:
