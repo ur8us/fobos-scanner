@@ -1828,9 +1828,15 @@
                     );
             }
 
-            function openMarkerDialogFromEvent(canvas, evt) {
+            function stopMarkerMouseEvent(evt) {
                 evt.preventDefault();
                 evt.stopPropagation();
+                if (typeof evt.stopImmediatePropagation === "function")
+                    evt.stopImmediatePropagation();
+            }
+
+            function openMarkerDialogFromEvent(canvas, evt) {
+                stopMarkerMouseEvent(evt);
                 const freq = frequencyAt(canvas, evt.clientX);
                 if (freq === null) return false;
                 const marker = nearestMarkerAtCanvas(canvas, evt.clientX);
@@ -1838,20 +1844,25 @@
                 return true;
             }
 
-            function handleMarkerPointerDown(canvas, evt) {
+            function handleMarkerMouseDown(canvas, evt) {
                 if (!evt.shiftKey || evt.button !== 2) return;
                 if (openMarkerDialogFromEvent(canvas, evt))
-                    markerContextSuppressUntil = Date.now() + 800;
+                    markerContextSuppressUntil = Date.now() + 1000;
             }
 
             function handleMarkerContextMenu(canvas, evt) {
                 if (Date.now() < markerContextSuppressUntil) {
-                    evt.preventDefault();
-                    evt.stopPropagation();
+                    stopMarkerMouseEvent(evt);
                     return;
                 }
                 if (!evt.shiftKey) return;
                 openMarkerDialogFromEvent(canvas, evt);
+            }
+
+            function handleMarkerAuxClick(canvas, evt) {
+                if (evt.button !== 2) return;
+                if (evt.shiftKey || Date.now() < markerContextSuppressUntil)
+                    stopMarkerMouseEvent(evt);
             }
 
             function subdivisionCountForStep(step) {
@@ -2685,17 +2696,27 @@
             );
             wfCanvas.addEventListener("mouseleave", hideHoverReadout);
             scCanvas.addEventListener("mouseleave", hideHoverReadout);
-            wfCanvas.addEventListener("pointerdown", (evt) =>
-                handleMarkerPointerDown(wfCanvas, evt),
+            wfCanvas.addEventListener(
+                "mousedown",
+                (evt) => handleMarkerMouseDown(wfCanvas, evt),
+                true,
             );
-            scCanvas.addEventListener("pointerdown", (evt) =>
-                handleMarkerPointerDown(scCanvas, evt),
+            scCanvas.addEventListener(
+                "mousedown",
+                (evt) => handleMarkerMouseDown(scCanvas, evt),
+                true,
             );
             wfCanvas.addEventListener("contextmenu", (evt) =>
                 handleMarkerContextMenu(wfCanvas, evt),
             );
             scCanvas.addEventListener("contextmenu", (evt) =>
                 handleMarkerContextMenu(scCanvas, evt),
+            );
+            wfCanvas.addEventListener("auxclick", (evt) =>
+                handleMarkerAuxClick(wfCanvas, evt),
+            );
+            scCanvas.addEventListener("auxclick", (evt) =>
+                handleMarkerAuxClick(scCanvas, evt),
             );
             document
                 .getElementById("markerOk")
