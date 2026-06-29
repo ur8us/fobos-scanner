@@ -30,6 +30,8 @@ When the current visible span needs only one hardware scan point, the backend us
 
 Single mode distinguishes the visible span from the processed source span. When the processed span is wide enough, the backend tunes the receiver center just outside the visible window so the I/Q zero-frequency dip is not centered on the screen.
 
+Single mode chooses the smallest power-of-two FFT size that can fill the current display, from `1024` through `65536`. If more frequency resolution is needed, increase decimation instead of using FFT sizes above `65536`. The `Min Rate` setting applies only to decimated single-stream mode and uses FFT-window overlap to meet the requested waterfall line cadence.
+
 The backend should not auto-start a scan immediately after the server banner. The web UI starts scanning through `/api/start`, and if a scan is already active the UI should attach to `/api/waterfall` instead of restarting it. This avoids racing Fobos async USB setup during page load or refresh.
 
 `/api/start` is for hardware scan changes: band, sample rate, bandwidth ratio, converter, direct sampling, and gains. It can restart the hardware scan.
@@ -64,6 +66,7 @@ The frontend uses peak-per-pixel reduction when more FFT bins exist than canvas 
 - Shift + mouse wheel zooms the spectrum/waterfall horizontally around the cursor.
 - Holding Shift changes the spectrum/waterfall cursor to zoom mode.
 - Frequency scale, hover frequency, and hover level must use the current zoomed view.
+- Frequency scale ticks are rendered as border-left strokes, not 1px background rectangles. This fixed Firefox/browser-zoom cases where subpixel 1px tick divs disappeared.
 - The scan label shows `from - to (bandwidth) MHz`.
 - Waterfall min/max sliders currently allow values up to `400`.
 - `/api/status` is polled as a heartbeat. If the backend is unreachable, the UI must show `disconnected`, not stale `scanning`.

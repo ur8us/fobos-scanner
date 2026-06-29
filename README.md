@@ -1,6 +1,6 @@
-# Fobos SDR Scanner
+# Fobos SDR Scanner with a million time zoom
 
-Browser-based spectrum and waterfall scanner for RigExpert Fobos SDR using the agile Fobos SDR API.
+Browser-based spectrum and waterfall scanner for RigExpert Fobos SDR using the agile Fobos SDR API, where you can zoom in a million times.
 
 ![Fobos SDR Scanner screenshot](images/screenshot01.png)
 
@@ -17,7 +17,8 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Converter frequency offset for upconverter/downconverter use
 - Waterfall brightness window controls up to `400`
 - Configurable frequency range, sample rate, bandwidth ratio, line-rate limit, and direct sampling mode
-- Single-frequency super-zoom path using CIC decimation and a 65536-point FFT when the visible span is too narrow for a direct FFT
+- Single-frequency super-zoom path using automatic 1024-65536 FFT sizing plus CIC decimation when the visible span is too narrow for a direct FFT
+- Minimum line-rate control for decimated single-stream zoom using FFT-window overlap
 - Editable `bands.ini` spectrum overlays for QO-100 NB/WB transponder ranges
 - Browser status heartbeat that shows `disconnected`, `idle`, or `scanning`
 
@@ -42,7 +43,7 @@ negative converter: receiver = abs(-converter - radio)
 
 Changing the FFT size uses `POST /api/fft`. It updates only backend FFT processing buffers and does not restart `fobos_sdr_start_scan()`, reset zoom, clear the waterfall, or change brightness settings.
 
-When the visible span fits inside one scan point, the backend switches from hardware scan mode to normal single-frequency streaming. At very high zoom it can decimate the continuous I/Q stream with a 3-stage CIC decimator and then run a 65536-point FFT on the decimated data. This improves narrow-span frequency resolution without allocating one huge USB transfer buffer. In single-frequency mode the receiver center is shifted outside the visible span when possible, which moves the normal I/Q zero-frequency dip away from the middle of the screen.
+When the visible span fits inside one scan point, the backend switches from hardware scan mode to normal single-frequency streaming. It chooses the smallest useful power-of-two FFT from `1024` through `65536`; at very high zoom it decimates the continuous I/Q stream with a 3-stage CIC decimator instead of using larger FFTs. This improves narrow-span frequency resolution without allocating one huge USB transfer buffer. In single-frequency mode the receiver center is shifted outside the visible span when possible, which moves the normal I/Q zero-frequency dip away from the middle of the screen.
 
 Band overlays are loaded from:
 
