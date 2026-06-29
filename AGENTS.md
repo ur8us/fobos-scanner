@@ -98,7 +98,7 @@ The frontend uses peak-per-pixel reduction when more FFT bins exist than canvas 
 
 ## Frontend Behavior
 
-- Shift + mouse wheel zooms the spectrum/waterfall horizontally around the cursor.
+- Shift + wheel zooms the spectrum/waterfall horizontally around the cursor.
 - Holding Shift changes the spectrum/waterfall cursor to zoom mode.
 - Frequency markers open with Shift + left-click, or Ctrl/Alt + right-click. Do not use Shift + right-click for marker editing; Firefox reserves that shortcut for its native context menu and page JavaScript cannot suppress it reliably.
 - Frequency scale, hover frequency, and hover level must use the current zoomed view.
