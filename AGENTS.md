@@ -44,6 +44,28 @@ The backend should not auto-start a scan immediately after the server banner. Th
 
 `/api/fft` is for FFT-size changes only. It must not call `start_scan()`, must not call `fobos_sdr_start_scan()`, and must not reset frontend zoom, waterfall history, or brightness settings. The scan worker notices `g_fft_generation`, swaps FFT buffers, drops the partial mixed-size row, and continues processing the current hardware scan.
 
+## Backend/Frontend Traffic
+
+Live display data flows over `GET /api/waterfall` as Server-Sent Events. Each event is named `line` and contains JSON metadata plus a `d` array of `display_bins` unsigned 8-bit magnitudes encoded as decimal JSON numbers. The frontend uses that row for both the latest spectrum trace and one waterfall row.
+
+The backend must reduce processed FFT/source bins to exactly `display_bins` values before sending. Do not send all FFT bins unless the frontend protocol and traffic budget are deliberately redesigned.
+
+The `traffic_kbytes_s` value reported by `/api/status` is measured from actual bytes successfully written by `sse_broadcast()` over the recent traffic window. It is aggregate SSE payload traffic across connected clients. It does not include most `/api/status` polling, control POSTs, static files, or browser/TCP/IP framing overhead.
+
+Per-line SSE traffic is:
+
+```text
+B_line = H + (N - 1) + sum(digits(v_i), i = 0..N-1)
+```
+
+Where `N = display_bins`, `v_i` are values in `d`, and `H` is fixed SSE/JSON metadata overhead for the line. For one browser:
+
+```text
+T_sse_kbytes_per_sec = R * B_line / 1024
+```
+
+For multiple connected browser tabs, multiply by the number of clients. Use this formula for estimates, but use the measured `traffic_kbytes_s` field when describing what the program currently sends.
+
 ## Frequency Rules
 
 Frontend frequencies are air/signal frequencies. The backend converts them to receiver frequencies only immediately before programming the SDR.
