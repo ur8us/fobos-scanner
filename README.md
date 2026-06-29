@@ -11,12 +11,14 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Hardware-assisted frequency scanning through `fobos_sdr_start_scan()`
 - Live spectrum and top-to-bottom waterfall display
 - Shift + mouse wheel zoom for the spectrum and waterfall
+- Saved zoom window restored on reload/autostart; pressing Start resets to the full band
 - Hover readout for air frequency, receiver frequency when a converter is set, and spectrum level
 - Adjustable LNA/VGA gain while scanning
 - Converter frequency offset for upconverter/downconverter use
 - Waterfall brightness window controls up to `400`
-- Configurable frequency range, sample rate, bandwidth ratio, FFT size, and direct sampling mode
-- FFT sizes from `1024` to `65536`, adjustable while scanning without restarting the hardware scan
+- Configurable frequency range, sample rate, bandwidth ratio, line-rate limit, and direct sampling mode
+- Single-frequency super-zoom path using CIC decimation and a 65536-point FFT when the visible span is too narrow for a direct FFT
+- Editable `bands.ini` spectrum overlays for QO-100 NB/WB transponder ranges
 - Browser status heartbeat that shows `disconnected`, `idle`, or `scanning`
 
 ## Operation
@@ -39,6 +41,16 @@ negative converter: receiver = abs(-converter - radio)
 ```
 
 Changing the FFT size uses `POST /api/fft`. It updates only backend FFT processing buffers and does not restart `fobos_sdr_start_scan()`, reset zoom, clear the waterfall, or change brightness settings.
+
+When the visible span fits inside one scan point, the backend switches from hardware scan mode to normal single-frequency streaming. At very high zoom it can decimate the continuous I/Q stream with a 3-stage CIC decimator and then run a 65536-point FFT on the decimated data. This improves narrow-span frequency resolution without allocating one huge USB transfer buffer. In single-frequency mode the receiver center is shifted outside the visible span when possible, which moves the normal I/Q zero-frequency dip away from the middle of the screen.
+
+Band overlays are loaded from:
+
+```text
+bands.ini
+```
+
+The file is human editable. Use one section per band with `name`, `start_mhz`, and `end_mhz`.
 
 ## Dependencies
 
@@ -122,3 +134,4 @@ http://localhost:8080
 - FFT size updates live through `POST /api/fft`.
 - Waterfall data is sent as compact `uint8` magnitude rows over Server-Sent Events.
 - FFT magnitudes are Hann-window normalized and compensated to a `1024`-point FFT reference bandwidth so displayed signal levels stay comparable when FFT size changes.
+- Rate limit options are saved in `fobos-scanner.conf`; the default is `20 lines/s`.
