@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/time.h>
+#include <sys/select.h>
 #include <errno.h>
 #include <limits.h>
 #include <fobos_sdr.h>
@@ -82,6 +83,7 @@ static int g_bins_per_step = 512;  /* g_fft_size / 2 */
 static struct fobos_sdr_dev_t *g_dev = NULL;
 static pthread_t g_scan_thread;
 static volatile int g_scanning = 0;
+static volatile int g_scan_thread_joinable = 0;
 typedef enum {
     RUN_MODE_SCAN = 0,
     RUN_MODE_SINGLE = 1
@@ -681,6 +683,85 @@ static void raw_visible_band(double *out_start, double *out_end);
 static void active_scan_band(double *out_start, double *out_end);
 static void send_json_response(int client_fd, int code, const char *reason,
                                const char *cors, const char *body);
+static void load_sample_rates(struct fobos_sdr_dev_t *dev);
+
+static double estimate_frontend_kbytes_s(int display_bins,
+                                         double raw_line_rate,
+                                         int rate_drop_factor)
+{
+    double lines_per_second = raw_line_rate;
+    double bytes_per_line;
+
+    if (rate_drop_factor > 1)
+        lines_per_second /= (double)rate_drop_factor;
+    if (lines_per_second < 0.0)
+        lines_per_second = 0.0;
+
+    /*
+     * Waterfall rows are currently JSON/SSE. Most bins take 2-3 digits plus a
+     * comma, and metadata/event framing is roughly below 1 KiB.
+     */
+    bytes_per_line = 1024.0 + (double)display_bins * 4.0;
+    return (bytes_per_line * lines_per_second) / 1024.0;
+}
+
+static void reset_device_info(void)
+{
+    snprintf(g_hw_rev, sizeof(g_hw_rev), "%s", "unknown");
+    snprintf(g_fw_ver, sizeof(g_fw_ver), "%s", "unknown");
+    snprintf(g_serial, sizeof(g_serial), "%s", "unknown");
+    snprintf(g_manufacturer, sizeof(g_manufacturer), "%s", "unknown");
+    snprintf(g_product, sizeof(g_product), "%s", "unknown");
+    g_sample_rate_count = 0;
+}
+
+static void close_device(void)
+{
+    if (!g_dev)
+        return;
+    fobos_sdr_close(g_dev);
+    g_dev = NULL;
+    reset_device_info();
+}
+
+static int open_first_device(int verbose)
+{
+    int count;
+    int ret;
+
+    if (g_dev)
+        return FOBOS_ERR_OK;
+
+    count = fobos_sdr_get_device_count();
+    if (verbose)
+        printf("[SDR] Devices found: %d\n", count);
+    if (count <= 0) {
+        if (verbose)
+            printf("[SDR] No device connected.\n");
+        return -1;
+    }
+
+    ret = fobos_sdr_open(&g_dev, 0);
+    if (ret != FOBOS_ERR_OK) {
+        if (verbose)
+            printf("[SDR] Could not open device: %d\n", ret);
+        g_dev = NULL;
+        reset_device_info();
+        return ret;
+    }
+
+    ret = fobos_sdr_get_board_info(g_dev, g_hw_rev, g_fw_ver,
+                                   g_manufacturer, g_product, g_serial);
+    if (ret != FOBOS_ERR_OK && verbose)
+        printf("[SDR] Could not read board info: %d\n", ret);
+    load_sample_rates(g_dev);
+    if (verbose) {
+        printf("[SDR] Device: %s %s\n", g_manufacturer, g_product);
+        printf("[SDR]   HW: %s  FW: %s  S/N: %s\n",
+               g_hw_rev, g_fw_ver, g_serial);
+    }
+    return FOBOS_ERR_OK;
+}
 
 /* ------------------------------------------------------------------ */
 /* Hardware scan context                                              */
@@ -1973,8 +2054,9 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
     scan_ctx_t *ctx = (scan_ctx_t *)user;
     int channel;
 
+    (void)dev;
+
     if (!g_scanning) {
-        fobos_sdr_cancel_async(dev);
         return;
     }
 
@@ -2004,6 +2086,7 @@ static void *scan_thread_func(void *arg)
     scan_ctx_t ctx;
     int ret;
     int worker_started = 0;
+    int device_error = 0;
     uint32_t async_len;
     uint32_t line_sample_count;
     single_fft_plan_t single_plan = {0};
@@ -2112,11 +2195,11 @@ static void *scan_thread_func(void *arg)
     worker_started = 1;
 
     ret = fobos_sdr_set_clk_source(g_dev, (int)g_clk_source);
-    if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_clk_source failed: %d\n", ret);
+    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_clk_source failed: %d\n", ret); device_error = 1; }
     ret = fobos_sdr_set_samplerate(g_dev, g_samplerate);
-    if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_samplerate failed: %d\n", ret);
+    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_samplerate failed: %d\n", ret); device_error = 1; }
     ret = fobos_sdr_set_auto_bandwidth(g_dev, g_bw_ratio);
-    if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_auto_bandwidth failed: %d\n", ret);
+    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_auto_bandwidth failed: %d\n", ret); device_error = 1; }
     if (!direct_sampling_enabled()) {
         ret = fobos_sdr_set_lna_gain(g_dev, g_lna_gain);
         if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_lna_gain failed: %d\n", ret);
@@ -2124,7 +2207,7 @@ static void *scan_thread_func(void *arg)
         if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_vga_gain failed: %d\n", ret);
     }
     ret = fobos_sdr_set_direct_sampling(g_dev, direct_sampling_enabled() ? 1 : 0);
-    if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_direct_sampling failed: %d\n", ret);
+    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_direct_sampling failed: %d\n", ret); device_error = 1; }
 
     if (ctx.single_mode) {
         fobos_sdr_stop_scan(g_dev);
@@ -2135,6 +2218,7 @@ static void *scan_thread_func(void *arg)
         }
         if (ret != FOBOS_ERR_OK) {
             fprintf(stderr, "[SDR] set_frequency failed: %d\n", ret);
+            device_error = 1;
             g_scanning = 0;
         }
         if (direct_sampling_enabled()) {
@@ -2161,14 +2245,17 @@ static void *scan_thread_func(void *arg)
         ret = fobos_sdr_start_scan(g_dev, device_freqs, (unsigned int)total_steps);
         if (ret != FOBOS_ERR_OK) {
             fprintf(stderr, "[SDR] fobos_sdr_start_scan failed: %d\n", ret);
+            device_error = 1;
             g_scanning = 0;
         }
     }
 
     if (g_scanning) {
         ret = fobos_sdr_read_async(g_dev, scan_callback, &ctx, 16, async_len);
-        if (ret != FOBOS_ERR_OK && g_scanning)
+        if (ret != FOBOS_ERR_OK && g_scanning) {
             fprintf(stderr, "[SDR] fobos_sdr_read_async failed: %d\n", ret);
+            device_error = 1;
+        }
     }
 
     if (!ctx.single_mode)
@@ -2195,6 +2282,10 @@ static void *scan_thread_func(void *arg)
     free(ctx.fft_scratch);
     free(ctx.decim_accum);
     free(ctx.line_buf);
+    if (device_error) {
+        fprintf(stderr, "[SDR] Closing SDR device after I/O error; will poll for reconnect\n");
+        close_device();
+    }
     printf("[SDR] Scan thread stopped\n");
     return NULL;
 }
@@ -2213,12 +2304,12 @@ static int start_scan(void)
     run_mode_t mode;
 
     /* If already scanning, restart with new params */
-    if (g_scanning) {
+    if (g_scan_thread_joinable) {
         g_scanning = 0;
-        fobos_sdr_cancel_async(g_dev);
+        if (g_dev)
+            fobos_sdr_cancel_async(g_dev);
         pthread_join(g_scan_thread, NULL);
-        if (g_active_mode == RUN_MODE_SCAN)
-            fobos_sdr_stop_scan(g_dev);
+        g_scan_thread_joinable = 0;
     }
 
     mode = planned_run_mode();
@@ -2240,25 +2331,26 @@ static int start_scan(void)
         if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) return -1;
     }
 
-    if (!g_dev) {
-        if (fobos_sdr_get_device_count() <= 0) return -1;
-        if (fobos_sdr_open(&g_dev, 0) != FOBOS_ERR_OK) return -1;
-    }
+    if (!g_dev && open_first_device(0) != FOBOS_ERR_OK)
+        return -1;
 
     g_scanning = 1;
     if (pthread_create(&g_scan_thread, NULL, scan_thread_func, NULL) != 0) {
         g_scanning = 0;
         return -1;
     }
+    g_scan_thread_joinable = 1;
     return 0;
 }
 
 static void stop_scan(void)
 {
-    if (!g_scanning) return;
+    if (!g_scan_thread_joinable) return;
     g_scanning = 0;
-    fobos_sdr_cancel_async(g_dev);
+    if (g_dev)
+        fobos_sdr_cancel_async(g_dev);
     pthread_join(g_scan_thread, NULL);
+    g_scan_thread_joinable = 0;
 }
 
 static int apply_gain_settings(void)
@@ -2445,6 +2537,7 @@ static void handle_request(int client_fd, const char *req)
         double overlap_factor = current_overlap_factor();
         uint32_t line_sample_count;
         double raw_line_rate = 0.0;
+        double traffic_kbytes_s;
         int rate_drop_factor;
 
         if (mode == RUN_MODE_SINGLE) {
@@ -2471,6 +2564,8 @@ static void handle_request(int client_fd, const char *req)
                                                      total_steps,
                                                      g_rate_limit_lps,
                                                      &raw_line_rate);
+        traffic_kbytes_s = estimate_frontend_kbytes_s(display_bins, raw_line_rate,
+                                                      rate_drop_factor);
         format_sample_rates_json(sample_rates, sizeof(sample_rates));
 
         int n = snprintf(body, sizeof(body),
@@ -2487,6 +2582,7 @@ static void handle_request(int client_fd, const char *req)
             "\"required_points\":%d,\"mode\":\"%s\",\"active_mode\":\"%s\","
             "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
             "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+            "\"traffic_kbytes_s\":%.1f,"
             "\"bins_per_step\":%d,\"line_bins\":%d,\"display_bins\":%d,"
             "\"view_id\":%u,\"fft_size\":%d,\"effective_fft_size\":%d,"
             "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
@@ -2507,6 +2603,7 @@ static void handle_request(int client_fd, const char *req)
             step, total_steps,
             required_points, run_mode_name(mode), run_mode_name(g_active_mode),
             g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
+            traffic_kbytes_s,
             bins_per_step, line_bins, display_bins,
             g_view_id, current_fft_size(), effective_fft,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
@@ -2657,6 +2754,9 @@ static void handle_request(int client_fd, const char *req)
                                                          total_steps,
                                                          g_rate_limit_lps,
                                                          &raw_line_rate);
+        double traffic_kbytes_s = estimate_frontend_kbytes_s(current_display_bins(),
+                                                             raw_line_rate,
+                                                             rate_drop_factor);
         char json_body[1536];
         snprintf(json_body, sizeof(json_body),
             "{\"status\":\"%s\",\"freq_start\":%.0f,\"freq_end\":%.0f,"
@@ -2666,6 +2766,7 @@ static void handle_request(int client_fd, const char *req)
             "\"required_points\":%d,\"mode\":\"%s\","
             "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
             "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+            "\"traffic_kbytes_s\":%.1f,"
             "\"display_bins\":%d,\"view_id\":%u,\"effective_fft_size\":%d,"
             "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
             "\"effective_input_samples\":%u,\"direct_sampling\":%u,"
@@ -2678,6 +2779,7 @@ static void handle_request(int client_fd, const char *req)
             g_converter_freq, total_steps, step,
             planned_required_points(), run_mode_name(mode),
             g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
+            traffic_kbytes_s,
             current_display_bins(), g_view_id, effective_fft,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
             g_direct_sampling, g_clk_source, g_samplerate, g_bw_ratio,
@@ -2763,6 +2865,9 @@ static void handle_request(int client_fd, const char *req)
                                                              total_steps,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
+            double traffic_kbytes_s = estimate_frontend_kbytes_s(current_display_bins(),
+                                                                 raw_line_rate,
+                                                                 rate_drop_factor);
             char json_body[1536];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"view_id\":%u,"
@@ -2773,6 +2878,7 @@ static void handle_request(int client_fd, const char *req)
                 "\"required_points\":%d,\"mode\":\"%s\","
                 "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+                "\"traffic_kbytes_s\":%.1f,"
                 "\"effective_fft_size\":%d,\"decim_factor\":%d,"
                 "\"decim_hop\":%d,\"overlap_factor\":%.3f,"
                 "\"effective_input_samples\":%u,\"scanning\":%d,"
@@ -2785,6 +2891,7 @@ static void handle_request(int client_fd, const char *req)
                 total_steps, step, current_display_bins(),
                 planned_required_points(), run_mode_name(mode),
                 g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
+                traffic_kbytes_s,
                 effective_fft, decim_factor, decim_hop, overlap_factor, line_sample_count,
                 g_scanning, g_direct_sampling, g_clk_source,
                 direct_sampling_max_hz());
@@ -2910,16 +3017,21 @@ static void handle_request(int client_fd, const char *req)
                                                              total_steps,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
+            double traffic_kbytes_s = estimate_frontend_kbytes_s(current_display_bins(),
+                                                                 raw_line_rate,
+                                                                 rate_drop_factor);
             char json_body[768];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+                "\"traffic_kbytes_s\":%.1f,"
                 "\"mode\":\"%s\",\"effective_fft_size\":%d,"
                 "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
                 "\"effective_input_samples\":%u,"
                 "\"scanning\":%d}",
                 (ret == 0) ? "ok" : "error",
                 g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
+                traffic_kbytes_s,
                 run_mode_name(mode), effective_fft,
                 decim_factor, decim_hop, overlap_factor, line_sample_count,
                 g_scanning);
@@ -2967,15 +3079,20 @@ static void handle_request(int client_fd, const char *req)
                                                              total_steps,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
+            double traffic_kbytes_s = estimate_frontend_kbytes_s(current_display_bins(),
+                                                                 raw_line_rate,
+                                                                 rate_drop_factor);
             char json_body[768];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"min_rate_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+                "\"traffic_kbytes_s\":%.1f,"
                 "\"mode\":\"%s\",\"effective_fft_size\":%d,"
                 "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
                 "\"effective_input_samples\":%u,\"scanning\":%d}",
                 (ret == 0) ? "ok" : "error",
                 g_min_rate_lps, rate_drop_factor, raw_line_rate,
+                traffic_kbytes_s,
                 run_mode_name(mode), effective_fft,
                 decim_factor, decim_hop, overlap_factor,
                 line_sample_count, g_scanning);
@@ -3048,6 +3165,29 @@ static int create_http_server_socket(void)
     return -1;
 }
 
+static long long now_msec(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000LL + (long long)tv.tv_usec / 1000LL;
+}
+
+static void poll_device_reconnect(void)
+{
+    static long long last_poll = 0;
+    long long now = now_msec();
+
+    if (g_dev || g_scanning || now - last_poll < 5000)
+        return;
+
+    last_poll = now;
+    if (open_first_device(0) == FOBOS_ERR_OK) {
+        printf("[SDR] Device reconnected: %s %s\n", g_manufacturer, g_product);
+        printf("[SDR]   HW: %s  FW: %s  S/N: %s\n",
+               g_hw_rev, g_fw_ver, g_serial);
+    }
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -3067,24 +3207,7 @@ int main(int argc, char **argv)
         fobos_sdr_get_api_info(lib_ver, drv_ver);
         printf("[SDR] API: %s (drv: %s)\n", lib_ver, drv_ver);
 
-        int count = fobos_sdr_get_device_count();
-        printf("[SDR] Devices found: %d\n", count);
-
-        if (count > 0) {
-            int ret = fobos_sdr_open(&g_dev, 0);
-            if (ret == FOBOS_ERR_OK) {
-                fobos_sdr_get_board_info(g_dev, g_hw_rev, g_fw_ver,
-                                         g_manufacturer, g_product, g_serial);
-                load_sample_rates(g_dev);
-                printf("[SDR] Device: %s %s\n", g_manufacturer, g_product);
-                printf("[SDR]   HW: %s  FW: %s  S/N: %s\n",
-                       g_hw_rev, g_fw_ver, g_serial);
-            } else {
-                printf("[SDR] Could not open device: %d\n", ret);
-            }
-        } else {
-            printf("[SDR] No device connected.\n");
-        }
+        open_first_device(1);
     }
 
     int server_fd = create_http_server_socket();
@@ -3114,7 +3237,26 @@ int main(int argc, char **argv)
     while (!g_exit) {
         struct sockaddr_storage client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        fd_set readfds;
+        struct timeval wait_to;
+        int ready;
+        int client_fd;
+
+        poll_device_reconnect();
+
+        FD_ZERO(&readfds);
+        FD_SET(server_fd, &readfds);
+        wait_to.tv_sec = 1;
+        wait_to.tv_usec = 0;
+        ready = select(server_fd + 1, &readfds, NULL, NULL, &wait_to);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            perror("select"); break;
+        }
+        if (ready == 0)
+            continue;
+
+        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
             perror("accept"); break;

@@ -344,6 +344,13 @@
             .marker-dialog.open {
                 display: block;
             }
+            .marker-dialog-title {
+                margin: 0 0 10px 0;
+                color: #d8e0e8;
+                font-size: 13px;
+                font-weight: 500;
+                letter-spacing: 0.5px;
+            }
             .marker-dialog label {
                 display: block;
                 margin: 0 0 7px 0;
@@ -384,9 +391,11 @@
                 <span>FW: <span class="val" id="infoFw">---</span></span>
                 <span>S/N: <span class="val" id="infoSn">---</span></span>
                 <span>Zoom (press SHIFT): <span class="val" id="infoZoom">1.00x</span></span>
+                <span>Markers (press SHIFT): <span class="val" id="infoMarkers">0</span></span>
                 <span>Shown: <span class="val" id="infoRange">---</span></span>
-                <span>FFT: <span class="val" id="infoFFT">---</span></span>
                 <span>SCAN: <span class="val" id="infoScan">---</span></span>
+                <span>FFT: <span class="val" id="infoFFT">---</span></span>
+                <span>Traffic: <span class="val" id="infoTraffic">---</span></span>
                 <span class="view-buttons">
                     <button class="mini-btn" id="panLeft" title="Pan left">Left</button>
                     <button class="mini-btn" id="zoomOut" title="Zoom out">-</button>
@@ -568,6 +577,7 @@
             </div>
             <div class="hover-readout" id="hoverReadout"></div>
             <div class="marker-dialog" id="markerDialog">
+                <div class="marker-dialog-title">Add/edit marker</div>
                 <label>
                     Name
                     <input type="text" id="markerName" autocomplete="off" />
@@ -1504,11 +1514,17 @@
                 };
             }
 
+            function updateMarkerCount() {
+                const el = document.getElementById("infoMarkers");
+                if (el) el.textContent = String(markers.length);
+            }
+
             async function loadMarkers() {
                 const data = await apiGet("/api/markers");
                 if (!data || data.status !== "ok") {
                     markers = [];
                     markerGroups = ["Ungrouped"];
+                    updateMarkerCount();
                     return;
                 }
                 markers = (data.markers || [])
@@ -1524,6 +1540,7 @@
                     if (!markerGroups.includes(marker.group))
                         markerGroups.push(marker.group);
                 }
+                updateMarkerCount();
                 if (currentBins && currentBins.length) {
                     drawScope(
                         currentBins,
@@ -1715,6 +1732,7 @@
                         frequency_hz: freqHz,
                     });
                 }
+                updateMarkerCount();
                 closeMarkerDialog();
                 await saveMarkers();
                 if (currentBins && currentBins.length)
@@ -1729,6 +1747,7 @@
             async function deleteMarkerDialog() {
                 if (!markerDialogTarget) return;
                 markers = markers.filter((marker) => marker !== markerDialogTarget);
+                updateMarkerCount();
                 closeMarkerDialog();
                 await saveMarkers();
                 if (currentBins && currentBins.length)
@@ -1741,6 +1760,7 @@
             }
 
             function handleMarkerContextMenu(canvas, evt) {
+                if (!evt.shiftKey) return;
                 evt.preventDefault();
                 const freq = frequencyAt(canvas, evt.clientX);
                 if (freq === null) return;
@@ -2745,6 +2765,16 @@
             }
 
             window.addEventListener("keydown", (evt) => {
+                const markerDialog = document.getElementById("markerDialog");
+                if (
+                    evt.key === "Escape" &&
+                    markerDialog &&
+                    markerDialog.classList.contains("open")
+                ) {
+                    evt.preventDefault();
+                    closeMarkerDialog();
+                    return;
+                }
                 if (evt.key === "Shift") setZoomCursor(true);
                 if (isEditingElement(evt.target)) return;
                 if (evt.key === "+" || evt.key === "=") {
@@ -3014,7 +3044,18 @@
                 el.textContent =
                     mode === "scan" && steps >= 2
                         ? steps + " steps"
-                        : "Continuous";
+                        : "Fixed";
+            }
+
+            function updateTrafficInfo(plan) {
+                const el = document.getElementById("infoTraffic");
+                if (!el || !plan || plan.traffic_kbytes_s === undefined) return;
+                const value = Number(plan.traffic_kbytes_s);
+                if (!Number.isFinite(value)) return;
+                el.textContent =
+                    value < 100
+                        ? value.toFixed(1) + " kB/s"
+                        : Math.round(value) + " kB/s";
             }
 
             function updateFFTInfo(plan) {
@@ -3034,6 +3075,7 @@
                 if (!fft) return;
                 fftInfo.textContent = decim > 1 ? fft + " x" + decim : String(fft);
                 updateScanInfo(plan);
+                updateTrafficInfo(plan);
             }
 
             // ===================================================================
