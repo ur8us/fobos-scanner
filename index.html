@@ -646,7 +646,8 @@
             let waterfallRenderActiveToken = 0;
             let binRangeCache = null;
             let zoomWheelFrame = 0;
-            let zoomWheelDelta = 0;
+            let zoomWheelSteps = 0;
+            let zoomWheelDirection = 0;
             let zoomWheelCanvas = null;
             let zoomWheelClientX = 0;
             const MAX_ZOOM_FACTOR = 1000000;
@@ -2517,11 +2518,12 @@
                 .getElementById("markerDelete")
                 .addEventListener("click", deleteMarkerDialog);
 
-            function applyZoomAtCursor(canvas, clientX, deltaY) {
+            function applyZoomStepsAtCursor(canvas, clientX, signedSteps) {
                 if (!canvas || !hasFrequencyWindow()) return;
 
                 const rect = canvas.getBoundingClientRect();
                 if (rect.width <= 0) return;
+                if (!Number.isFinite(signedSteps) || signedSteps === 0) return;
 
                 const cursor = Math.max(
                     0,
@@ -2535,13 +2537,10 @@
 
                 const currentSpan = currentFreq1 - currentFreq0;
                 const anchor = currentFreq0 + cursor * currentSpan;
-                const steps = Math.max(
-                    1,
-                    Math.min(6, Math.round(Math.abs(deltaY) / 80)),
-                );
+                const steps = Math.max(1, Math.min(8, Math.abs(signedSteps)));
                 const factorPerStep = 1.18;
                 const factor =
-                    deltaY < 0
+                    signedSteps < 0
                         ? Math.pow(1 / factorPerStep, steps)
                         : Math.pow(factorPerStep, steps);
                 const minSpan = Math.max(1, fullSpan / MAX_ZOOM_FACTOR);
@@ -2576,6 +2575,21 @@
                     formatScanRange(currentFreq0, currentFreq1);
                 saveVisibleView();
                 scheduleViewUpdate(left, right, true);
+            }
+
+            function wheelZoomStep(evt) {
+                const delta = evt.deltaY;
+                if (!Number.isFinite(delta) || delta === 0) return 0;
+
+                let unit = 80;
+                if (evt.deltaMode === WheelEvent.DOM_DELTA_LINE) unit = 3;
+                else if (evt.deltaMode === WheelEvent.DOM_DELTA_PAGE) unit = 1;
+
+                const steps = Math.max(
+                    1,
+                    Math.min(4, Math.round(Math.abs(delta) / unit)),
+                );
+                return (delta < 0 ? -1 : 1) * steps;
             }
 
             function applyVisibleWindow(left, right) {
@@ -2638,11 +2652,14 @@
             function flushZoomWheel() {
                 const canvas = zoomWheelCanvas;
                 const clientX = zoomWheelClientX;
-                const delta = Math.max(-480, Math.min(480, zoomWheelDelta));
+                const signedSteps =
+                    zoomWheelDirection * Math.max(1, Math.min(8, zoomWheelSteps));
                 zoomWheelFrame = 0;
-                zoomWheelDelta = 0;
+                zoomWheelSteps = 0;
+                zoomWheelDirection = 0;
                 zoomWheelCanvas = null;
-                if (delta !== 0) applyZoomAtCursor(canvas, clientX, delta);
+                if (signedSteps !== 0)
+                    applyZoomStepsAtCursor(canvas, clientX, signedSteps);
             }
 
             function handleZoomWheel(evt) {
@@ -2651,9 +2668,13 @@
                 }
 
                 evt.preventDefault();
-                const delta = Math.max(-240, Math.min(240, evt.deltaY || 0));
-                if (delta === 0) return;
-                zoomWheelDelta += delta;
+                const signedStep = wheelZoomStep(evt);
+                if (signedStep === 0) return;
+                const direction = signedStep < 0 ? -1 : 1;
+                if (zoomWheelFrame && zoomWheelDirection && direction !== zoomWheelDirection)
+                    return;
+                zoomWheelDirection = direction;
+                zoomWheelSteps = Math.min(8, zoomWheelSteps + Math.abs(signedStep));
                 zoomWheelCanvas = evt.currentTarget;
                 zoomWheelClientX = evt.clientX;
                 if (!zoomWheelFrame)

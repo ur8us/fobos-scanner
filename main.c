@@ -60,6 +60,7 @@
 #define CIC_STAGES          3
 #define FFT_LEVEL_REF_SIZE  FFT_SIZE_MIN
 #define FFTS_PER_STEP       32
+#define SCAN_FFTS_PER_STEP  1
 #define SCAN_BUF_LEN        65536
 #define PROCESS_QUEUE_LEN   8
 #define DIRECT_SAMPLING_RATE_HZ 50.0e6
@@ -110,7 +111,7 @@ static double g_visible_start = MIN_FREQ_START_HZ;
 static double g_visible_end   = 2000.0e6;
 static double g_converter_freq = 0.0;
 static double g_samplerate   = 50.0e6;
-static double g_bw_ratio     = 0.8;
+static double g_bw_ratio     = 0.1;
 static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 0;
 static uint32_t g_rate_limit_lps = 20;
@@ -853,7 +854,10 @@ typedef struct {
     int rate_drop_factor;
     int rate_drop_cycle;
     int rate_have_cycle;
+    int max_ffts_per_buffer;
     uint32_t rate_limit_lps;
+    double rate_keep_ratio;
+    double rate_keep_credit;
     double estimated_line_rate;
     uint64_t rate_callback_seq;
     uint64_t rate_scan_cycle_seq;
@@ -1384,7 +1388,14 @@ static int rate_drop_factor_for_plan(double samplerate, uint32_t async_len,
         return 1;
 
     limit_lps = normalize_rate_limit_lps(limit_lps);
-    buffers_per_second = samplerate / (double)async_len;
+    /*
+     * The Fobos callback buffer contains interleaved I/Q floats. Fixed mode
+     * line timing follows samplerate / (2 * requested_length). Agile hardware
+     * scan cycles complete at half that line cadence, so scan mode uses an
+     * extra factor of two for rate limiting and status estimates.
+     */
+    buffers_per_second = samplerate /
+        ((double)async_len * (total_steps > 1 ? 4.0 : 2.0));
     lines_per_second = buffers_per_second / (double)total_steps;
     if (out_line_rate)
         *out_line_rate = lines_per_second;
@@ -1395,6 +1406,14 @@ static int rate_drop_factor_for_plan(double samplerate, uint32_t async_len,
     if (factor < 1)
         factor = 1;
     return factor;
+}
+
+static double rate_keep_ratio_for_line_rate(double line_rate, uint32_t limit_lps)
+{
+    limit_lps = normalize_rate_limit_lps(limit_lps);
+    if (line_rate <= 0.0 || line_rate <= (double)limit_lps)
+        return 1.0;
+    return (double)limit_lps / line_rate;
 }
 
 static int scan_bins_per_step_for_width_and_fft(double width, int fft_size)
@@ -1503,6 +1522,7 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         ctx->selected_fft_size = fft_size;
         decim_factor = 1;
         decim_hop = fft_size;
+        ctx->max_ffts_per_buffer = ctx->single_mode ? FFTS_PER_STEP : SCAN_FFTS_PER_STEP;
         fft_samplerate = ctx->raw_samplerate > 0.0 ? ctx->raw_samplerate : ctx->samplerate;
         fft_ratio = ctx->bw_ratio;
         step_width = ctx->step_width;
@@ -1631,14 +1651,17 @@ static uint32_t current_fft_generation(void)
 static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step,
                                  int fft_size, const float *window,
                                  float *local_fft, float mag_scale,
-                                 int positive_half, float *out)
+                                 int positive_half, int max_ffts, float *out)
 {
     int fft_count = 0;
     int shifted_start = (fft_size - bins_per_step) / 2;
 
     memset(out, 0, (size_t)bins_per_step * sizeof(float));
 
-    for (uint32_t pos = 0; pos + (uint32_t)fft_size <= buf_len && fft_count < FFTS_PER_STEP; pos += (uint32_t)fft_size) {
+    if (max_ffts < 1)
+        max_ffts = 1;
+
+    for (uint32_t pos = 0; pos + (uint32_t)fft_size <= buf_len && fft_count < max_ffts; pos += (uint32_t)fft_size) {
         for (int i = 0; i < fft_size; i++) {
             float w = window[i];
             local_fft[2*i]   = buf[2*(pos+i)]   * w;
@@ -1721,6 +1744,7 @@ static int cic_decimated_fft_magnitude(scan_ctx_t *ctx, float *buf,
     if (decim <= 1 || !ctx->decim_accum)
         return average_fft_magnitude(buf, buf_len, bins_per_step, ctx->fft_size,
                                      ctx->window, ctx->fft_scratch, ctx->mag_scale, 0,
+                                     ctx->max_ffts_per_buffer,
                                      out);
 
     gain = pow((double)decim, (double)CIC_STAGES);
@@ -1881,17 +1905,24 @@ static void publish_scan_line(scan_ctx_t *ctx)
 
 static int should_publish_processed_line(scan_ctx_t *ctx)
 {
-    int factor = ctx->rate_drop_factor;
-    uint64_t seq;
+    (void)ctx;
+    return 1;
+}
 
-    if (!ctx->single_mode || ctx->decim_factor <= 1 || factor <= 1)
+static int rate_limiter_should_keep(scan_ctx_t *ctx)
+{
+    double ratio = ctx->rate_keep_ratio;
+
+    if (ratio <= 0.0 || ratio >= 0.999999)
         return 1;
 
-    seq = ctx->rate_output_seq++;
-    if ((seq % (uint64_t)factor) == 0)
+    ctx->rate_keep_credit += ratio;
+    if (ctx->rate_keep_credit >= 1.0) {
+        ctx->rate_keep_credit -= 1.0;
+        if (ctx->rate_keep_credit > 1.0)
+            ctx->rate_keep_credit = fmod(ctx->rate_keep_credit, 1.0);
         return 1;
-
-    ctx->rate_output_dropped++;
+    }
     return 0;
 }
 
@@ -1922,6 +1953,7 @@ static void process_scan_buffer(scan_ctx_t *ctx, float *buf, uint32_t buf_len, i
         if (average_fft_magnitude(buf, buf_len, channel_bins, ctx->fft_size,
                                   ctx->window, ctx->fft_scratch, ctx->mag_scale,
                                   ctx->direct_sampling != 0 && ctx->decim_factor <= 1,
+                                  ctx->max_ffts_per_buffer,
                                   slot) <= 0)
             return;
     }
@@ -2124,15 +2156,12 @@ static void *scan_worker_thread(void *arg)
 
 static int scan_callback_should_process(scan_ctx_t *ctx, int channel)
 {
-    int factor = ctx->rate_drop_factor;
-    if (factor <= 1)
-        return 1;
-    if (ctx->single_mode && ctx->decim_factor > 1)
+    if (ctx->rate_keep_ratio >= 0.999999)
         return 1;
 
     if (ctx->single_mode) {
-        uint64_t seq = ctx->rate_callback_seq++;
-        if ((seq % (uint64_t)factor) == 0)
+        ctx->rate_callback_seq++;
+        if (rate_limiter_should_keep(ctx))
             return 1;
         ctx->rate_dropped++;
         return 0;
@@ -2141,7 +2170,8 @@ static int scan_callback_should_process(scan_ctx_t *ctx, int channel)
     if (channel == 0) {
         uint64_t seq = ctx->rate_scan_cycle_seq++;
         ctx->rate_have_cycle = 1;
-        ctx->rate_drop_cycle = ((seq % (uint64_t)factor) != 0);
+        (void)seq;
+        ctx->rate_drop_cycle = !rate_limiter_should_keep(ctx);
     } else if (!ctx->rate_have_cycle) {
         ctx->rate_drop_cycle = 0;
     }
@@ -2305,6 +2335,9 @@ static void *scan_thread_func(void *arg)
                                                      ctx.total_steps,
                                                      ctx.rate_limit_lps,
                                                      &ctx.estimated_line_rate);
+    ctx.rate_keep_ratio = rate_keep_ratio_for_line_rate(ctx.estimated_line_rate,
+                                                        ctx.rate_limit_lps);
+    ctx.rate_keep_credit = 1.0;
     if (scan_queue_init(&ctx, async_len) != 0) {
         fprintf(stderr, "[SDR] Out of memory\n");
         free(ctx.window);
