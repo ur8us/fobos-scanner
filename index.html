@@ -683,6 +683,7 @@
             let markerGroups = ["Ungrouped"];
             let markerHitBoxes = [];
             let markerDialogTarget = null;
+            let markerContextSuppressUntil = 0;
             let waterfallAuto = false;
             let autoWfMin = null;
             let autoWfMax = null;
@@ -1827,13 +1828,30 @@
                     );
             }
 
-            function handleMarkerContextMenu(canvas, evt) {
-                if (!evt.shiftKey) return;
+            function openMarkerDialogFromEvent(canvas, evt) {
                 evt.preventDefault();
+                evt.stopPropagation();
                 const freq = frequencyAt(canvas, evt.clientX);
-                if (freq === null) return;
+                if (freq === null) return false;
                 const marker = nearestMarkerAtCanvas(canvas, evt.clientX);
                 openMarkerDialog(marker, freq, evt.clientX, evt.clientY);
+                return true;
+            }
+
+            function handleMarkerPointerDown(canvas, evt) {
+                if (!evt.shiftKey || evt.button !== 2) return;
+                if (openMarkerDialogFromEvent(canvas, evt))
+                    markerContextSuppressUntil = Date.now() + 800;
+            }
+
+            function handleMarkerContextMenu(canvas, evt) {
+                if (Date.now() < markerContextSuppressUntil) {
+                    evt.preventDefault();
+                    evt.stopPropagation();
+                    return;
+                }
+                if (!evt.shiftKey) return;
+                openMarkerDialogFromEvent(canvas, evt);
             }
 
             function subdivisionCountForStep(step) {
@@ -2587,6 +2605,10 @@
             const hoverReadout = document.getElementById("hoverReadout");
 
             function showHoverReadout(canvas, evt, includeLevel) {
+                if (panActive) {
+                    hoverReadout.style.display = "none";
+                    return;
+                }
                 if (!hasFrequencyWindow()) {
                     hoverReadout.style.display = "none";
                     return;
@@ -2663,6 +2685,12 @@
             );
             wfCanvas.addEventListener("mouseleave", hideHoverReadout);
             scCanvas.addEventListener("mouseleave", hideHoverReadout);
+            wfCanvas.addEventListener("pointerdown", (evt) =>
+                handleMarkerPointerDown(wfCanvas, evt),
+            );
+            scCanvas.addEventListener("pointerdown", (evt) =>
+                handleMarkerPointerDown(scCanvas, evt),
+            );
             wfCanvas.addEventListener("contextmenu", (evt) =>
                 handleMarkerContextMenu(wfCanvas, evt),
             );
@@ -2763,6 +2791,7 @@
 
             function applyVisibleWindow(left, right) {
                 if (!hasFrequencyWindow()) return;
+                hideHoverReadout();
                 const full = primaryFrequencyWindow();
                 const clamped = clampVisibleWindow(
                     left,
@@ -2899,6 +2928,7 @@
             function startPan(evt) {
                 if (evt.button !== 0 || evt.shiftKey) return;
                 if (!hasFrequencyWindow()) return;
+                hideHoverReadout();
 
                 const full = primaryFrequencyWindow();
                 const fullStart = full.left;
