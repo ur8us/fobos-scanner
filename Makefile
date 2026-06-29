@@ -4,17 +4,23 @@ LDFLAGS = -L../libfobos-sdr-agile/build-local -L../local-agile/lib
 LIBS = -lfobos_sdr -lusb-1.0 -lm -pthread
 INCS = -I../libfobos-sdr-agile -I../libfobos-sdr-agile/fobos -I../local-agile/include
 
-TARGET = fobos-scanner
+TARGETS = fobos-scanner fobos-stream-test
 
-.PHONY: all clean run
+.PHONY: all clean run stream-test
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): main.c
+fobos-scanner: main.c
 	$(CC) $(CFLAGS) $(INCS) -o $@ $< $(LDFLAGS) $(LIBS)
 
-run: $(TARGET)
-	LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./$(TARGET)
+fobos-stream-test: fobos_stream_test.c
+	$(CC) $(CFLAGS) $(INCS) -o $@ $< $(LDFLAGS) $(LIBS)
+
+run: fobos-scanner
+	LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./fobos-scanner
+
+stream-test: fobos-stream-test
+	LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./fobos-stream-test
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)

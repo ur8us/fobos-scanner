@@ -1,4 +1,5 @@
 fobos-scanner
+fobos-stream-test
 *.o
 *.so
 *.a

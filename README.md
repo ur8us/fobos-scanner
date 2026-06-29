@@ -98,6 +98,7 @@ This produces:
 
 ```text
 ./fobos-scanner
+./fobos-stream-test
 ```
 
 To remove the built binary:
@@ -124,6 +125,45 @@ Then open:
 
 ```text
 http://localhost:8080
+```
+
+## Stream Integrity Test
+
+`fobos-stream-test` is a standalone receiver stream health checker. It opens the Fobos SDR in normal single-frequency async streaming mode, runs for a fixed time, and reports callback timing, inferred missing buffers, buffer length changes, repeated buffer signatures, non-finite samples, clipping, RMS/DC levels, boundary jumps, and observed sample throughput.
+
+The Fobos agile public callback does not expose hardware sequence numbers, so missing/out-of-order buffers are inferred from callback cadence and timing gaps rather than from explicit buffer IDs.
+
+Run with defaults, `100 MHz`, `50 MHz` sample rate, and `10` seconds:
+
+```sh
+LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./fobos-stream-test
+```
+
+Or use the Makefile wrapper:
+
+```sh
+make stream-test
+```
+
+Example custom run:
+
+```sh
+LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./fobos-stream-test --freq-mhz 315 --samplerate 50M --seconds 60
+```
+
+Useful options:
+
+```text
+--freq-mhz MHz
+--freq-hz HZ
+--samplerate HZ
+--seconds SEC
+--buf-len complex_samples
+--buf-count N
+--bw-ratio R
+--lna N
+--vga N
+--clock internal|external
 ```
 
 ## Notes

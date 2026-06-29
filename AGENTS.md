@@ -6,12 +6,18 @@
 
 - `main.c` starts an HTTP server on port `8080`, serves `index.html`, exposes JSON API endpoints, and streams scan lines to the browser over Server-Sent Events.
 - `index.html` owns the frontend controls, spectrum canvas, waterfall canvas, hover readout, and scan parameter requests.
-- `Makefile` builds one binary, `fobos-scanner`, against the agile Fobos SDR library and `libusb`.
+- `Makefile` builds `fobos-scanner` and the standalone `fobos-stream-test` utility against the agile Fobos SDR library and `libusb`.
 - `run.sh` starts the binary with the local agile library paths in `LD_LIBRARY_PATH`.
 - `fobos-scanner.conf` is a local runtime config file and should stay untracked.
 - `scanner-deepseek` is reference material and should stay untracked.
 - `bands.ini` is a tracked, human-editable band overlay file served to the frontend.
 - `tasks.md`, `PLAN.MD`, and `suggestions.md` are local planning/report files and should stay untracked.
+
+## Stream Test Utility
+
+`fobos_stream_test.c` builds as `fobos-stream-test`. It must stay independent from the web scanner backend. It opens the receiver in normal single-frequency async streaming mode and reports stream health from callback timing and sample contents.
+
+The public agile callback does not expose a hardware sequence number. Do not claim exact buffer order/loss detection unless the library API changes; infer likely missing buffers from callback cadence, large gaps, and expected callback counts.
 
 ## Scanner Architecture
 
@@ -99,6 +105,12 @@ Equivalent direct command:
 
 ```sh
 LD_LIBRARY_PATH=../libfobos-sdr-agile/build-local:../local-agile/lib ./fobos-scanner
+```
+
+Run the stream integrity tester:
+
+```sh
+make stream-test
 ```
 
 Open the UI at:
