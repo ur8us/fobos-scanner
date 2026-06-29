@@ -301,7 +301,7 @@ static uint32_t normalize_rate_limit_lps(uint32_t value)
 
 static uint32_t normalize_min_rate_lps(uint32_t value)
 {
-    static const uint32_t allowed[] = { 0, 1, 2, 5, 10 };
+    static const uint32_t allowed[] = { 0, 1, 2, 5, 10, 20 };
     for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
         if (value == allowed[i])
             return value;
