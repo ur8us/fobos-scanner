@@ -1389,13 +1389,11 @@ static int rate_drop_factor_for_plan(double samplerate, uint32_t async_len,
 
     limit_lps = normalize_rate_limit_lps(limit_lps);
     /*
-     * The Fobos callback buffer contains interleaved I/Q floats. Fixed mode
-     * line timing follows samplerate / (2 * requested_length). Agile hardware
-     * scan cycles complete at half that line cadence, so scan mode uses an
-     * extra factor of two for rate limiting and status estimates.
+     * fobos_sdr_read_async() reports buf_len as complex I/Q sample count.
+     * One fixed-mode line consumes async_len samples. One hardware-scan line
+     * consumes async_len samples for each scan step.
      */
-    buffers_per_second = samplerate /
-        ((double)async_len * (total_steps > 1 ? 4.0 : 2.0));
+    buffers_per_second = samplerate / (double)async_len;
     lines_per_second = buffers_per_second / (double)total_steps;
     if (out_line_rate)
         *out_line_rate = lines_per_second;
@@ -1739,6 +1737,7 @@ static int cic_decimated_fft_magnitude(scan_ctx_t *ctx, float *buf,
                                        float *out)
 {
     int decim = ctx->decim_factor;
+    int produced = 0;
     double gain;
 
     if (decim <= 1 || !ctx->decim_accum)
@@ -1782,12 +1781,13 @@ static int cic_decimated_fft_magnitude(scan_ctx_t *ctx, float *buf,
 
         if (ctx->decim_fill >= ctx->fft_size) {
             int ok = fft_magnitude_from_accum(ctx, bins_per_step, out);
+            if (ok > 0)
+                produced++;
             advance_decim_frame(ctx);
-            return ok;
         }
     }
 
-    return 0;
+    return produced;
 }
 
 static void prepare_direct_sampling_samples(scan_ctx_t *ctx, float *buf, uint32_t buf_len)
@@ -1903,9 +1903,17 @@ static void publish_scan_line(scan_ctx_t *ctx)
     free(json);
 }
 
+static int rate_limiter_should_keep(scan_ctx_t *ctx);
+
 static int should_publish_processed_line(scan_ctx_t *ctx)
 {
-    (void)ctx;
+    if (ctx->single_mode && ctx->decim_factor > 1 &&
+        ctx->rate_keep_ratio < 0.999999) {
+        if (rate_limiter_should_keep(ctx))
+            return 1;
+        ctx->rate_output_dropped++;
+        return 0;
+    }
     return 1;
 }
 
@@ -2160,6 +2168,8 @@ static int scan_callback_should_process(scan_ctx_t *ctx, int channel)
         return 1;
 
     if (ctx->single_mode) {
+        if (ctx->decim_factor > 1)
+            return 1;
         ctx->rate_callback_seq++;
         if (rate_limiter_should_keep(ctx))
             return 1;
