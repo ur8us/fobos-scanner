@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/time.h>
@@ -84,6 +85,8 @@ static struct fobos_sdr_dev_t *g_dev = NULL;
 static pthread_t g_scan_thread;
 static volatile int g_scanning = 0;
 static volatile int g_scan_thread_joinable = 0;
+static pthread_mutex_t g_cancel_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_cancel_requested = 0;
 typedef enum {
     RUN_MODE_SCAN = 0,
     RUN_MODE_SINGLE = 1
@@ -684,6 +687,24 @@ static void active_scan_band(double *out_start, double *out_end);
 static void send_json_response(int client_fd, int code, const char *reason,
                                const char *cors, const char *body);
 static void load_sample_rates(struct fobos_sdr_dev_t *dev);
+static long long now_msec(void);
+
+static void reset_async_cancel_request(void)
+{
+    pthread_mutex_lock(&g_cancel_mutex);
+    g_cancel_requested = 0;
+    pthread_mutex_unlock(&g_cancel_mutex);
+}
+
+static void request_async_cancel(void)
+{
+    pthread_mutex_lock(&g_cancel_mutex);
+    if (g_dev && !g_cancel_requested) {
+        g_cancel_requested = 1;
+        fobos_sdr_cancel_async(g_dev);
+    }
+    pthread_mutex_unlock(&g_cancel_mutex);
+}
 
 static double estimate_frontend_kbytes_s(int display_bins,
                                          double raw_line_rate,
@@ -799,6 +820,9 @@ typedef struct {
     uint64_t rate_output_seq;
     uint64_t rate_dropped;
     uint64_t rate_output_dropped;
+    volatile long long last_callback_msec;
+    volatile int watchdog_stop;
+    volatile int watchdog_triggered;
     uint32_t fft_generation;
     double configured_start;
     double configured_end;
@@ -2060,6 +2084,7 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
         return;
     }
 
+    ctx->last_callback_msec = now_msec();
     channel = ctx->single_mode ? 0 : fobos_sdr_get_scan_index(dev);
     if (channel < 0 || channel >= ctx->total_steps)
         return;
@@ -2067,6 +2092,32 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
         return;
 
     scan_queue_push(ctx, channel, buf, buf_len);
+}
+
+static void *scan_watchdog_thread(void *arg)
+{
+    scan_ctx_t *ctx = (scan_ctx_t *)arg;
+    const long long startup_timeout_ms = 2500;
+    const long long stall_timeout_ms = 5000;
+    const struct timespec sleep_time = { 0, 100000000L };
+
+    while (!ctx->watchdog_stop && g_scanning) {
+        long long now = now_msec();
+        long long last = ctx->last_callback_msec;
+        long long timeout = ctx->line_num == 0 ? startup_timeout_ms : stall_timeout_ms;
+
+        if (last > 0 && now - last > timeout) {
+            ctx->watchdog_triggered = 1;
+            fprintf(stderr,
+                    "[SDR] No sample buffers received for %.1f s; canceling async read\n",
+                    (double)(now - last) / 1000.0);
+            g_scanning = 0;
+            request_async_cancel();
+            break;
+        }
+        nanosleep(&sleep_time, NULL);
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2087,6 +2138,8 @@ static void *scan_thread_func(void *arg)
     int ret;
     int worker_started = 0;
     int device_error = 0;
+    int watchdog_started = 0;
+    pthread_t watchdog_thread;
     uint32_t async_len;
     uint32_t line_sample_count;
     single_fft_plan_t single_plan = {0};
@@ -2251,11 +2304,27 @@ static void *scan_thread_func(void *arg)
     }
 
     if (g_scanning) {
+        ctx.last_callback_msec = now_msec();
+        ctx.watchdog_stop = 0;
+        ctx.watchdog_triggered = 0;
+        reset_async_cancel_request();
+        if (pthread_create(&watchdog_thread, NULL, scan_watchdog_thread, &ctx) == 0) {
+            watchdog_started = 1;
+        } else {
+            fprintf(stderr, "[SDR] Failed to start scan watchdog\n");
+        }
         ret = fobos_sdr_read_async(g_dev, scan_callback, &ctx, 16, async_len);
         if (ret != FOBOS_ERR_OK && g_scanning) {
             fprintf(stderr, "[SDR] fobos_sdr_read_async failed: %d\n", ret);
             device_error = 1;
         }
+    }
+
+    if (watchdog_started) {
+        ctx.watchdog_stop = 1;
+        pthread_join(watchdog_thread, NULL);
+        if (ctx.watchdog_triggered)
+            device_error = 1;
     }
 
     if (!ctx.single_mode)
@@ -2306,8 +2375,7 @@ static int start_scan(void)
     /* If already scanning, restart with new params */
     if (g_scan_thread_joinable) {
         g_scanning = 0;
-        if (g_dev)
-            fobos_sdr_cancel_async(g_dev);
+        request_async_cancel();
         pthread_join(g_scan_thread, NULL);
         g_scan_thread_joinable = 0;
     }
@@ -2347,8 +2415,7 @@ static void stop_scan(void)
 {
     if (!g_scan_thread_joinable) return;
     g_scanning = 0;
-    if (g_dev)
-        fobos_sdr_cancel_async(g_dev);
+    request_async_cancel();
     pthread_join(g_scan_thread, NULL);
     g_scan_thread_joinable = 0;
 }
