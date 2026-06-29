@@ -1957,6 +1957,12 @@
                 return Math.max(0, Math.min(255, Math.round(scaled)));
             }
 
+            function mapSpectrumValue(value) {
+                const span = Math.max(1, waterfallMax - waterfallMin);
+                const scaled = (Number(value) - waterfallMin) / span;
+                return Math.max(0, Math.min(1, scaled));
+            }
+
             function writeWaterfallPixel(pix, offset, rawValue) {
                 const val = mapWaterfallValue(rawValue | 0);
                 pix[offset] = colorLUT[val * 3];
@@ -2235,7 +2241,7 @@
                     scCtx.stroke();
                 }
 
-                // The data is magnitude 0-255; draw the curve
+                // Draw the spectrum with the same min/max level window as the waterfall.
                 scCtx.strokeStyle = "#40c0a0";
                 scCtx.lineWidth = 1.5;
                 scCtx.beginPath();
@@ -2249,8 +2255,8 @@
                 const binRanges =
                     sameAxis && n !== w ? getCanvasBinRanges(w, n, range) : null;
                 for (let x = 0; x < w; x++) {
-                    const v =
-                        (sameAxis && n === w
+                    const rawValue =
+                        sameAxis && n === w
                             ? data[x]
                             : sameAxis
                               ? dataPeakForBinRange(
@@ -2265,7 +2271,8 @@
                                     targetAxis,
                                     freqStart,
                                     freqEnd,
-                                )) / 255;
+                                );
+                    const v = mapSpectrumValue(rawValue);
                     const y = h - 5 - v * (h - 10);
                     if (x === 0) scCtx.moveTo(x, y);
                     else scCtx.lineTo(x, y);
@@ -2305,7 +2312,7 @@
                     ((maxFreq - targetAxis.left) /
                         Math.max(1, targetAxis.right - targetAxis.left)) *
                     w;
-                const py = h - 5 - (maxVal / 255) * (h - 10);
+                const py = h - 5 - mapSpectrumValue(maxVal) * (h - 10);
                 scCtx.fillStyle = "#ff8040";
                 scCtx.beginPath();
                 scCtx.arc(px, py, 3, 0, 2 * Math.PI);
