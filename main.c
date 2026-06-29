@@ -133,6 +133,18 @@ static unsigned int g_sample_rate_count = 0;
 static int g_sse_fds[MAX_SSE_CLIENTS];
 static pthread_mutex_t g_sse_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Frontend traffic accounting: actual SSE bytes successfully written. */
+#define TRAFFIC_SAMPLE_COUNT 1024
+#define TRAFFIC_WINDOW_MS    2000LL
+typedef struct {
+    long long msec;
+    size_t bytes;
+} traffic_sample_t;
+
+static traffic_sample_t g_traffic_samples[TRAFFIC_SAMPLE_COUNT];
+static int g_traffic_sample_pos = 0;
+static pthread_mutex_t g_traffic_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* ------------------------------------------------------------------ */
 /* SSE helpers                                                        */
 /* ------------------------------------------------------------------ */
@@ -163,18 +175,23 @@ static void sse_add_client(int fd)
     if (!added) close(fd);
 }
 
-static void sse_broadcast(const char *data, int len)
+static size_t sse_broadcast(const char *data, int len)
 {
+    size_t delivered = 0;
+
     pthread_mutex_lock(&g_sse_mutex);
     for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
         int fd = g_sse_fds[i];
         if (fd > 0) {
             if (write_all(fd, data, (size_t)len) != 0) {
                 close(fd); g_sse_fds[i] = 0;
+            } else {
+                delivered += (size_t)len;
             }
         }
     }
     pthread_mutex_unlock(&g_sse_mutex);
+    return delivered;
 }
 
 /* ------------------------------------------------------------------ */
@@ -706,24 +723,46 @@ static void request_async_cancel(void)
     pthread_mutex_unlock(&g_cancel_mutex);
 }
 
-static double estimate_frontend_kbytes_s(int display_bins,
-                                         double raw_line_rate,
-                                         int rate_drop_factor)
+static void record_frontend_traffic(size_t bytes)
 {
-    double lines_per_second = raw_line_rate;
-    double bytes_per_line;
+    if (bytes == 0)
+        return;
 
-    if (rate_drop_factor > 1)
-        lines_per_second /= (double)rate_drop_factor;
-    if (lines_per_second < 0.0)
-        lines_per_second = 0.0;
+    pthread_mutex_lock(&g_traffic_mutex);
+    g_traffic_samples[g_traffic_sample_pos].msec = now_msec();
+    g_traffic_samples[g_traffic_sample_pos].bytes = bytes;
+    g_traffic_sample_pos = (g_traffic_sample_pos + 1) % TRAFFIC_SAMPLE_COUNT;
+    pthread_mutex_unlock(&g_traffic_mutex);
+}
 
-    /*
-     * Waterfall rows are currently JSON/SSE. Most bins take 2-3 digits plus a
-     * comma, and metadata/event framing is roughly below 1 KiB.
-     */
-    bytes_per_line = 1024.0 + (double)display_bins * 4.0;
-    return (bytes_per_line * lines_per_second) / 1024.0;
+static double measured_frontend_kbytes_s(void)
+{
+    long long now = now_msec();
+    long long cutoff = now - TRAFFIC_WINDOW_MS;
+    long long oldest = now;
+    size_t bytes = 0;
+
+    pthread_mutex_lock(&g_traffic_mutex);
+    for (int i = 0; i < TRAFFIC_SAMPLE_COUNT; i++) {
+        if (g_traffic_samples[i].msec >= cutoff) {
+            bytes += g_traffic_samples[i].bytes;
+            if (g_traffic_samples[i].msec < oldest)
+                oldest = g_traffic_samples[i].msec;
+        }
+    }
+    pthread_mutex_unlock(&g_traffic_mutex);
+
+    if (bytes == 0)
+        return 0.0;
+
+    {
+        long long elapsed = now - oldest;
+        if (elapsed < 1000)
+            elapsed = 1000;
+        if (elapsed > TRAFFIC_WINDOW_MS)
+            elapsed = TRAFFIC_WINDOW_MS;
+        return ((double)bytes / 1024.0) * (1000.0 / (double)elapsed);
+    }
 }
 
 static void reset_device_info(void)
@@ -1794,7 +1833,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
         pos += snprintf(json + pos, 5, "%s%d", (i ? "," : ""), line_packed[i]);
 
     pos += snprintf(json + pos, 16, "]}\n\n");
-    sse_broadcast(json, pos);
+    record_frontend_traffic(sse_broadcast(json, pos));
     free(line_packed);
     free(json);
 }
@@ -2631,8 +2670,7 @@ static void handle_request(int client_fd, const char *req)
                                                      total_steps,
                                                      g_rate_limit_lps,
                                                      &raw_line_rate);
-        traffic_kbytes_s = estimate_frontend_kbytes_s(display_bins, raw_line_rate,
-                                                      rate_drop_factor);
+        traffic_kbytes_s = measured_frontend_kbytes_s();
         format_sample_rates_json(sample_rates, sizeof(sample_rates));
 
         int n = snprintf(body, sizeof(body),
@@ -2821,9 +2859,7 @@ static void handle_request(int client_fd, const char *req)
                                                          total_steps,
                                                          g_rate_limit_lps,
                                                          &raw_line_rate);
-        double traffic_kbytes_s = estimate_frontend_kbytes_s(current_display_bins(),
-                                                             raw_line_rate,
-                                                             rate_drop_factor);
+        double traffic_kbytes_s = measured_frontend_kbytes_s();
         char json_body[1536];
         snprintf(json_body, sizeof(json_body),
             "{\"status\":\"%s\",\"freq_start\":%.0f,\"freq_end\":%.0f,"
@@ -2932,9 +2968,7 @@ static void handle_request(int client_fd, const char *req)
                                                              total_steps,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
-            double traffic_kbytes_s = estimate_frontend_kbytes_s(current_display_bins(),
-                                                                 raw_line_rate,
-                                                                 rate_drop_factor);
+            double traffic_kbytes_s = measured_frontend_kbytes_s();
             char json_body[1536];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"view_id\":%u,"
@@ -3084,9 +3118,7 @@ static void handle_request(int client_fd, const char *req)
                                                              total_steps,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
-            double traffic_kbytes_s = estimate_frontend_kbytes_s(current_display_bins(),
-                                                                 raw_line_rate,
-                                                                 rate_drop_factor);
+            double traffic_kbytes_s = measured_frontend_kbytes_s();
             char json_body[768];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
@@ -3146,9 +3178,7 @@ static void handle_request(int client_fd, const char *req)
                                                              total_steps,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
-            double traffic_kbytes_s = estimate_frontend_kbytes_s(current_display_bins(),
-                                                                 raw_line_rate,
-                                                                 rate_drop_factor);
+            double traffic_kbytes_s = measured_frontend_kbytes_s();
             char json_body[768];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"min_rate_lps\":%u,"
