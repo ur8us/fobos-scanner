@@ -48,6 +48,7 @@
 #define HTML_PATH           "index.html"
 #define BANDS_PATH          "bands.ini"
 #define MARKERS_PATH        "markers.ini"
+#define FQ_RESPONSE_PATH    "fq_response.txt"
 #define MIN_FREQ_START_HZ   50.0e6
 #define DISPLAY_BINS_MIN    64
 #define DISPLAY_BINS_MAX    32768
@@ -104,9 +105,17 @@ typedef struct {
     double source_span;
     double extraction_ratio;
 } single_fft_plan_t;
+typedef struct {
+    float *correction_linear;
+    size_t count;
+    double samplerate_hz;
+    float min_correction;
+    float max_correction;
+} fq_response_table_t;
 static volatile run_mode_t g_active_mode = RUN_MODE_SCAN;
 static pthread_mutex_t g_fft_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_fft_generation = 1;
+static fq_response_table_t g_fq_response = {0};
 
 /* Scan parameters */
 static double g_freq_start   = MIN_FREQ_START_HZ;
@@ -452,6 +461,110 @@ static void load_config(void)
     else
         clamp_visible_to_config();
     printf("[SDR] Loaded config from %s\n", CONFIG_FILE);
+}
+
+static void free_fq_response_table(void)
+{
+    free(g_fq_response.correction_linear);
+    memset(&g_fq_response, 0, sizeof(g_fq_response));
+}
+
+static int append_fq_correction(float **values, size_t *count, size_t *capacity,
+                                float correction)
+{
+    float *new_values;
+
+    if (*count == *capacity) {
+        size_t new_capacity = *capacity ? *capacity * 2U : 4096U;
+        new_values = realloc(*values, new_capacity * sizeof(float));
+        if (!new_values)
+            return -1;
+        *values = new_values;
+        *capacity = new_capacity;
+    }
+    (*values)[(*count)++] = correction;
+    return 0;
+}
+
+static void load_fq_response_table(void)
+{
+    FILE *f;
+    char line[1024];
+    float *values = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    double samplerate_hz = 0.0;
+    float min_corr = 0.0f;
+    float max_corr = 0.0f;
+
+    free_fq_response_table();
+
+    f = fopen(FQ_RESPONSE_PATH, "r");
+    if (!f) {
+        printf("[SDR] Frequency compensation: %s not found, disabled\n",
+               FQ_RESPONSE_PATH);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        unsigned int bin;
+        double offset_hz;
+        double offset_mhz;
+        double response_db;
+        double correction_db;
+        double correction_linear;
+
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (*p == '\0')
+            continue;
+        if (*p == '#') {
+            if (sscanf(p, "# samplerate_hz %lf", &samplerate_hz) == 1)
+                continue;
+            continue;
+        }
+
+        if (sscanf(p, "%u %lf %lf %lf %lf %lf",
+                   &bin, &offset_hz, &offset_mhz, &response_db,
+                   &correction_db, &correction_linear) == 6 &&
+            isfinite(correction_linear) && correction_linear > 0.0 &&
+            correction_linear < 100.0) {
+            float corr = (float)correction_linear;
+            if (append_fq_correction(&values, &count, &capacity, corr) != 0) {
+                fprintf(stderr, "[SDR] Frequency compensation: out of memory loading %s\n",
+                        FQ_RESPONSE_PATH);
+                free(values);
+                fclose(f);
+                return;
+            }
+            if (count == 1 || corr < min_corr)
+                min_corr = corr;
+            if (count == 1 || corr > max_corr)
+                max_corr = corr;
+        }
+    }
+    fclose(f);
+
+    if (count < 2) {
+        fprintf(stderr, "[SDR] Frequency compensation: no usable correction rows in %s\n",
+                FQ_RESPONSE_PATH);
+        free(values);
+        return;
+    }
+
+    g_fq_response.correction_linear = values;
+    g_fq_response.count = count;
+    g_fq_response.samplerate_hz = samplerate_hz;
+    g_fq_response.min_correction = min_corr;
+    g_fq_response.max_correction = max_corr;
+
+    printf("[SDR] Frequency compensation loaded: %zu bins from %s",
+           g_fq_response.count, FQ_RESPONSE_PATH);
+    if (samplerate_hz > 0.0)
+        printf(", measured at %.3f MHz", samplerate_hz / 1.0e6);
+    printf(", correction %.3f..%.3f, scan mode only\n",
+           min_corr, max_corr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1221,6 +1334,8 @@ typedef struct {
     float *window;
     float *fft_scratch;
     float *decim_accum;
+    float *scan_fq_corr;
+    float *scan_fq_last_corr;
     float *line_buf;
     double cic_integrator_re[CIC_STAGES];
     double cic_integrator_im[CIC_STAGES];
@@ -1824,6 +1939,38 @@ static int current_line_bins(void)
     return (total_steps - 1) * bins_per_step + last_bins;
 }
 
+static float *build_scan_fq_correction(int fft_size, int bins)
+{
+    float *corr;
+    int shifted_start;
+
+    if (!g_fq_response.correction_linear || g_fq_response.count == 0 ||
+        fft_size <= 0 || bins <= 0)
+        return NULL;
+
+    corr = malloc((size_t)bins * sizeof(float));
+    if (!corr)
+        return NULL;
+
+    shifted_start = (fft_size - bins) / 2;
+    for (int i = 0; i < bins; i++) {
+        int shifted_bin = shifted_start + i;
+        size_t table_index;
+
+        if (shifted_bin < 0)
+            shifted_bin = 0;
+        if (shifted_bin >= fft_size)
+            shifted_bin = fft_size - 1;
+
+        table_index = ((size_t)shifted_bin * g_fq_response.count) / (size_t)fft_size;
+        if (table_index >= g_fq_response.count)
+            table_index = g_fq_response.count - 1U;
+        corr[i] = g_fq_response.correction_linear[table_index];
+    }
+
+    return corr;
+}
+
 static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
 {
     int fft_size;
@@ -1841,6 +1988,8 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
     float *window = NULL;
     float *fft_scratch = NULL;
     float *decim_accum = NULL;
+    float *scan_fq_corr = NULL;
+    float *scan_fq_last_corr = NULL;
     float *line_buf = NULL;
     float mag_scale;
 
@@ -1881,11 +2030,23 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         fft_scratch = malloc((size_t)fft_size * 2 * sizeof(float));
         if (decim_factor > 1)
             decim_accum = malloc((size_t)fft_size * 2 * sizeof(float));
+        if (!ctx->single_mode) {
+            scan_fq_corr = build_scan_fq_correction(fft_size, bins_per_step);
+            if (last_bins == bins_per_step)
+                scan_fq_last_corr = build_scan_fq_correction(fft_size, bins_per_step);
+            else
+                scan_fq_last_corr = build_scan_fq_correction(fft_size, last_bins);
+        }
         line_buf = malloc(bin_count * sizeof(float));
-        if (!window || !fft_scratch || (decim_factor > 1 && !decim_accum) || !line_buf) {
+        if (!window || !fft_scratch || (decim_factor > 1 && !decim_accum) ||
+            (!ctx->single_mode && g_fq_response.correction_linear &&
+             (!scan_fq_corr || !scan_fq_last_corr)) ||
+            !line_buf) {
             free(window);
             free(fft_scratch);
             free(decim_accum);
+            free(scan_fq_corr);
+            free(scan_fq_last_corr);
             free(line_buf);
             return -1;
         }
@@ -1905,10 +2066,14 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         free(window);
         free(fft_scratch);
         free(decim_accum);
+        free(scan_fq_corr);
+        free(scan_fq_last_corr);
         free(line_buf);
         window = NULL;
         fft_scratch = NULL;
         decim_accum = NULL;
+        scan_fq_corr = NULL;
+        scan_fq_last_corr = NULL;
         line_buf = NULL;
     }
 
@@ -1924,6 +2089,8 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
     free(ctx->window);
     free(ctx->fft_scratch);
     free(ctx->decim_accum);
+    free(ctx->scan_fq_corr);
+    free(ctx->scan_fq_last_corr);
     free(ctx->line_buf);
 
     ctx->fft_size = fft_size;
@@ -1958,6 +2125,8 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
     ctx->window = window;
     ctx->fft_scratch = fft_scratch;
     ctx->decim_accum = decim_accum;
+    ctx->scan_fq_corr = scan_fq_corr;
+    ctx->scan_fq_last_corr = scan_fq_last_corr;
     ctx->line_buf = line_buf;
     ctx->steps_seen = 0;
     memset(ctx->cic_integrator_re, 0, sizeof(ctx->cic_integrator_re));
@@ -1981,7 +2150,8 @@ static uint32_t current_fft_generation(void)
 static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step,
                                  int fft_size, const float *window,
                                  float *local_fft, float mag_scale,
-                                 int positive_half, int max_ffts, float *out)
+                                 int positive_half, int max_ffts,
+                                 const float *fq_correction, float *out)
 {
     int fft_count = 0;
     int shifted_start = (fft_size - bins_per_step) / 2;
@@ -2010,7 +2180,12 @@ static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step
             }
             float re = local_fft[2*fft_bin];
             float im = local_fft[2*fft_bin+1];
-            out[i] += sqrtf(re*re + im*im);
+            {
+                float mag = sqrtf(re*re + im*im);
+                if (fq_correction)
+                    mag *= fq_correction[i];
+                out[i] += mag;
+            }
         }
         fft_count++;
     }
@@ -2076,6 +2251,7 @@ static int cic_decimated_fft_magnitude(scan_ctx_t *ctx, float *buf,
         return average_fft_magnitude(buf, buf_len, bins_per_step, ctx->fft_size,
                                      ctx->window, ctx->fft_scratch, ctx->mag_scale, 0,
                                      ctx->max_ffts_per_buffer,
+                                     NULL,
                                      out);
 
     gain = pow((double)decim, (double)CIC_STAGES);
@@ -2307,10 +2483,15 @@ static void process_scan_buffer(scan_ctx_t *ctx, float *buf, uint32_t buf_len, i
         if (cic_decimated_fft_magnitude(ctx, buf, buf_len, channel_bins, slot) <= 0)
             return;
     } else {
+        const float *fq_corr = NULL;
+        if (!ctx->single_mode)
+            fq_corr = (channel == ctx->total_steps - 1) ?
+                ctx->scan_fq_last_corr : ctx->scan_fq_corr;
         if (average_fft_magnitude(buf, buf_len, channel_bins, ctx->fft_size,
                                   ctx->window, ctx->fft_scratch, ctx->mag_scale,
                                   ctx->direct_sampling != 0 && ctx->decim_factor <= 1,
                                   ctx->max_ffts_per_buffer,
+                                  fq_corr,
                                   slot) <= 0)
             return;
     }
@@ -2702,6 +2883,8 @@ static void *scan_thread_func(void *arg)
         free(ctx.window);
         free(ctx.fft_scratch);
         free(ctx.decim_accum);
+        free(ctx.scan_fq_corr);
+        free(ctx.scan_fq_last_corr);
         free(ctx.line_buf);
         g_scanning = 0;
         return NULL;
@@ -2713,6 +2896,8 @@ static void *scan_thread_func(void *arg)
         free(ctx.window);
         free(ctx.fft_scratch);
         free(ctx.decim_accum);
+        free(ctx.scan_fq_corr);
+        free(ctx.scan_fq_last_corr);
         free(ctx.line_buf);
         g_scanning = 0;
         return NULL;
@@ -2822,6 +3007,8 @@ static void *scan_thread_func(void *arg)
     free(ctx.window);
     free(ctx.fft_scratch);
     free(ctx.decim_accum);
+    free(ctx.scan_fq_corr);
+    free(ctx.scan_fq_last_corr);
     free(ctx.line_buf);
     if (device_error) {
         fprintf(stderr, "[SDR] Closing SDR device after I/O error; will poll for reconnect\n");
@@ -4307,6 +4494,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 
     load_config();
+    load_fq_response_table();
 
     init_window();
     memset(g_sse_fds, 0, sizeof(g_sse_fds));

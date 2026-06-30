@@ -1,5 +1,6 @@
 fobos-scanner
 fobos-stream-test
+fobos-fq-response
 *.o
 *.so
 *.a
@@ -17,3 +18,5 @@ ideas.md
 REPORT.MD
 tools/zoom_sweep.py
 test_results*.txt
+fq_response*.txt
+fq_response*.png

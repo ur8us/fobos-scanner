@@ -190,6 +190,7 @@ This produces:
 ```text
 ./fobos-scanner
 ./fobos-stream-test
+./fobos-fq-response
 ```
 
 To remove the built binary:
@@ -240,6 +241,58 @@ Or use the Makefile wrapper:
 
 ```sh
 make stream-test
+```
+
+## Frequency Response Calibration
+
+`fobos-fq-response` measures the receiver passband shape with all antennas disconnected. It tunes many receiver center frequencies, repeats several passes, captures noise-only synchronous buffers at each center, FFTs and robust-averages them, clamps narrow peaks against a local baseline, smooths the result, optionally mirror-averages around DC, and writes an inverse-correction table for later frequency-domain compensation.
+
+Run with defaults: `50 MHz` sample rate, `65536` FFT, 11 centers from `100` to `350 MHz`, `3` passes, `128` buffers per capture, LNA `2`, VGA `15`, and output prefix `fq_response`:
+
+```sh
+./run-fq-response.sh
+```
+
+The program asks you to confirm that antennas and signal sources are disconnected. For automated runs:
+
+```sh
+./run-fq-response.sh --yes --out-prefix my_response
+```
+
+Outputs:
+
+```text
+my_response.txt
+my_response.png
+```
+
+The text file is machine readable. Important columns are:
+
+```text
+offset_hz           baseband offset from -samplerate/2 to +samplerate/2
+response_db         measured, smoothed passband response normalized to 0 dB mean
+correction_db       inverse correction in dB
+correction_linear   inverse amplitude multiplier, 10^(correction_db/20)
+raw_avg_db          robust averaged response before final smoothing/symmetry
+despurred_db        raw average after narrow upward peak clamping
+```
+
+When `fq_response.txt` is present in the scanner directory, the backend loads its smoothed `correction_linear` column on startup. The correction is applied only to hardware scan-mode FFT bins; single-frequency fixed/zoom mode is left unchanged. If the active scan FFT size is smaller than the calibration table, the backend selects the matching normalized baseband correction element for each FFT bin.
+
+Useful options:
+
+```text
+--centers-mhz 100,125,150,175,200,225,250,275,300,325,350
+--samplerate 50M
+--fft-size 65536
+--buffers 128
+--passes 3
+--despur-khz 5000
+--peak-clamp-db 0.25
+--smooth-khz 3000
+--lna 2
+--vga 15
+--no-symmetry
 ```
 
 ## Checks
