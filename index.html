@@ -3700,10 +3700,18 @@
                 if (evt.key === "Shift") setZoomCursor(true);
                 if (evt.key === "Control") setRulerReadyCursor(true);
                 if (isEditingElement(evt.target)) return;
-                if (evt.key === "+" || evt.key === "=") {
+                if (
+                    (evt.key === "+" || evt.key === "=") &&
+                    !evt.ctrlKey &&
+                    !evt.metaKey
+                ) {
                     evt.preventDefault();
                     zoomByFactor(1 / 1.35);
-                } else if (evt.key === "-" || evt.key === "_") {
+                } else if (
+                    (evt.key === "-" || evt.key === "_") &&
+                    !evt.ctrlKey &&
+                    !evt.metaKey
+                ) {
                     evt.preventDefault();
                     zoomByFactor(1.35);
                 } else if (evt.key === "ArrowLeft") {

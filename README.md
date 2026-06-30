@@ -11,6 +11,7 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Hardware-assisted frequency scanning through `fobos_sdr_start_scan()`
 - Live spectrum and top-to-bottom waterfall display
 - `Shift + wheel` zoom for the spectrum and waterfall
+- Keyboard zoom/pan shortcuts that leave browser `Ctrl++`, `Ctrl+-`, and `Ctrl+0` zoom controls untouched
 - Saved zoom window restored on reload/autostart; pressing Start resets to the full band
 - Hover readout for air frequency, receiver frequency when a converter is set, and spectrum level
 - Adjustable LNA/VGA gain while scanning

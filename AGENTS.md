@@ -100,6 +100,7 @@ The frontend uses peak-per-pixel reduction when more FFT bins exist than canvas 
 
 - Shift + wheel zooms the spectrum/waterfall horizontally around the cursor.
 - Holding Shift changes the spectrum/waterfall cursor to zoom mode.
+- Plain `+`, `-`, arrow keys, and `0` are app zoom/pan shortcuts, but do not intercept browser zoom shortcuts such as `Ctrl++`, `Ctrl+-`, or `Ctrl+0`.
 - Frequency markers open with Shift + left-click, or Ctrl/Alt + right-click. Do not use Shift + right-click for marker editing; Firefox reserves that shortcut for its native context menu and page JavaScript cannot suppress it reliably.
 - Frequency scale, hover frequency, and hover level must use the current zoomed view.
 - Frequency scale ticks are rendered as border-left strokes, not 1px background rectangles. This fixed Firefox/browser-zoom cases where subpixel 1px tick divs disappeared.
