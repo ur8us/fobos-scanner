@@ -3575,7 +3575,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "{\"device\":\"Fobos SDR\","
             "\"hardware\":\"%s\",\"firmware\":\"%s\",\"serial\":\"%s\","
             "\"manufacturer\":\"%s\",\"product\":\"%s\","
-            "\"scanning\":%d,"
+            "\"scanning\":%d,\"device_present\":%d,"
             "\"freq_start\":%.0f,\"freq_end\":%.0f,\"converter_freq\":%.0f,"
             "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
             "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
@@ -3596,7 +3596,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"sample_rates\":%s}",
             g_hw_rev, g_fw_ver, g_serial,
             g_manufacturer, g_product,
-            g_scanning,
+            g_scanning, g_dev != NULL,
             g_freq_start, g_freq_end, g_converter_freq,
             g_freq_start, g_freq_end,
             g_visible_start, g_visible_end,

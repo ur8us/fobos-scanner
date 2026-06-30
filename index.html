@@ -88,6 +88,19 @@
             body.panning-mode #waterfall {
                 cursor: grabbing;
             }
+            body.ruler-ready #waterfall,
+            body.ruler-mode #waterfall {
+                cursor: default;
+            }
+            #rulerOverlay {
+                position: absolute;
+                inset: 0;
+                display: block;
+                width: 100%;
+                height: 600px;
+                pointer-events: none;
+                z-index: 2;
+            }
             .freq-scale {
                 position: relative;
                 height: 34px;
@@ -204,6 +217,124 @@
                 color: #8098b0;
                 text-align: right;
             }
+            .dual-group {
+                flex: 1 0 250px;
+                min-width: 230px;
+            }
+            .dual-label {
+                display: flex;
+                justify-content: space-between;
+                gap: 10px;
+            }
+            .dual-slider {
+                --range-left: 0%;
+                --range-right: 100%;
+                position: relative;
+                height: 28px;
+                margin-top: 3px;
+            }
+            .dual-slider::before,
+            .dual-slider::after {
+                content: "";
+                position: absolute;
+                top: 11px;
+                height: 6px;
+                border-radius: 3px;
+                pointer-events: none;
+            }
+            .dual-slider::before {
+                left: 0;
+                right: 0;
+                background: #2a3040;
+            }
+            .dual-slider::after {
+                left: var(--range-left);
+                right: calc(100% - var(--range-right));
+                background: #40a0e0;
+                box-shadow: 0 0 8px #40a0e055;
+            }
+            .dual-slider.wf-level-slider::before {
+                background: linear-gradient(
+                    90deg,
+                    #030408 0%,
+                    #06245e 30%,
+                    #1197bd 58%,
+                    #ddd046 82%,
+                    #f4f8ff 100%
+                );
+            }
+            .dual-slider.disabled {
+                opacity: 0.45;
+            }
+            .inline-control-row {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            .inline-control-row .dual-slider {
+                flex: 1 1 auto;
+                min-width: 120px;
+            }
+            .dual-slider input[type="range"] {
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 28px;
+                margin: 0;
+                padding: 0;
+                pointer-events: none;
+                background: transparent;
+                border: none;
+                appearance: none;
+                -webkit-appearance: none;
+            }
+            .dual-slider input[type="range"]::-webkit-slider-runnable-track {
+                height: 6px;
+                background: transparent;
+                border: none;
+            }
+            .dual-slider input[type="range"]::-moz-range-track {
+                height: 6px;
+                background: transparent;
+                border: none;
+            }
+            .dual-slider input[type="range"]::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                width: 15px;
+                height: 15px;
+                margin-top: -4px;
+                border-radius: 50%;
+                border: 1px solid #c8d8e8;
+                background: #40a0e0;
+                cursor: pointer;
+                pointer-events: auto;
+                box-shadow: 0 1px 4px #000b;
+            }
+            .dual-slider input[type="range"]::-moz-range-thumb {
+                width: 15px;
+                height: 15px;
+                border-radius: 50%;
+                border: 1px solid #c8d8e8;
+                background: #40a0e0;
+                cursor: pointer;
+                pointer-events: auto;
+                box-shadow: 0 1px 4px #000b;
+            }
+            .dual-slider input[type="range"]:disabled::-webkit-slider-thumb {
+                cursor: not-allowed;
+                background: #607080;
+            }
+            .dual-slider input[type="range"]:disabled::-moz-range-thumb {
+                cursor: not-allowed;
+                background: #607080;
+            }
+            .dual-min {
+                z-index: 3;
+            }
+            .dual-max {
+                z-index: 4;
+            }
             .check-group {
                 justify-content: end;
             }
@@ -221,6 +352,10 @@
             .check-label input {
                 width: auto;
                 accent-color: #40a0e0;
+            }
+            .inline-check-label {
+                flex: 0 0 auto;
+                min-height: 28px;
             }
 
             .btn-group {
@@ -526,63 +661,77 @@
                         step="1"
                     />
                 </div>
-                <div class="ctrl-group">
-                    <label>Min Rate (if possible)</label>
-                    <select id="minRate">
-                        <option value="0" selected>As is</option>
-                        <option value="1">1 line/s</option>
-                        <option value="2">2 lines/sec</option>
-                        <option value="5">5 lines/sec</option>
-                        <option value="10">10 lines/sec</option>
-                        <option value="20">20 lines/sec</option>
-                    </select>
-                </div>
-                <div class="ctrl-group">
-                    <label>Rate Limit</label>
-                    <select id="rateLimit">
-                        <option value="1">1 line/s</option>
-                        <option value="2">2 lines/s</option>
-                        <option value="5">5 lines/s</option>
-                        <option value="10">10 lines/s</option>
-                        <option value="20" selected>20 lines/s</option>
-                        <option value="50">50 lines/s</option>
-                        <option value="100">100 lines/s</option>
-                    </select>
-                </div>
-                <div class="ctrl-group check-group">
-                    <label>WF Level</label>
-                    <label class="check-label">
-                        <input type="checkbox" id="wfAuto" />
-                        Auto
+                <div class="ctrl-group dual-group">
+                    <label class="dual-label">
+                        <span>Waterfall Rate</span>
+                        <span class="range-val" id="rateRangeVal"
+                            >Min: As is, Max: 20 lines/s</span
+                        >
                     </label>
+                    <input type="hidden" id="minRate" value="0" />
+                    <input type="hidden" id="rateLimit" value="20" />
+                    <div class="dual-slider rate-slider" id="rateSlider">
+                        <input
+                            type="range"
+                            class="dual-min"
+                            id="rateMinSlider"
+                            min="0"
+                            max="7"
+                            value="0"
+                            step="1"
+                            aria-label="Minimum waterfall line rate"
+                        />
+                        <input
+                            type="range"
+                            class="dual-max"
+                            id="rateMaxSlider"
+                            min="0"
+                            max="7"
+                            value="5"
+                            step="1"
+                            aria-label="Waterfall line rate limit"
+                        />
+                    </div>
                 </div>
-                <div class="ctrl-group">
-                    <label
-                        >WF Min
-                        <span class="range-val" id="wfMinVal">0</span></label
-                    >
-                    <input
-                        type="range"
-                        id="wfMin"
-                        min="0"
-                        max="400"
-                        value="0"
-                        step="1"
-                    />
-                </div>
-                <div class="ctrl-group">
-                    <label
-                        >WF Max
-                        <span class="range-val" id="wfMaxVal">15</span></label
-                    >
-                    <input
-                        type="range"
-                        id="wfMax"
-                        min="1"
-                        max="400"
-                        value="15"
-                        step="1"
-                    />
+                <div class="ctrl-group dual-group">
+                    <label class="dual-label">
+                        <span>Waterfall Levels</span>
+                        <span class="range-val">
+                            Min: <span id="wfMinVal">0</span>, Max:
+                            <span id="wfMaxVal">15</span>
+                        </span>
+                    </label>
+                    <div class="inline-control-row">
+                        <div
+                            class="dual-slider wf-level-slider"
+                            id="wfLevelSlider"
+                        >
+                            <input
+                                type="range"
+                                class="dual-min"
+                                id="wfMin"
+                                min="0"
+                                max="400"
+                                value="0"
+                                step="1"
+                                aria-label="Waterfall minimum level"
+                            />
+                            <input
+                                type="range"
+                                class="dual-max"
+                                id="wfMax"
+                                min="1"
+                                max="400"
+                                value="15"
+                                step="1"
+                                aria-label="Waterfall maximum level"
+                            />
+                        </div>
+                        <label class="check-label inline-check-label">
+                            <input type="checkbox" id="wfAuto" />
+                            Auto
+                        </label>
+                    </div>
                 </div>
             </div>
 
@@ -594,6 +743,7 @@
 
             <div class="waterfall-wrap">
                 <canvas id="waterfall"></canvas>
+                <canvas id="rulerOverlay"></canvas>
             </div>
             <div class="hover-readout" id="hoverReadout"></div>
             <div class="marker-dialog" id="markerDialog">
@@ -624,6 +774,8 @@
             // ===================================================================
             const wfCanvas = document.getElementById("waterfall");
             const wfCtx = wfCanvas.getContext("2d");
+            const rulerCanvas = document.getElementById("rulerOverlay");
+            const rulerCtx = rulerCanvas.getContext("2d");
             const scCanvas = document.getElementById("scope");
             const scCtx = scCanvas.getContext("2d");
 
@@ -641,6 +793,9 @@
             let backendOnline = false;
             let scanRequestSerial = 0;
             let statusPollInFlight = false;
+            let desiredScanRunning = false;
+            let autoRestartTimer = 0;
+            let autoRestartInFlight = false;
             let configuredFreq0 = 0;
             let configuredFreq1 = 0;
             let currentFreq0 = 0;
@@ -657,6 +812,16 @@
             let panStartX = 0;
             let panStartFreq0 = 0;
             let panStartFreq1 = 0;
+            let panPreviewBaseData = null;
+            let panPreviewBaseWidth = 0;
+            let panPreviewBaseHeight = 0;
+            let rulerActive = false;
+            let rulerStart = null;
+            let rulerEnd = null;
+            let lastWaterfallLineMs = 0;
+            let lastSseLineMs = 0;
+            let sseOpenMs = 0;
+            let waterfallSecondsPerLine = null;
             let redrawFrame = 0;
             let waterfallRenderToken = 0;
             let waterfallRenderActiveToken = 0;
@@ -687,6 +852,17 @@
             let waterfallAuto = false;
             let autoWfMin = null;
             let autoWfMax = null;
+            let rateMinDirty = false;
+            let rateMaxDirty = false;
+            const RATE_VALUES = [0, 1, 2, 5, 10, 20, 50, 100];
+            const RATE_MIN_MIN_INDEX = 0;
+            const RATE_MIN_MAX_INDEX = 5;
+            const RATE_LIMIT_MIN_INDEX = 2;
+            const RATE_LIMIT_MAX_INDEX = 7;
+            const RATE_LIMIT_DEFAULT_INDEX = 5;
+            const AUTO_RESTART_DELAY_MS = 900;
+            const SSE_STALL_MIN_MS = 5000;
+            const SSE_STALL_MAX_MS = 30000;
 
             function hasFrequencyWindow(
                 start = currentFreq0,
@@ -716,6 +892,9 @@
 
                 wfCanvas.width = w;
                 wfCanvas.height = 600;
+                rulerCanvas.width = w;
+                rulerCanvas.height = 600;
+                clearRulerOverlay();
 
                 if (!wfImageData || wfImageData.width !== w) {
                     wfImageData = wfCtx.createImageData(w, 600);
@@ -740,6 +919,213 @@
 
             function displayBins() {
                 return Math.max(1, Math.floor(wfCanvas.width || 1));
+            }
+
+            function clearRulerOverlay() {
+                if (!rulerCanvas || !rulerCtx) return;
+                rulerCtx.clearRect(0, 0, rulerCanvas.width, rulerCanvas.height);
+            }
+
+            function clampNumber(value, min, max) {
+                return Math.max(min, Math.min(max, value));
+            }
+
+            function formatCompactNumber(value, decimals) {
+                return Number(value)
+                    .toFixed(decimals)
+                    .replace(/0+$/, "")
+                    .replace(/\.$/, "");
+            }
+
+            function formatFrequencyDistance(deltaHz) {
+                const hz = Math.abs(Number(deltaHz) || 0);
+                if (hz < 1e6) {
+                    const khz = hz / 1e3;
+                    const decimals = khz < 10 ? 3 : khz < 100 ? 2 : 1;
+                    return formatCompactNumber(khz, decimals) + " kHz";
+                }
+                const mhz = hz / 1e6;
+                const decimals = mhz < 10 ? 3 : mhz < 100 ? 2 : 1;
+                return formatCompactNumber(mhz, decimals) + " MHz";
+            }
+
+            function formatSecondsDistance(seconds) {
+                if (!Number.isFinite(seconds)) return "-- s";
+                const value = Math.abs(seconds);
+                const decimals = value < 10 ? 3 : value < 100 ? 2 : 1;
+                return formatCompactNumber(value, decimals) + " s";
+            }
+
+            function estimateWaterfallSecondsPerLine() {
+                if (
+                    Number.isFinite(waterfallSecondsPerLine) &&
+                    waterfallSecondsPerLine > 0
+                ) {
+                    return waterfallSecondsPerLine;
+                }
+                const selectedLimit = parseInt(
+                    document.getElementById("rateLimit").value,
+                    10,
+                );
+                if (Number.isFinite(selectedLimit) && selectedLimit > 0)
+                    return 1 / selectedLimit;
+                return NaN;
+            }
+
+            function updateWaterfallLineRateEstimate(plan) {
+                if (!plan || plan.raw_line_rate === undefined) return;
+                if (
+                    lastWaterfallLineMs > 0 &&
+                    performance.now() - lastWaterfallLineMs < 3000
+                ) {
+                    return;
+                }
+                let lineRate = Number(plan.raw_line_rate);
+                const limit = Number(plan.rate_limit_lps);
+                if (!Number.isFinite(lineRate) || lineRate <= 0) return;
+                if (Number.isFinite(limit) && limit > 0)
+                    lineRate = Math.min(lineRate, limit);
+                if (lineRate > 0) waterfallSecondsPerLine = 1 / lineRate;
+            }
+
+            function recordWaterfallLineArrival() {
+                const now = performance.now();
+                lastSseLineMs = now;
+                if (lastWaterfallLineMs > 0 && now > lastWaterfallLineMs) {
+                    const seconds = (now - lastWaterfallLineMs) / 1000;
+                    if (seconds > 0 && seconds < 10) {
+                        waterfallSecondsPerLine =
+                            waterfallSecondsPerLine === null
+                                ? seconds
+                                : waterfallSecondsPerLine * 0.85 +
+                                  seconds * 0.15;
+                    }
+                }
+                lastWaterfallLineMs = now;
+            }
+
+            function sseStallTimeoutMs() {
+                const secondsPerLine = estimateWaterfallSecondsPerLine();
+                if (!Number.isFinite(secondsPerLine) || secondsPerLine <= 0)
+                    return SSE_STALL_MIN_MS;
+                return clampNumber(
+                    secondsPerLine * 1000 * 6,
+                    SSE_STALL_MIN_MS,
+                    SSE_STALL_MAX_MS,
+                );
+            }
+
+            function nearestRateIndex(value) {
+                const rate = Number(value);
+                if (!Number.isFinite(rate)) return RATE_LIMIT_DEFAULT_INDEX;
+                let bestIndex = 0;
+                let bestDiff = Infinity;
+                for (let i = 0; i < RATE_VALUES.length; i++) {
+                    const diff = Math.abs(RATE_VALUES[i] - rate);
+                    if (diff < bestDiff) {
+                        bestDiff = diff;
+                        bestIndex = i;
+                    }
+                }
+                return bestIndex;
+            }
+
+            function formatLineRate(value) {
+                const rate = Number(value);
+                if (!rate) return "As is";
+                return rate === 1 ? "1 line/s" : rate + " lines/s";
+            }
+
+            function updateDualSliderFill(sliderId, minValue, maxValue, max) {
+                const slider = document.getElementById(sliderId);
+                if (!slider || max <= 0) return;
+                const left = clampNumber((minValue / max) * 100, 0, 100);
+                const right = clampNumber((maxValue / max) * 100, 0, 100);
+                slider.style.setProperty("--range-left", left + "%");
+                slider.style.setProperty("--range-right", right + "%");
+            }
+
+            function updateRateRangeDisplay() {
+                const minEl = document.getElementById("minRate");
+                const maxEl = document.getElementById("rateLimit");
+                const minSlider = document.getElementById("rateMinSlider");
+                const maxSlider = document.getElementById("rateMaxSlider");
+                const label = document.getElementById("rateRangeVal");
+                let minIdx = clampNumber(
+                    nearestRateIndex(minEl.value),
+                    RATE_MIN_MIN_INDEX,
+                    RATE_MIN_MAX_INDEX,
+                );
+                let maxIdx = clampNumber(
+                    nearestRateIndex(maxEl.value),
+                    RATE_LIMIT_MIN_INDEX,
+                    RATE_LIMIT_MAX_INDEX,
+                );
+
+                if (minIdx > maxIdx) maxIdx = minIdx;
+
+                minEl.value = String(RATE_VALUES[minIdx]);
+                maxEl.value = String(RATE_VALUES[maxIdx]);
+                minSlider.value = String(minIdx);
+                maxSlider.value = String(maxIdx);
+                label.textContent =
+                    "Min: " +
+                    formatLineRate(RATE_VALUES[minIdx]) +
+                    ", Max: " +
+                    formatLineRate(RATE_VALUES[maxIdx]);
+                updateDualSliderFill(
+                    "rateSlider",
+                    minIdx,
+                    maxIdx,
+                    RATE_VALUES.length - 1,
+                );
+            }
+
+            function syncRateRangeFromSliders(changed) {
+                const minEl = document.getElementById("minRate");
+                const maxEl = document.getElementById("rateLimit");
+                const minSlider = document.getElementById("rateMinSlider");
+                const maxSlider = document.getElementById("rateMaxSlider");
+                const prevMin = minEl.value;
+                const prevMax = maxEl.value;
+                let minIdx = clampNumber(
+                    parseInt(minSlider.value, 10) || 0,
+                    RATE_MIN_MIN_INDEX,
+                    RATE_MIN_MAX_INDEX,
+                );
+                let maxIdx = clampNumber(
+                    parseInt(maxSlider.value, 10) || RATE_LIMIT_DEFAULT_INDEX,
+                    RATE_LIMIT_MIN_INDEX,
+                    RATE_LIMIT_MAX_INDEX,
+                );
+
+                if (minIdx > maxIdx) {
+                    if (changed === "min") maxIdx = minIdx;
+                    else minIdx = maxIdx;
+                }
+
+                minEl.value = String(RATE_VALUES[minIdx]);
+                maxEl.value = String(RATE_VALUES[maxIdx]);
+                updateRateRangeDisplay();
+                return {
+                    minChanged: minEl.value !== prevMin,
+                    maxChanged: maxEl.value !== prevMax,
+                };
+            }
+
+            function updateWaterfallLevelDisplay() {
+                const minEl = document.getElementById("wfMin");
+                const maxEl = document.getElementById("wfMax");
+                const levelSlider = document.getElementById("wfLevelSlider");
+                const minVal = parseInt(minEl.value, 10) || 0;
+                const maxVal = parseInt(maxEl.value, 10) || 1;
+                document.getElementById("wfMinVal").textContent =
+                    String(minVal);
+                document.getElementById("wfMaxVal").textContent =
+                    String(maxVal);
+                updateDualSliderFill("wfLevelSlider", minVal, maxVal, 400);
+                if (levelSlider)
+                    levelSlider.classList.toggle("disabled", waterfallAuto);
             }
 
             function selectedDirectSampling() {
@@ -1266,6 +1652,22 @@
                     redrawFrame = 0;
                     redrawCurrentView(waterfallRenderToken);
                 });
+            }
+
+            function capturePanPreviewBase() {
+                panPreviewBaseData = null;
+                panPreviewBaseWidth = 0;
+                panPreviewBaseHeight = 0;
+                if (!wfImageData) return;
+                panPreviewBaseData = new Uint8ClampedArray(wfImageData.data);
+                panPreviewBaseWidth = wfImageData.width;
+                panPreviewBaseHeight = wfImageData.height;
+            }
+
+            function clearPanPreviewBase() {
+                panPreviewBaseData = null;
+                panPreviewBaseWidth = 0;
+                panPreviewBaseHeight = 0;
             }
 
             function redrawCurrentView(renderToken) {
@@ -2033,9 +2435,10 @@
                 const low = percentileFromSorted(samples, 0.08);
                 const high = percentileFromSorted(samples, 0.985);
                 const targetMin = Math.max(0, Math.min(398, low - 8));
+                const autoMaxBase = Math.max(targetMin + 2, high + 18);
                 const targetMax = Math.max(
                     targetMin + 2,
-                    Math.min(400, high + 18),
+                    Math.min(400, Math.round(autoMaxBase * 1.5)),
                 );
 
                 if (autoWfMin === null || autoWfMax === null) {
@@ -2054,10 +2457,7 @@
                 waterfallMax = nextMax;
                 document.getElementById("wfMin").value = String(nextMin);
                 document.getElementById("wfMax").value = String(nextMax);
-                document.getElementById("wfMinVal").textContent =
-                    String(nextMin);
-                document.getElementById("wfMaxVal").textContent =
-                    String(nextMax);
+                updateWaterfallLevelDisplay();
                 localStorage.setItem("wfMin", String(nextMin));
                 localStorage.setItem("wfMax", String(nextMax));
             }
@@ -2098,6 +2498,7 @@
                 prevEnd,
                 nextStart,
                 nextEnd,
+                sourcePixels = null,
             ) {
                 if (!wfImageData) return;
                 const w = wfImageData.width;
@@ -2106,7 +2507,11 @@
                 const nextSpan = nextEnd - nextStart;
                 if (w <= 0 || h <= 0 || prevSpan <= 0 || nextSpan <= 0) return;
 
-                const source = new Uint8ClampedArray(wfImageData.data);
+                const source =
+                    sourcePixels &&
+                    sourcePixels.length === wfImageData.data.length
+                        ? sourcePixels
+                        : new Uint8ClampedArray(wfImageData.data);
                 const imageData = wfCtx.createImageData(w, h);
                 const dest = imageData.data;
 
@@ -2142,12 +2547,14 @@
                 prevEnd,
                 nextStart,
                 nextEnd,
+                sourcePixels = null,
             ) {
                 transformWaterfallPixels(
                     prevStart,
                     prevEnd,
                     nextStart,
                     nextEnd,
+                    sourcePixels,
                 );
                 if (currentBins && currentBins.length) {
                     drawScope(
@@ -2498,6 +2905,8 @@
 
             function connectSSE() {
                 if (eventSource) eventSource.close();
+                sseOpenMs = performance.now();
+                lastSseLineMs = 0;
                 eventSource = new EventSource("/api/waterfall");
 
                 eventSource.addEventListener("line", function (e) {
@@ -2536,6 +2945,7 @@
                         currentBins = bins;
                         currentBinsFreq0 = currentFreq0;
                         currentBinsFreq1 = currentFreq1;
+                        recordWaterfallLineArrival();
 
                         drawWaterfallLine(
                             bins,
@@ -2581,6 +2991,75 @@
                     eventSource.close();
                     eventSource = null;
                 }
+                sseOpenMs = 0;
+                lastSseLineMs = 0;
+            }
+
+            function ensureSSEReceiving() {
+                if (!backendOnline || !scanRunning) return;
+                if (!eventSource) {
+                    connectSSE();
+                    return;
+                }
+                if (
+                    eventSource.readyState === EventSource.CLOSED ||
+                    eventSource.readyState === 2
+                ) {
+                    disconnectSSE();
+                    connectSSE();
+                    return;
+                }
+
+                const referenceMs = lastSseLineMs || sseOpenMs;
+                if (
+                    referenceMs > 0 &&
+                    performance.now() - referenceMs > sseStallTimeoutMs()
+                ) {
+                    disconnectSSE();
+                    connectSSE();
+                }
+            }
+
+            function clearAutoRestartTimer() {
+                if (autoRestartTimer) {
+                    clearTimeout(autoRestartTimer);
+                    autoRestartTimer = 0;
+                }
+            }
+
+            function statusDevicePresent(status) {
+                if (!status || status.device_present === undefined)
+                    return true;
+                return !!Number(status.device_present);
+            }
+
+            function scheduleDesiredScanRestart(status) {
+                if (!desiredScanRunning || autoRestartTimer || autoRestartInFlight)
+                    return;
+                if (!backendOnline || scanRunning || !statusDevicePresent(status))
+                    return;
+
+                autoRestartTimer = setTimeout(async () => {
+                    autoRestartTimer = 0;
+                    if (
+                        !desiredScanRunning ||
+                        autoRestartInFlight ||
+                        scanRunning ||
+                        !backendOnline
+                    ) {
+                        return;
+                    }
+                    autoRestartInFlight = true;
+                    try {
+                        await startOrRestartScan({
+                            resetView: false,
+                            preserveView: true,
+                            autoRetry: true,
+                        });
+                    } finally {
+                        autoRestartInFlight = false;
+                    }
+                }, AUTO_RESTART_DELAY_MS);
             }
 
             async function checkBackendStatus() {
@@ -2594,6 +3073,7 @@
                 }
 
                 if (!status) {
+                    clearAutoRestartTimer();
                     updateUI(false, false);
                     disconnectSSE();
                     return null;
@@ -2612,11 +3092,13 @@
                     currentFreq1 = Number(status.visible_end_hz);
                 updateFFTInfo(status);
                 if (status.scanning) {
+                    clearAutoRestartTimer();
                     if (Number(status.display_bins) !== displayBins())
                         scheduleViewUpdate(currentFreq0, currentFreq1, false);
-                    if (!eventSource) connectSSE();
+                    ensureSSEReceiving();
                 } else {
                     disconnectSSE();
+                    scheduleDesiredScanRestart(status);
                 }
                 return status;
             }
@@ -2627,6 +3109,7 @@
             const hoverReadout = document.getElementById("hoverReadout");
 
             function showHoverReadout(canvas, evt, includeLevel) {
+                if (rulerActive) return;
                 if (panActive) {
                     hoverReadout.style.display = "none";
                     return;
@@ -2686,7 +3169,7 @@
                         currentSourceStart(),
                         currentSourceEnd(),
                     );
-                    lines.push(String(level));
+                    lines.push("Level: " + String(level));
                 }
 
                 hoverReadout.textContent = lines.join("\n");
@@ -2699,13 +3182,152 @@
                 hoverReadout.style.display = "none";
             }
 
+            function waterfallPointFromEvent(evt) {
+                const rect = wfCanvas.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return null;
+                return {
+                    x: clampNumber(
+                        ((evt.clientX - rect.left) / rect.width) *
+                            wfCanvas.width,
+                        0,
+                        wfCanvas.width,
+                    ),
+                    y: clampNumber(
+                        ((evt.clientY - rect.top) / rect.height) *
+                            wfCanvas.height,
+                        0,
+                        wfCanvas.height,
+                    ),
+                };
+            }
+
+            function frequencyAtWaterfallX(x) {
+                if (!hasFrequencyWindow()) return null;
+                const axis = getZoomedFrequencyAxis(
+                    currentFreq0,
+                    currentFreq1,
+                    currentSteps,
+                    currentBins ? currentBins.length : displayBins(),
+                );
+                if (axis.right <= axis.left || wfCanvas.width <= 0)
+                    return null;
+                const frac = clampNumber(x / wfCanvas.width, 0, 1);
+                return axis.left + frac * (axis.right - axis.left);
+            }
+
+            function rulerText() {
+                if (!rulerStart || !rulerEnd) return "";
+                const f0 = frequencyAtWaterfallX(rulerStart.x);
+                const f1 = frequencyAtWaterfallX(rulerEnd.x);
+                const secondsPerLine = estimateWaterfallSecondsPerLine();
+                const seconds =
+                    Math.abs(rulerEnd.y - rulerStart.y) * secondsPerLine;
+                const frequencyText =
+                    f0 === null || f1 === null
+                        ? "--"
+                        : formatFrequencyDistance(f1 - f0);
+                return (
+                    "Distance: " +
+                    frequencyText +
+                    "\nInterval: " +
+                    formatSecondsDistance(seconds)
+                );
+            }
+
+            function drawRulerOverlay() {
+                clearRulerOverlay();
+                if (!rulerActive || !rulerStart || !rulerEnd) return;
+
+                rulerCtx.save();
+                rulerCtx.lineWidth = 2;
+                rulerCtx.setLineDash([8, 8]);
+                rulerCtx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+                rulerCtx.beginPath();
+                rulerCtx.moveTo(rulerStart.x, rulerStart.y);
+                rulerCtx.lineTo(rulerEnd.x, rulerEnd.y);
+                rulerCtx.stroke();
+                rulerCtx.lineDashOffset = 8;
+                rulerCtx.strokeStyle = "rgba(0, 0, 0, 0.95)";
+                rulerCtx.beginPath();
+                rulerCtx.moveTo(rulerStart.x, rulerStart.y);
+                rulerCtx.lineTo(rulerEnd.x, rulerEnd.y);
+                rulerCtx.stroke();
+                rulerCtx.lineDashOffset = 0;
+
+                rulerCtx.setLineDash([]);
+                rulerCtx.fillStyle = "rgba(64, 160, 224, 0.9)";
+                rulerCtx.strokeStyle = "rgba(5, 8, 12, 0.9)";
+                for (const point of [rulerStart, rulerEnd]) {
+                    rulerCtx.beginPath();
+                    rulerCtx.arc(point.x, point.y, 3.5, 0, Math.PI * 2);
+                    rulerCtx.fill();
+                    rulerCtx.stroke();
+                }
+                rulerCtx.restore();
+            }
+
+            function showRulerReadout(evt) {
+                hoverReadout.textContent = rulerText();
+                hoverReadout.style.left = evt.clientX + 12 + "px";
+                hoverReadout.style.top = evt.clientY + 12 + "px";
+                hoverReadout.style.display = "block";
+            }
+
+            function startRuler(evt) {
+                if (evt.button !== 0 || !evt.ctrlKey) return;
+                if (!hasFrequencyWindow()) return;
+                const point = waterfallPointFromEvent(evt);
+                if (!point) return;
+
+                evt.preventDefault();
+                evt.stopImmediatePropagation();
+                hideHoverReadout();
+                rulerActive = true;
+                rulerStart = point;
+                rulerEnd = point;
+                document.body.classList.add("ruler-mode");
+                wfCanvas.setPointerCapture(evt.pointerId);
+                drawRulerOverlay();
+                showRulerReadout(evt);
+            }
+
+            function moveRuler(evt) {
+                if (!rulerActive) return;
+                const point = waterfallPointFromEvent(evt);
+                if (!point) return;
+                evt.preventDefault();
+                evt.stopImmediatePropagation();
+                rulerEnd = point;
+                drawRulerOverlay();
+                showRulerReadout(evt);
+            }
+
+            function endRuler(evt) {
+                if (!rulerActive) return;
+                evt.preventDefault();
+                evt.stopImmediatePropagation();
+                rulerActive = false;
+                rulerStart = null;
+                rulerEnd = null;
+                document.body.classList.remove("ruler-mode");
+                clearRulerOverlay();
+                hideHoverReadout();
+                try {
+                    wfCanvas.releasePointerCapture(evt.pointerId);
+                } catch (e) {
+                    /* pointer capture may already be gone */
+                }
+            }
+
             wfCanvas.addEventListener("mousemove", (evt) =>
                 showHoverReadout(wfCanvas, evt, false),
             );
             scCanvas.addEventListener("mousemove", (evt) =>
                 showHoverReadout(scCanvas, evt, true),
             );
-            wfCanvas.addEventListener("mouseleave", hideHoverReadout);
+            wfCanvas.addEventListener("mouseleave", () => {
+                if (!rulerActive) hideHoverReadout();
+            });
             scCanvas.addEventListener("mouseleave", hideHoverReadout);
             wfCanvas.addEventListener(
                 "mousedown",
@@ -2958,7 +3580,7 @@
             }
 
             function startPan(evt) {
-                if (evt.button !== 0 || evt.shiftKey) return;
+                if (evt.button !== 0 || evt.shiftKey || evt.ctrlKey) return;
                 if (!hasFrequencyWindow()) return;
                 hideHoverReadout();
 
@@ -2967,6 +3589,8 @@
                 const fullEnd = full.right;
                 if (currentFreq1 - currentFreq0 >= fullEnd - fullStart) return;
 
+                cancelCurrentViewRedraw();
+                capturePanPreviewBase();
                 panActive = true;
                 panStartX = evt.clientX;
                 panStartFreq0 = currentFreq0;
@@ -3003,12 +3627,27 @@
                 currentFreq1 = clamped.right;
                 pendingViewChange = true;
                 binRangeCache = null;
-                transformVisibleDisplay(
-                    prevFreq0,
-                    prevFreq1,
-                    currentFreq0,
-                    currentFreq1,
-                );
+                if (
+                    panPreviewBaseData &&
+                    wfImageData &&
+                    panPreviewBaseWidth === wfImageData.width &&
+                    panPreviewBaseHeight === wfImageData.height
+                ) {
+                    transformVisibleDisplay(
+                        panStartFreq0,
+                        panStartFreq1,
+                        currentFreq0,
+                        currentFreq1,
+                        panPreviewBaseData,
+                    );
+                } else {
+                    transformVisibleDisplay(
+                        prevFreq0,
+                        prevFreq1,
+                        currentFreq0,
+                        currentFreq1,
+                    );
+                }
                 scheduleCurrentViewRedraw();
                 updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
                 document.getElementById("infoRange").textContent =
@@ -3021,16 +3660,22 @@
             function endPan(evt) {
                 if (!panActive) return;
                 panActive = false;
+                clearPanPreviewBase();
                 setPanningCursor(false);
                 try {
                     wfCanvas.releasePointerCapture(evt.pointerId);
                 } catch (e) {
                     /* pointer capture may already be gone */
                 }
+                scheduleCurrentViewRedraw();
             }
 
             function setZoomCursor(active) {
                 document.body.classList.toggle("zoom-mode", active);
+            }
+
+            function setRulerReadyCursor(active) {
+                document.body.classList.toggle("ruler-ready", active);
             }
 
             function isEditingElement(target) {
@@ -3053,6 +3698,7 @@
                     return;
                 }
                 if (evt.key === "Shift") setZoomCursor(true);
+                if (evt.key === "Control") setRulerReadyCursor(true);
                 if (isEditingElement(evt.target)) return;
                 if (evt.key === "+" || evt.key === "=") {
                     evt.preventDefault();
@@ -3073,8 +3719,12 @@
             });
             window.addEventListener("keyup", (evt) => {
                 if (evt.key === "Shift") setZoomCursor(false);
+                if (evt.key === "Control") setRulerReadyCursor(false);
             });
-            window.addEventListener("blur", () => setZoomCursor(false));
+            window.addEventListener("blur", () => {
+                setZoomCursor(false);
+                setRulerReadyCursor(false);
+            });
             window.addEventListener("beforeunload", () => {
                 saveVisibleView(true);
             });
@@ -3082,6 +3732,11 @@
             wfCanvas.addEventListener("wheel", handleZoomWheel, {
                 passive: false,
             });
+            wfCanvas.addEventListener("pointerdown", startRuler);
+            wfCanvas.addEventListener("pointermove", moveRuler);
+            wfCanvas.addEventListener("pointerup", endRuler);
+            wfCanvas.addEventListener("pointercancel", endRuler);
+            wfCanvas.addEventListener("lostpointercapture", endRuler);
             wfCanvas.addEventListener("pointerdown", startPan);
             wfCanvas.addEventListener("pointermove", movePan);
             wfCanvas.addEventListener("pointerup", endPan);
@@ -3321,27 +3976,27 @@
             }
 
             function setRateLimitValue(value) {
-                const sel = document.getElementById("rateLimit");
-                const selectedText = String(value || 20);
-                if (
-                    [...sel.options].some((opt) => opt.value === selectedText)
-                ) {
-                    sel.value = selectedText;
-                } else {
-                    sel.value = "20";
-                }
+                const idx = clampNumber(
+                    nearestRateIndex(value || 20),
+                    RATE_LIMIT_MIN_INDEX,
+                    RATE_LIMIT_MAX_INDEX,
+                );
+                document.getElementById("rateLimit").value = String(
+                    RATE_VALUES[idx],
+                );
+                updateRateRangeDisplay();
             }
 
             function setMinRateValue(value) {
-                const sel = document.getElementById("minRate");
-                const selectedText = String(value || 0);
-                if (
-                    [...sel.options].some((opt) => opt.value === selectedText)
-                ) {
-                    sel.value = selectedText;
-                } else {
-                    sel.value = "0";
-                }
+                const idx = clampNumber(
+                    nearestRateIndex(value || 0),
+                    RATE_MIN_MIN_INDEX,
+                    RATE_MIN_MAX_INDEX,
+                );
+                document.getElementById("minRate").value = String(
+                    RATE_VALUES[idx],
+                );
+                updateRateRangeDisplay();
             }
 
             function setClockSourceValue(value) {
@@ -3376,6 +4031,7 @@
 
             function updateFFTInfo(plan) {
                 if (!plan) return;
+                updateWaterfallLineRateEstimate(plan);
                 const fftInfo = document.getElementById("infoFFT");
                 if (!fftInfo) return;
                 const fft =
@@ -3562,6 +4218,8 @@
             }
 
             async function startOrRestartScan(options = { resetView: true }) {
+                desiredScanRunning = true;
+                clearAutoRestartTimer();
                 const serial = ++scanRequestSerial;
                 viewRequestSerial++;
                 pendingView = null;
@@ -3590,6 +4248,7 @@
                 if (serial !== scanRequestSerial) return result;
 
                 if (!result) {
+                    clearAutoRestartTimer();
                     updateUI(false, false);
                     disconnectSSE();
                 } else if (result.status === "ok") {
@@ -3598,6 +4257,7 @@
                     clearScanDisplay();
                     connectSSE();
                 } else {
+                    if (!options.autoRetry) desiredScanRunning = false;
                     updateUI(false, true);
                     disconnectSSE();
                 }
@@ -3687,6 +4347,8 @@
             document
                 .getElementById("btnStop")
                 .addEventListener("click", async function () {
+                    desiredScanRunning = false;
+                    clearAutoRestartTimer();
                     scanRequestSerial++;
                     viewRequestSerial++;
                     pendingView = null;
@@ -3697,6 +4359,7 @@
                     }
                     const result = await apiPost("/api/stop", {});
                     if (!result) {
+                        clearAutoRestartTimer();
                         updateUI(false, false);
                         disconnectSSE();
                     } else if (result.status === "ok") {
@@ -3717,12 +4380,43 @@
                     document.getElementById("vgaVal").textContent = this.value;
                     scheduleGainUpdate();
                 });
+
+            function handleRateSliderInput(changed) {
+                const changes = syncRateRangeFromSliders(changed);
+                rateMinDirty = rateMinDirty || changes.minChanged;
+                rateMaxDirty = rateMaxDirty || changes.maxChanged;
+            }
+
+            async function handleRateSliderChange(changed) {
+                const changes = syncRateRangeFromSliders(changed);
+                const minChanged = changes.minChanged || rateMinDirty;
+                const maxChanged = changes.maxChanged || rateMaxDirty;
+                rateMinDirty = false;
+                rateMaxDirty = false;
+                if (minChanged) await updateBackendMinRate();
+                if (maxChanged) await updateBackendRateLimit();
+            }
+
             document
-                .getElementById("minRate")
-                .addEventListener("change", updateBackendMinRate);
+                .getElementById("rateMinSlider")
+                .addEventListener("input", () =>
+                    handleRateSliderInput("min"),
+                );
             document
-                .getElementById("rateLimit")
-                .addEventListener("change", updateBackendRateLimit);
+                .getElementById("rateMaxSlider")
+                .addEventListener("input", () =>
+                    handleRateSliderInput("max"),
+                );
+            document
+                .getElementById("rateMinSlider")
+                .addEventListener("change", () =>
+                    handleRateSliderChange("min"),
+                );
+            document
+                .getElementById("rateMaxSlider")
+                .addEventListener("change", () =>
+                    handleRateSliderChange("max"),
+                );
             document
                 .getElementById("directSampling")
                 .addEventListener("change", handleDirectSamplingChanged);
@@ -3735,6 +4429,7 @@
                 document.getElementById("wfAuto").checked = waterfallAuto;
                 document.getElementById("wfMin").disabled = waterfallAuto;
                 document.getElementById("wfMax").disabled = waterfallAuto;
+                updateWaterfallLevelDisplay();
                 if (!waterfallAuto) {
                     autoWfMin = null;
                     autoWfMax = null;
@@ -3758,8 +4453,7 @@
                 waterfallMax = maxVal;
                 minEl.value = minVal;
                 maxEl.value = maxVal;
-                document.getElementById("wfMinVal").textContent = minVal;
-                document.getElementById("wfMaxVal").textContent = maxVal;
+                updateWaterfallLevelDisplay();
                 localStorage.setItem("wfMin", minVal);
                 localStorage.setItem("wfMax", maxVal);
                 scheduleCurrentViewRedraw();
@@ -3892,16 +4586,14 @@
                 const savedWfMax = localStorage.getItem("wfMax");
                 if (savedWfMin !== null) {
                     document.getElementById("wfMin").value = savedWfMin;
-                    document.getElementById("wfMinVal").textContent =
-                        savedWfMin;
                     waterfallMin = parseInt(savedWfMin, 10);
                 }
                 if (savedWfMax !== null) {
                     document.getElementById("wfMax").value = savedWfMax;
-                    document.getElementById("wfMaxVal").textContent =
-                        savedWfMax;
                     waterfallMax = parseInt(savedWfMax, 10);
                 }
+                syncWaterfallBrightness("max");
+                updateRateRangeDisplay();
                 setWaterfallAuto(localStorage.getItem("wfAuto") === "1");
 
                 if (!status) {
