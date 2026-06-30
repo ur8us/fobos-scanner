@@ -3229,7 +3229,7 @@
                 return (
                     "Distance: " +
                     frequencyText +
-                    "\nInterval: " +
+                    "\nTime: " +
                     formatSecondsDistance(seconds)
                 );
             }
@@ -3712,7 +3712,7 @@
                 } else if (evt.key === "ArrowRight") {
                     evt.preventDefault();
                     panByFraction(0.2);
-                } else if (evt.key === "0") {
+                } else if (evt.key === "0" && !evt.ctrlKey && !evt.metaKey) {
                     evt.preventDefault();
                     resetZoomView();
                 }
