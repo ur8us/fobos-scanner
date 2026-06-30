@@ -17,12 +17,12 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Adjustable LNA `0..3` and VGA `0..31` gain while scanning
 - Converter frequency offset for upconverter/downconverter use
 - Waterfall brightness window controls up to `400`
-- Configurable frequency range, sample rate, software bandwidth ratio, line-rate limit, and direct sampling mode
+- Configurable frequency range, software bandwidth ratio, line-rate limit, and direct sampling mode with fixed 50 MHz sample rate
 - Single-frequency super-zoom path using automatic 1024-65536 FFT sizing plus CIC decimation when the visible span is too narrow for a direct FFT
 - Minimum line-rate control for decimated single-stream zoom using FFT-window overlap
 - Editable `bands.ini` spectrum overlays
 - Editable frequency markers using `Shift + left-click` or `Ctrl/Alt + right-click`
-- Browser status heartbeat that shows `disconnected`, `idle`, or `scanning`
+- Browser status heartbeat that shows `disconnected`, `idle`, or `scanning`, plus `SW: YYYYMMDD` from the running binary compile date
 - Hardened flat-JSON control parser, explicit bad-request responses, validated marker saves, and throttled frontend view persistence
 
 ## Operation
@@ -38,6 +38,10 @@ step = samplerate * bw_ratio
 In the scanner, `bw_ratio` is a software scan/display ratio only. The backend keeps the Fobos SDR hardware auto bandwidth at full bandwidth (`1.0`) so each 50 MHz sample stream contains the full receiver passband.
 
 The Fobos agile scan list is limited to `256` frequencies. If the requested band needs more points, the backend clamps the effective end frequency to the last covered frequency and returns that value to the frontend.
+
+Hardware scan mode reads `98304` complex samples per scan point. This is above the agile API minimum of `65536`, giving slower receiver retunes enough dwell time to stop reporting "tuning incomplete" buffers at scan edges or tuner band transitions.
+
+The backend also clamps the configured air-frequency range to receiver tuning limits after converter math. In RF-input mode the receiver center must stay from `50 MHz` through `6000 MHz`; with a converter enabled, the UI start/end values are adjusted so the resulting receiver frequencies remain inside that range before the 256-point scan clamp is applied.
 
 All frontend frequencies are air/signal frequencies. Immediately before programming the SDR, the backend converts them to receiver frequencies:
 
@@ -191,8 +195,8 @@ This produces:
 
 ```text
 ./fobos-scanner
-./fobos-stream-test
-./fobos-fq-response
+./tools/fobos-stream-test
+./tools/fobos-fq-response
 ```
 
 To remove the built binary:
@@ -236,7 +240,7 @@ The Fobos agile public callback does not expose hardware sequence numbers, so mi
 Run with defaults, `100 MHz`, `50 MHz` sample rate, and `10` seconds:
 
 ```sh
-./run-stream-test.sh
+./tools/run-stream-test.sh
 ```
 
 Or use the Makefile wrapper:
@@ -252,14 +256,16 @@ make stream-test
 Run with defaults: `50 MHz` sample rate, `65536` FFT, 11 centers from `100` to `350 MHz`, `3` passes, `128` buffers per capture, LNA `2`, VGA `15`, and output prefix `fq_response`:
 
 ```sh
-./run-fq-response.sh
+./tools/run-fq-response.sh
 ```
 
 The program asks you to confirm that antennas and signal sources are disconnected. For automated runs:
 
 ```sh
-./run-fq-response.sh --yes --out-prefix my_response
+./tools/run-fq-response.sh --yes --out-prefix my_response
 ```
+
+The wrapper runs from the scanner directory even though it lives in `tools/`, so default output files are written next to the main program:
 
 Outputs:
 
@@ -316,7 +322,7 @@ The smoke test covers the index page, `/api/status`, bad JSON field handling, in
 Example custom run:
 
 ```sh
-./run-stream-test.sh --freq-mhz 315 --samplerate 50M --seconds 60
+./tools/run-stream-test.sh --freq-mhz 315 --samplerate 50M --seconds 60
 ```
 
 Useful options:
@@ -337,7 +343,9 @@ Useful options:
 ## Notes
 
 - Default scan start frequency is `50 MHz`.
+- The scanner sample rate is fixed at `50 MHz`; the frontend control is disabled and backend start requests ignore any other sample-rate value.
 - Default software bandwidth usage in auto scan mode is `0.9`; IF frequency-response compensation is enabled by default when `fq_response.txt` is available.
+- Auto waterfall levels are enabled by default on first page load.
 - The backend listens on port `8080`.
 - The scanner needs access to a connected Fobos SDR supported by the agile firmware/API.
 - Gain sliders update the device live through `POST /api/gain`; LNA accepts `0..3`, VGA accepts `0..31`.

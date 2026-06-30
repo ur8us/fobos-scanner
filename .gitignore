@@ -1,6 +1,8 @@
 fobos-scanner
 fobos-stream-test
 fobos-fq-response
+tools/fobos-stream-test
+tools/fobos-fq-response
 *.o
 *.so
 *.a

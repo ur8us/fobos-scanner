@@ -275,6 +275,15 @@
                 flex: 1 1 auto;
                 min-width: 120px;
             }
+            .single-slider-row {
+                height: 28px;
+                margin-top: 3px;
+                display: flex;
+                align-items: center;
+            }
+            .single-slider-row input[type="range"] {
+                width: 100%;
+            }
             .dual-slider input[type="range"] {
                 position: absolute;
                 left: 0;
@@ -522,6 +531,7 @@
             </h1>
 
             <div class="info-bar">
+                <span>SW: <span class="val" id="infoSw">---</span></span>
                 <span>HW: <span class="val" id="infoHw">---</span></span>
                 <span>FW: <span class="val" id="infoFw">---</span></span>
                 <span>S/N: <span class="val" id="infoSn">---</span></span>
@@ -599,10 +609,8 @@
                 </div>
                 <div class="ctrl-group">
                     <label>Sample Rate</label>
-                    <select id="samplerate">
-                        <option value="25000000">25 MHz</option>
+                    <select id="samplerate" disabled>
                         <option value="50000000" selected>50 MHz</option>
-                        <option value="64000000">64 MHz</option>
                     </select>
                 </div>
                 <div class="ctrl-group">
@@ -635,31 +643,42 @@
             </div>
 
             <div class="controls">
-                <div class="ctrl-group">
+                <div class="ctrl-group gain-group">
                     <label>
                         LNA <span class="range-val" id="lnaVal">0</span>
                     </label>
-                    <input
-                        type="range"
-                        id="lnaGain"
-                        min="0"
-                        max="3"
-                        value="0"
-                        step="1"
-                    />
+                    <div class="single-slider-row">
+                        <input
+                            type="range"
+                            id="lnaGain"
+                            min="0"
+                            max="3"
+                            value="0"
+                            step="1"
+                        />
+                    </div>
                 </div>
-                <div class="ctrl-group">
+                <div class="ctrl-group gain-group">
                     <label>
                         VGA <span class="range-val" id="vgaVal">0</span>
                     </label>
-                    <input
-                        type="range"
-                        id="vgaGain"
-                        min="0"
-                        max="31"
-                        value="0"
-                        step="1"
-                    />
+                    <div class="single-slider-row">
+                        <input
+                            type="range"
+                            id="vgaGain"
+                            min="0"
+                            max="31"
+                            value="0"
+                            step="1"
+                        />
+                    </div>
+                </div>
+                <div class="ctrl-group check-group">
+                    <label>IF FQ RESPONSE</label>
+                    <label class="check-label">
+                        <input type="checkbox" id="freqComp" checked />
+                        Compensate
+                    </label>
                 </div>
                 <div class="ctrl-group dual-group">
                     <label class="dual-label">
@@ -692,13 +711,6 @@
                             aria-label="Waterfall line rate limit"
                         />
                     </div>
-                </div>
-                <div class="ctrl-group check-group">
-                    <label>IF FQ RESPONSE</label>
-                    <label class="check-label">
-                        <input type="checkbox" id="freqComp" checked />
-                        Compensate
-                    </label>
                 </div>
                 <div class="ctrl-group dual-group">
                     <label class="dual-label">
@@ -735,7 +747,7 @@
                             />
                         </div>
                         <label class="check-label inline-check-label">
-                            <input type="checkbox" id="wfAuto" />
+                            <input type="checkbox" id="wfAuto" checked />
                             Auto
                         </label>
                     </div>
@@ -856,7 +868,7 @@
             let markerHitBoxes = [];
             let markerDialogTarget = null;
             let markerContextSuppressUntil = 0;
-            let waterfallAuto = false;
+            let waterfallAuto = true;
             let autoWfMin = null;
             let autoWfMax = null;
             let rateMinDirty = false;
@@ -1153,8 +1165,7 @@
                 document.getElementById("freqEnd").disabled = disableForDirect;
                 document.getElementById("converterFreq").disabled =
                     disableForDirect;
-                document.getElementById("samplerate").disabled =
-                    disableForDirect;
+                document.getElementById("samplerate").disabled = true;
                 document.getElementById("bwRatio").disabled = disableForDirect;
                 document.getElementById("directSampling").disabled = locked;
                 document.getElementById("clockIn").disabled = locked;
@@ -1166,8 +1177,7 @@
             function computedDirectSamplingMaxHz() {
                 const samplerate = selectedDirectSampling()
                     ? 50000000
-                    : parseFloat(document.getElementById("samplerate").value) ||
-                      50000000;
+                    : 50000000;
                 return Math.max(
                     1,
                     Math.min(DIRECT_SAMPLING_HARD_MAX_HZ, samplerate * 0.5),
@@ -3114,6 +3124,18 @@
                 }
 
                 updateUI(!!status.scanning, true);
+                if (status.sw_version !== undefined)
+                    document.getElementById("infoSw").textContent =
+                        status.sw_version || "---";
+                if (status.hardware !== undefined)
+                    document.getElementById("infoHw").textContent =
+                        status.hardware || "---";
+                if (status.firmware !== undefined)
+                    document.getElementById("infoFw").textContent =
+                        status.firmware || "---";
+                if (status.serial !== undefined)
+                    document.getElementById("infoSn").textContent =
+                        status.serial || "---";
                 if (status.view_id !== undefined)
                     currentViewId = Number(status.view_id);
                 if (status.configured_start_hz !== undefined)
@@ -3985,35 +4007,15 @@
 
             function syncSampleRateOptions(rates, selected) {
                 const sel = document.getElementById("samplerate");
-                const values = Array.isArray(rates)
-                    ? [...new Set(rates.map(Number).filter((rate) => rate > 0))]
-                    : [];
-
-                if (values.length) {
-                    sel.replaceChildren(
-                        ...values.map((rate) => {
-                            const opt = document.createElement("option");
-                            opt.value = String(rate);
-                            opt.textContent = sampleRateLabel(rate);
-                            return opt;
-                        }),
-                    );
-                }
-
-                if (selected) {
-                    const selectedText = String(selected);
-                    if (
-                        ![...sel.options].some(
-                            (opt) => opt.value === selectedText,
-                        )
-                    ) {
-                        const opt = document.createElement("option");
-                        opt.value = selectedText;
-                        opt.textContent = sampleRateLabel(selected);
-                        sel.appendChild(opt);
-                    }
-                    sel.value = selectedText;
-                }
+                const fixedRate = 50000000;
+                const opt = document.createElement("option");
+                void rates;
+                void selected;
+                opt.value = String(fixedRate);
+                opt.textContent = sampleRateLabel(fixedRate);
+                opt.selected = true;
+                sel.replaceChildren(opt);
+                sel.disabled = true;
             }
 
             function setRateLimitValue(value) {
@@ -4215,9 +4217,7 @@
                           ),
                     samplerate: direct
                         ? 50000000
-                        : parseFloat(
-                              document.getElementById("samplerate").value,
-                          ),
+                        : 50000000,
                     bw_ratio: direct
                         ? 1.0
                         : parseFloat(document.getElementById("bwRatio").value),
@@ -4528,6 +4528,8 @@
             (async function init() {
                 const status = await apiGet("/api/status");
                 if (status) {
+                    document.getElementById("infoSw").textContent =
+                        status.sw_version || "---";
                     document.getElementById("infoHw").textContent =
                         status.hardware || "---";
                     document.getElementById("infoFw").textContent =
@@ -4645,7 +4647,10 @@
                 }
                 syncWaterfallBrightness("max");
                 updateRateRangeDisplay();
-                setWaterfallAuto(localStorage.getItem("wfAuto") === "1");
+                const savedWfAuto = localStorage.getItem("wfAuto");
+                setWaterfallAuto(
+                    savedWfAuto === null ? true : savedWfAuto === "1",
+                );
 
                 if (!status) {
                     updateUI(false, false);

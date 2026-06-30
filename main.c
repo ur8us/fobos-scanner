@@ -50,6 +50,9 @@
 #define MARKERS_PATH        "markers.ini"
 #define FQ_RESPONSE_PATH    "fq_response.txt"
 #define MIN_FREQ_START_HZ   50.0e6
+#define RF_RECEIVER_MIN_HZ  50.0e6
+#define RF_RECEIVER_MAX_HZ  6000.0e6
+#define SCANNER_SAMPLE_RATE_HZ 50.0e6
 #define DISPLAY_BINS_MIN    64
 #define DISPLAY_BINS_MAX    32768
 
@@ -63,9 +66,11 @@
 #define FFT_LEVEL_REF_SIZE  FFT_SIZE_MIN
 #define FFTS_PER_STEP       32
 #define SCAN_FFTS_PER_STEP  1
-#define SCAN_BUF_LEN        65536
+/* Hardware scan dwell. 65536 is the agile API minimum; 12*8192 gives
+ * marginal retunes time to leave the API's "tuning incomplete" state. */
+#define SCAN_BUF_LEN        (8192U * 12U)
 #define PROCESS_QUEUE_LEN   8
-#define DIRECT_SAMPLING_RATE_HZ 50.0e6
+#define DIRECT_SAMPLING_RATE_HZ SCANNER_SAMPLE_RATE_HZ
 #define DIRECT_SAMPLING_MAX_HZ 25.0e6
 #define HARDWARE_AUTO_BANDWIDTH 1.0
 #define DB_FLOOR            -100.0f
@@ -114,6 +119,10 @@ typedef struct {
     float min_correction;
     float max_correction;
 } fq_response_table_t;
+typedef struct {
+    double start;
+    double end;
+} freq_interval_t;
 static volatile run_mode_t g_active_mode = RUN_MODE_SCAN;
 static pthread_mutex_t g_fft_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_fft_generation = 1;
@@ -125,7 +134,7 @@ static double g_freq_end     = 2000.0e6;
 static double g_visible_start = MIN_FREQ_START_HZ;
 static double g_visible_end   = 2000.0e6;
 static double g_converter_freq = 0.0;
-static double g_samplerate   = 50.0e6;
+static double g_samplerate   = SCANNER_SAMPLE_RATE_HZ;
 static double g_bw_ratio     = 0.9;
 static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 0;
@@ -401,6 +410,9 @@ static void force_direct_sampling_defaults(int reset_visible)
 #define CONFIG_FILE "fobos-scanner.conf"
 
 static void clamp_visible_to_config(void);
+static int clamp_configured_band_to_receiver_limits(void);
+static void clamp_scan_end_to_hardware_limit(void);
+static int receiver_frequency_valid(double rx_freq);
 
 static void save_config(void)
 {
@@ -461,10 +473,14 @@ static void load_config(void)
         g_visible_start = g_freq_start;
         g_visible_end = g_freq_end;
     }
+    g_samplerate = SCANNER_SAMPLE_RATE_HZ;
     if (direct_sampling_enabled())
         force_direct_sampling_defaults(!have_visible_start || !have_visible_end);
-    else
+    else {
+        clamp_configured_band_to_receiver_limits();
+        clamp_scan_end_to_hardware_limit();
         clamp_visible_to_config();
+    }
     printf("[SDR] Loaded config from %s\n", CONFIG_FILE);
 }
 
@@ -1323,6 +1339,7 @@ typedef struct {
     uint64_t rate_output_seq;
     uint64_t rate_dropped;
     uint64_t rate_output_dropped;
+    uint64_t tuning_skipped;
     volatile long long last_callback_msec;
     volatile int watchdog_stop;
     volatile int watchdog_triggered;
@@ -1445,6 +1462,9 @@ static void clamp_scan_end_to_hardware_limit(void)
         return;
     }
 
+    if (clamp_configured_band_to_receiver_limits() != 0)
+        return;
+
     if (step <= 0.0 || g_freq_end <= g_freq_start)
         return;
 
@@ -1490,7 +1510,7 @@ static int build_device_scan_frequencies(const double *air_freqs, int count, dou
             device_freqs[i] = air_freqs[i] - g_converter_freq;
         else
             device_freqs[i] = fabs(-g_converter_freq - air_freqs[i]);
-        if (device_freqs[i] < 0.0)
+        if (!receiver_frequency_valid(device_freqs[i]))
             return -1;
     }
     return 0;
@@ -1501,6 +1521,120 @@ static double receiver_frequency_from_radio(double air_freq)
     if (g_converter_freq >= 0.0)
         return air_freq - g_converter_freq;
     return fabs(-g_converter_freq - air_freq);
+}
+
+static int receiver_frequency_valid(double rx_freq)
+{
+    return rx_freq >= RF_RECEIVER_MIN_HZ && rx_freq <= RF_RECEIVER_MAX_HZ;
+}
+
+static int append_air_interval(freq_interval_t *intervals, int count,
+                               double start, double end)
+{
+    if (end <= MIN_FREQ_START_HZ || end <= start || count >= 2)
+        return count;
+    if (start < MIN_FREQ_START_HZ)
+        start = MIN_FREQ_START_HZ;
+    if (end > start) {
+        intervals[count].start = start;
+        intervals[count].end = end;
+        count++;
+    }
+    return count;
+}
+
+static int air_intervals_for_receiver_limits(freq_interval_t *intervals)
+{
+    if (g_converter_freq >= 0.0) {
+        return append_air_interval(intervals, 0,
+                                   g_converter_freq + RF_RECEIVER_MIN_HZ,
+                                   g_converter_freq + RF_RECEIVER_MAX_HZ);
+    }
+
+    {
+        double conv = -g_converter_freq;
+        int count = 0;
+        count = append_air_interval(intervals, count,
+                                    conv - RF_RECEIVER_MAX_HZ,
+                                    conv - RF_RECEIVER_MIN_HZ);
+        count = append_air_interval(intervals, count,
+                                    conv + RF_RECEIVER_MIN_HZ,
+                                    conv + RF_RECEIVER_MAX_HZ);
+        return count;
+    }
+}
+
+static int clamp_configured_band_to_receiver_limits(void)
+{
+    freq_interval_t intervals[2];
+    double req_start = g_freq_start;
+    double req_end = g_freq_end;
+    double req_span = req_end - req_start;
+    double req_center = (req_start + req_end) * 0.5;
+    int count;
+    int best = -1;
+    double best_overlap = 0.0;
+
+    if (direct_sampling_enabled())
+        return 0;
+
+    count = air_intervals_for_receiver_limits(intervals);
+    if (count <= 0)
+        return -1;
+
+    for (int i = 0; i < count; i++) {
+        double overlap_start = req_start > intervals[i].start ?
+            req_start : intervals[i].start;
+        double overlap_end = req_end < intervals[i].end ?
+            req_end : intervals[i].end;
+        double overlap = overlap_end - overlap_start;
+        if (overlap > best_overlap) {
+            best_overlap = overlap;
+            best = i;
+        }
+    }
+
+    if (best >= 0 && best_overlap > 0.0) {
+        if (g_freq_start < intervals[best].start)
+            g_freq_start = intervals[best].start;
+        if (g_freq_end > intervals[best].end)
+            g_freq_end = intervals[best].end;
+    } else {
+        double best_distance = 0.0;
+        for (int i = 0; i < count; i++) {
+            double distance = 0.0;
+            if (req_center < intervals[i].start)
+                distance = intervals[i].start - req_center;
+            else if (req_center > intervals[i].end)
+                distance = req_center - intervals[i].end;
+            if (best < 0 || distance < best_distance) {
+                best = i;
+                best_distance = distance;
+            }
+        }
+        if (best < 0)
+            return -1;
+        if (req_span <= 0.0 || req_span > intervals[best].end - intervals[best].start)
+            req_span = intervals[best].end - intervals[best].start;
+        req_center = (req_center < intervals[best].start) ? intervals[best].start :
+            (req_center > intervals[best].end ? intervals[best].end : req_center);
+        g_freq_start = req_center - req_span * 0.5;
+        g_freq_end = g_freq_start + req_span;
+        if (g_freq_start < intervals[best].start) {
+            g_freq_start = intervals[best].start;
+            g_freq_end = g_freq_start + req_span;
+        }
+        if (g_freq_end > intervals[best].end) {
+            g_freq_end = intervals[best].end;
+            g_freq_start = g_freq_end - req_span;
+        }
+    }
+
+    if (g_freq_start < MIN_FREQ_START_HZ)
+        g_freq_start = MIN_FREQ_START_HZ;
+    if (g_freq_end <= g_freq_start)
+        return -1;
+    return 0;
 }
 
 static int source_band_covers_visible(double center, double source_span,
@@ -1530,7 +1664,7 @@ static double single_source_center_for_visible(double visible_start,
         double center = candidates[i];
         if (!source_band_covers_visible(center, source_span, visible_start, visible_end))
             continue;
-        if (receiver_frequency_from_radio(center) >= 0.0)
+        if (receiver_frequency_valid(receiver_frequency_from_radio(center)))
             return center;
     }
 
@@ -2800,7 +2934,11 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
 
     ctx->last_callback_msec = now_msec();
     channel = ctx->single_mode ? 0 : fobos_sdr_get_scan_index(dev);
-    if (channel < 0 || channel >= ctx->total_steps)
+    if (channel < 0) {
+        ctx->tuning_skipped++;
+        return;
+    }
+    if (channel >= ctx->total_steps)
         return;
     if (!scan_callback_should_process(ctx, channel))
         return;
@@ -2882,8 +3020,9 @@ static void *scan_thread_func(void *arg)
         scan_start = center - single_plan.source_span * 0.5;
         scan_end = center + single_plan.source_span * 0.5;
         device_center = direct_sampling_enabled() ? 0.0 : receiver_frequency_from_radio(center);
-        if (!direct_sampling_enabled() && device_center < 0.0) {
-            fprintf(stderr, "[SDR] Converter frequency makes receiver frequency negative\n");
+        if (!direct_sampling_enabled() && !receiver_frequency_valid(device_center)) {
+            fprintf(stderr, "[SDR] Converter frequency puts receiver center outside %.0f - %.0f Hz\n",
+                    RF_RECEIVER_MIN_HZ, RF_RECEIVER_MAX_HZ);
             g_scanning = 0;
             return NULL;
         }
@@ -2898,7 +3037,8 @@ static void *scan_thread_func(void *arg)
         }
 
         if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) {
-            fprintf(stderr, "[SDR] Converter frequency makes hardware scan frequency negative\n");
+            fprintf(stderr, "[SDR] Converter frequency puts hardware scan outside %.0f - %.0f Hz\n",
+                    RF_RECEIVER_MIN_HZ, RF_RECEIVER_MAX_HZ);
             g_scanning = 0;
             return NULL;
         }
@@ -3071,6 +3211,10 @@ static void *scan_thread_func(void *arg)
         fprintf(stderr, "[SDR] Rate-limited %llu processed FFT lines\n",
                 (unsigned long long)ctx.rate_output_dropped);
     }
+    if (ctx.tuning_skipped > 0) {
+        fprintf(stderr, "[SDR] Skipped %llu tuning-incomplete scan buffers\n",
+                (unsigned long long)ctx.tuning_skipped);
+    }
     g_scanning = 0;
     scan_queue_destroy(&ctx);
     free(ctx.window);
@@ -3119,7 +3263,8 @@ static int start_scan(void)
         center = direct_sampling_enabled() ?
             direct_source_center_for_visible(start, end, plan.source_span) :
             single_source_center_for_visible(start, end, plan.source_span);
-        if (!direct_sampling_enabled() && receiver_frequency_from_radio(center) < 0.0)
+        if (!direct_sampling_enabled() &&
+            !receiver_frequency_valid(receiver_frequency_from_radio(center)))
             return -1;
     } else {
         total_steps = build_scan_frequencies(air_freqs, &step);
@@ -3728,6 +3873,39 @@ static int json_body_for_request(const http_request_t *http, json_doc_t *doc,
     return 0;
 }
 
+static const char *build_sw_version(void)
+{
+    static char version[32];
+    static int initialized = 0;
+    char mon[4] = {0};
+    int day = 0;
+    int year = 0;
+    int month = 0;
+    static const char *months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+
+    if (initialized)
+        return version;
+
+    if (sscanf(__DATE__, "%3s %d %d", mon, &day, &year) == 3) {
+        for (int i = 0; i < 12; i++) {
+            if (strcmp(mon, months[i]) == 0) {
+                month = i + 1;
+                break;
+            }
+        }
+    }
+
+    if (year > 0 && month > 0 && day > 0)
+        snprintf(version, sizeof(version), "%04d%02d%02d", year, month, day);
+    else
+        snprintf(version, sizeof(version), "00000000");
+    initialized = 1;
+    return version;
+}
+
 static void handle_request(int client_fd, const char *req, size_t req_len,
                            int truncated)
 {
@@ -3883,6 +4061,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
 
         int n = snprintf(body, sizeof(body),
             "{\"device\":\"Fobos SDR\","
+            "\"sw_version\":\"%s\","
             "\"hardware\":\"%s\",\"firmware\":\"%s\",\"serial\":\"%s\","
             "\"manufacturer\":\"%s\",\"product\":\"%s\","
             "\"scanning\":%d,\"device_present\":%d,"
@@ -3904,6 +4083,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"clk_source\":%u,\"freq_comp\":%u,"
             "\"direct_sampling_max_hz\":%.0f,"
             "\"sample_rates\":%s}",
+            build_sw_version(),
             g_hw_rev, g_fw_ver, g_serial,
             g_manufacturer, g_product,
             g_scanning, g_dev != NULL,
@@ -3954,7 +4134,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         double freq_start_tmp = g_freq_start;
         double freq_end_tmp = g_freq_end;
         double converter_tmp = g_converter_freq;
-        double samplerate_tmp = g_samplerate;
+        double samplerate_tmp = SCANNER_SAMPLE_RATE_HZ;
         double bw_ratio_tmp = g_bw_ratio;
         double visible_start_tmp = 0.0;
         double visible_end_tmp = 0.0;
@@ -3986,7 +4166,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         if (json_get_double(&json, "converter_freq", &number_tmp, &present) != 0) goto start_bad_json;
         if (present) converter_tmp = number_tmp * 1.0e6;
         if (json_get_double(&json, "samplerate", &number_tmp, &present) != 0) goto start_bad_json;
-        if (present) samplerate_tmp = number_tmp;
+        samplerate_tmp = SCANNER_SAMPLE_RATE_HZ;
         if (json_get_double(&json, "bw_ratio", &number_tmp, &present) != 0) goto start_bad_json;
         if (present) bw_ratio_tmp = number_tmp;
         if (json_get_uint(&json, "lna_gain", &uint_tmp, &present) != 0) goto start_bad_json;
@@ -4043,7 +4223,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         g_freq_start = freq_start_tmp;
         g_freq_end = freq_end_tmp;
         g_converter_freq = converter_tmp;
-        g_samplerate = samplerate_tmp;
+        g_samplerate = SCANNER_SAMPLE_RATE_HZ;
         g_bw_ratio = bw_ratio_tmp;
         g_lna_gain = lna_tmp;
         g_vga_gain = vga_tmp;
@@ -4067,6 +4247,12 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             if (g_bw_ratio > 1.0) g_bw_ratio = 1.0;
             if (g_freq_start < MIN_FREQ_START_HZ)
                 g_freq_start = MIN_FREQ_START_HZ;
+            if (clamp_configured_band_to_receiver_limits() != 0) {
+                send_json_error(client_fd, 400, "Bad Request", cors,
+                                "converter frequency leaves no valid receiver range");
+                close(client_fd);
+                return;
+            }
             clamp_scan_end_to_hardware_limit();
             if (have_visible_start && have_visible_end) {
                 g_visible_start = visible_start_tmp;
