@@ -17,7 +17,7 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Adjustable LNA `0..3` and VGA `0..31` gain while scanning
 - Converter frequency offset for upconverter/downconverter use
 - Waterfall brightness window controls up to `400`
-- Configurable frequency range, sample rate, bandwidth ratio, line-rate limit, and direct sampling mode
+- Configurable frequency range, sample rate, software bandwidth ratio, line-rate limit, and direct sampling mode
 - Single-frequency super-zoom path using automatic 1024-65536 FFT sizing plus CIC decimation when the visible span is too narrow for a direct FFT
 - Minimum line-rate control for decimated single-stream zoom using FFT-window overlap
 - Editable `bands.ini` spectrum overlays
@@ -34,6 +34,8 @@ The scan band is split into hardware scan points with:
 ```text
 step = samplerate * bw_ratio
 ```
+
+In the scanner, `bw_ratio` is a software scan/display ratio only. The backend keeps the Fobos SDR hardware auto bandwidth at full bandwidth (`1.0`) so each 50 MHz sample stream contains the full receiver passband.
 
 The Fobos agile scan list is limited to `256` frequencies. If the requested band needs more points, the backend clamps the effective end frequency to the last covered frequency and returns that value to the frontend.
 
@@ -277,7 +279,7 @@ raw_avg_db          robust averaged response before final smoothing/symmetry
 despurred_db        raw average after narrow upward peak clamping
 ```
 
-When `fq_response.txt` is present in the scanner directory, the backend loads its smoothed `correction_linear` column on startup. The correction is applied only to hardware scan-mode FFT bins; single-frequency fixed/zoom mode is left unchanged. If the active scan FFT size is smaller than the calibration table, the backend selects the matching normalized baseband correction element for each FFT bin.
+When `fq_response.txt` is present in the scanner directory, the backend loads its smoothed `correction_linear` column on startup. The correction is applied only to hardware scan-mode FFT bins; single-frequency fixed/zoom mode is left unchanged. The table is FFT-shifted low-to-high: index `0` is `-Fs/2`, the middle row is DC, and the final row is `+Fs/2`. The backend indexes the table by physical baseband offset, using the calibration sample-rate metadata when present, so `BW ratio = 0.5` at the calibration sample rate uses the centered 50% of a `BW=1.0` calibration instead of compressing the full edge correction into the narrower scan slice. Values are interpolated for smaller FFT sizes and for the shorter final scan step.
 
 Useful options:
 
@@ -341,4 +343,5 @@ Useful options:
 - FFT size updates live through `POST /api/fft`.
 - Waterfall data is sent as compact `uint8` magnitude rows over Server-Sent Events.
 - FFT magnitudes are Hann-window normalized and compensated to a `1024`-point FFT reference bandwidth so displayed signal levels stay comparable when FFT size changes.
+- Scanner `BW RATIO` does not narrow the Fobos hardware filter; hardware auto bandwidth is set to full passband during scanner starts.
 - Rate limit options are saved in `fobos-scanner.conf`; the default is `20 lines/s`.

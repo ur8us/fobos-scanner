@@ -67,6 +67,7 @@
 #define PROCESS_QUEUE_LEN   8
 #define DIRECT_SAMPLING_RATE_HZ 50.0e6
 #define DIRECT_SAMPLING_MAX_HZ 25.0e6
+#define HARDWARE_AUTO_BANDWIDTH 1.0
 #define DB_FLOOR            -100.0f
 #define DB_CEIL             -20.0f
 #define FRONTEND_IDLE_STOP_MS 20000LL
@@ -109,6 +110,7 @@ typedef struct {
     float *correction_linear;
     size_t count;
     double samplerate_hz;
+    double bw_ratio;
     float min_correction;
     float max_correction;
 } fq_response_table_t;
@@ -497,6 +499,7 @@ static void load_fq_response_table(void)
     size_t count = 0;
     size_t capacity = 0;
     double samplerate_hz = 0.0;
+    double bw_ratio = 1.0;
     float min_corr = 0.0f;
     float max_corr = 0.0f;
 
@@ -525,6 +528,11 @@ static void load_fq_response_table(void)
         if (*p == '#') {
             if (sscanf(p, "# samplerate_hz %lf", &samplerate_hz) == 1)
                 continue;
+            if (sscanf(p, "# bw_ratio %lf", &bw_ratio) == 1) {
+                if (bw_ratio <= 0.0 || bw_ratio > 1.0)
+                    bw_ratio = 1.0;
+                continue;
+            }
             continue;
         }
 
@@ -559,6 +567,7 @@ static void load_fq_response_table(void)
     g_fq_response.correction_linear = values;
     g_fq_response.count = count;
     g_fq_response.samplerate_hz = samplerate_hz;
+    g_fq_response.bw_ratio = bw_ratio;
     g_fq_response.min_correction = min_corr;
     g_fq_response.max_correction = max_corr;
 
@@ -566,6 +575,7 @@ static void load_fq_response_table(void)
            g_fq_response.count, FQ_RESPONSE_PATH);
     if (samplerate_hz > 0.0)
         printf(", measured at %.3f MHz", samplerate_hz / 1.0e6);
+    printf(", BW %.3f", bw_ratio);
     printf(", correction %.3f..%.3f, scan mode only\n",
            min_corr, max_corr);
 }
@@ -1942,39 +1952,74 @@ static int current_line_bins(void)
     return (total_steps - 1) * bins_per_step + last_bins;
 }
 
-static float *build_scan_fq_correction(int fft_size, int bins)
+static float fq_response_correction_at(double pos)
+{
+    double idxd;
+    size_t lo;
+    size_t hi;
+    double frac;
+
+    if (!g_fq_response.correction_linear || g_fq_response.count == 0)
+        return 1.0f;
+    if (g_fq_response.count == 1)
+        return g_fq_response.correction_linear[0];
+
+    if (pos < 0.0)
+        pos = 0.0;
+    if (pos > 1.0)
+        pos = 1.0;
+
+    idxd = pos * (double)(g_fq_response.count - 1U);
+    lo = (size_t)floor(idxd);
+    if (lo >= g_fq_response.count - 1U)
+        return g_fq_response.correction_linear[g_fq_response.count - 1U];
+    hi = lo + 1U;
+    frac = idxd - (double)lo;
+
+    return (float)((1.0 - frac) * (double)g_fq_response.correction_linear[lo] +
+                   frac * (double)g_fq_response.correction_linear[hi]);
+}
+
+static float *build_scan_fq_correction(int active_bins, int output_bins,
+                                       double active_span_ratio)
 {
     float *corr;
-    int shifted_start;
+    int start;
 
     if (!g_fq_response.correction_linear || g_fq_response.count == 0 ||
-        fft_size <= 0 || bins <= 0)
+        active_bins <= 0 || output_bins <= 0)
         return NULL;
 
-    corr = malloc((size_t)bins * sizeof(float));
+    if (output_bins > active_bins)
+        active_bins = output_bins;
+
+    corr = malloc((size_t)output_bins * sizeof(float));
     if (!corr)
         return NULL;
 
-    shifted_start = (fft_size - bins) / 2;
-    for (int i = 0; i < bins; i++) {
-        int shifted_bin = shifted_start + i;
-        if (shifted_bin < 0)
-            shifted_bin = 0;
-        if (shifted_bin >= fft_size)
-            shifted_bin = fft_size - 1;
+    if (active_span_ratio <= 0.0 || active_span_ratio > 1.0)
+        active_span_ratio = 1.0;
 
-        if (g_fq_response.count == 0) {
-            corr[i] = 1.0f;
-        } else if (g_fq_response.count == 1) {
-            corr[i] = g_fq_response.correction_linear[0];
-        } else {
-            double pos = (fft_size > 1) ? (double)shifted_bin / (double)(fft_size - 1) : 0.0;
-            double idxd = pos * (double)(g_fq_response.count - 1);
-            size_t table_index = (size_t)floor(idxd + 0.5);
-            if (table_index >= g_fq_response.count)
-                table_index = g_fq_response.count - 1U;
-            corr[i] = g_fq_response.correction_linear[table_index];
-        }
+    /*
+     * The table is already FFT-shifted low-to-high: index 0 is -Fs/2, the
+     * middle is DC, and the end is +Fs/2. The scanner extracts a centered
+     * physical baseband slice; BW=0.5 at the calibration sample rate means
+     * -0.25Fs..+0.25Fs, not a rescaled copy of the full BW=1.0 response. Map
+     * by physical offset into the table so lower BW ratios use the
+     * corresponding centered slice and do not get over-corrected by the
+     * full-band edge correction. A shorter final scan slice uses the centered
+     * subset of the active span.
+     */
+    start = (active_bins - output_bins) / 2;
+    for (int i = 0; i < output_bins; i++) {
+        double active_pos;
+        double pos;
+        if (active_bins <= 1)
+            active_pos = 0.5;
+        else
+            active_pos = (double)(start + i) / (double)(active_bins - 1);
+        pos = 0.5 + (active_pos - 0.5) * active_span_ratio;
+        corr[i] = fq_response_correction_at(pos);
     }
 
     return corr;
@@ -2001,6 +2046,7 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
     float *scan_fq_last_corr = NULL;
     float *line_buf = NULL;
     float mag_scale;
+    double correction_span_ratio;
 
     for (;;) {
         pthread_mutex_lock(&g_fft_mutex);
@@ -2034,17 +2080,26 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         last_bins = bins_for_width_and_rate(last_width, fft_samplerate, fft_ratio, fft_size);
         line_bins = (ctx->total_steps - 1) * bins_per_step + last_bins;
         bin_count = (size_t)line_bins;
+        correction_span_ratio = fft_ratio;
+        if (g_fq_response.samplerate_hz > 0.0 && fft_samplerate > 0.0)
+            correction_span_ratio = (fft_samplerate * fft_ratio) /
+                g_fq_response.samplerate_hz;
 
         window = malloc((size_t)fft_size * sizeof(float));
         fft_scratch = malloc((size_t)fft_size * 2 * sizeof(float));
         if (decim_factor > 1)
             decim_accum = malloc((size_t)fft_size * 2 * sizeof(float));
         if (!ctx->single_mode) {
-            scan_fq_corr = build_scan_fq_correction(fft_size, bins_per_step);
+            scan_fq_corr = build_scan_fq_correction(bins_per_step, bins_per_step,
+                                                    correction_span_ratio);
             if (last_bins == bins_per_step)
-                scan_fq_last_corr = build_scan_fq_correction(fft_size, bins_per_step);
+                scan_fq_last_corr = build_scan_fq_correction(bins_per_step,
+                                                             bins_per_step,
+                                                             correction_span_ratio);
             else
-                scan_fq_last_corr = build_scan_fq_correction(fft_size, last_bins);
+                scan_fq_last_corr = build_scan_fq_correction(bins_per_step,
+                                                             last_bins,
+                                                             correction_span_ratio);
         }
         line_buf = malloc(bin_count * sizeof(float));
         if (!window || !fft_scratch || (decim_factor > 1 && !decim_accum) ||
@@ -2917,7 +2972,12 @@ static void *scan_thread_func(void *arg)
     if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_clk_source failed: %d\n", ret); device_error = 1; }
     ret = fobos_sdr_set_samplerate(g_dev, g_samplerate);
     if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_samplerate failed: %d\n", ret); device_error = 1; }
-    ret = fobos_sdr_set_auto_bandwidth(g_dev, g_bw_ratio);
+    /*
+     * Keep the hardware passband full. UI BW ratio is a scanner/software
+     * concept: it controls scan step width and which centered FFT bins are
+     * published, not the Fobos SDR analog/baseband low-pass bandwidth.
+     */
+    ret = fobos_sdr_set_auto_bandwidth(g_dev, HARDWARE_AUTO_BANDWIDTH);
     if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_auto_bandwidth failed: %d\n", ret); device_error = 1; }
     if (!direct_sampling_enabled()) {
         ret = fobos_sdr_set_lna_gain(g_dev, g_lna_gain);

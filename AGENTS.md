@@ -28,7 +28,7 @@ The utility intentionally captures at many receiver center frequencies over mult
 
 The text output contains `response_db`, `correction_db`, `correction_linear`, `raw_avg_db`, and `despurred_db`; future scanner compensation should consume the correction values as an inverse frequency-domain window, not as waterfall brightness settings. Do not let narrow spurs become inverse correction notches.
 
-`main.c` loads `fq_response.txt` at startup when present and applies the smoothed `correction_linear` column only in hardware scan mode. The correction table is mapped by normalized baseband bin position so smaller scan FFT sizes sample the corresponding elements from the calibration table. Do not apply this table to single-frequency fixed/zoom mode unless that mode gets its own correction design.
+`main.c` loads `fq_response.txt` at startup when present and applies the smoothed `correction_linear` column only in hardware scan mode. The table is FFT-shifted low-to-high: row `0` is `-Fs/2`, the middle row is DC, and the final row is `+Fs/2`; do not index it by unshifted FFT bins. The scanner indexes by physical baseband offset, using calibration sample-rate metadata when present, so lower BW ratios use the centered corresponding slice of a BW=1.0 calibration instead of compressing the full edge correction into the narrower scan slice. Use interpolation for smaller FFT sizes and the centered subset for a shorter final scan slice. Do not apply this table to single-frequency fixed/zoom mode unless that mode gets its own correction design.
 
 ## Scanner Architecture
 
@@ -51,7 +51,7 @@ Single mode chooses the smallest power-of-two FFT size that can fill the current
 
 The backend should not auto-start a scan immediately after the server banner. The web UI starts scanning through `/api/start`, and if a scan is already active the UI should attach to `/api/waterfall` instead of restarting it. This avoids racing Fobos async USB setup during page load or refresh.
 
-`/api/start` is for hardware scan changes: band, sample rate, bandwidth ratio, converter, direct sampling, and gains. It can restart the hardware scan.
+`/api/start` is for scan changes: band, sample rate, software bandwidth ratio, converter, direct sampling, and gains. It can restart the hardware scan.
 
 Gain limits must match the Fobos SDR API behavior used by the UI and `fobos-stream-test`: LNA accepts `0..3`, VGA accepts `0..31`.
 
@@ -96,7 +96,7 @@ Frontend frequencies are air/signal frequencies. The backend converts them to re
 
 ## Bandwidth Ratio
 
-`bw_ratio` controls both scan spacing and displayed FFT width:
+`bw_ratio` is a software scanner ratio. It controls scan spacing and displayed FFT width only; do not use it to narrow the Fobos SDR hardware auto bandwidth. Scanner starts should keep the hardware passband full with `fobos_sdr_set_auto_bandwidth(..., 1.0)` so each 50 MHz stream contains the full receiver bandwidth.
 
 - `1.0` means scan in `samplerate` steps and display the full FFT span for each step.
 - `0.5` means scan in `samplerate / 2` steps and display only the centered half of each FFT result.
