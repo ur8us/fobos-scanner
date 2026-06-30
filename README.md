@@ -20,14 +20,14 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Configurable frequency range, sample rate, bandwidth ratio, line-rate limit, and direct sampling mode
 - Single-frequency super-zoom path using automatic 1024-65536 FFT sizing plus CIC decimation when the visible span is too narrow for a direct FFT
 - Minimum line-rate control for decimated single-stream zoom using FFT-window overlap
-- Editable `bands.ini` spectrum overlays for QO-100 NB/WB transponder ranges
+- Editable `bands.ini` spectrum overlays
 - Editable frequency markers using `Shift + left-click` or `Ctrl/Alt + right-click`
 - Browser status heartbeat that shows `disconnected`, `idle`, or `scanning`
 - Hardened flat-JSON control parser, explicit bad-request responses, validated marker saves, and throttled frontend view persistence
 
 ## Operation
 
-The backend opens the device to read board information, starts the HTTP server, and waits for scan commands from the web UI. The frontend automatically starts a scan when the backend is available; if a scan is already running, it attaches to the existing Server-Sent Events stream instead of restarting it.
+The backend opens the device to read board information, starts the HTTP server, and waits for scan commands from the web UI. The frontend automatically starts a scan when the backend is available; if a scan is already running, it attaches to the existing Server-Sent Events stream instead of restarting it. If the browser is closed or stops talking to the backend, the active scan is stopped after about `20` seconds with no frontend HTTP heartbeat and no active waterfall SSE client.
 
 The scan band is split into hardware scan points with:
 
@@ -59,6 +59,15 @@ The file is human editable. Use one section per band with `name`, `start_mhz`, a
 The backend persists the configured scan range and the current visible range in `fobos-scanner.conf`. Pressing Start from the UI intentionally resets the visible range to the full configured band unless the UI sends a preserved view.
 
 Control endpoints accept flat JSON objects. Malformed JSON, invalid numeric fields, unsupported methods, oversized bodies, and invalid marker files return JSON error responses instead of being silently ignored.
+
+## Mouse And Keyboard Controls
+
+- Hover over the spectrum or waterfall to show the frequency. If a converter is configured, the popup also shows `RF:` and `RX:` frequencies; on the spectrum it also shows `Level:`.
+- `Shift + mouse wheel` zooms the visible frequency span around the cursor.
+- Left-drag on the spectrum or waterfall pans the visible frequency span.
+- `Ctrl + left-drag` on the waterfall shows a temporary black/white dashed ruler with horizontal distance in kHz or MHz and vertical time difference in seconds.
+- `Shift + left-click` or `Ctrl/Alt + right-click` opens the frequency marker editor.
+- Plain `+`, `-`, left/right arrows, and `0` zoom, pan, and reset the app view. Browser zoom shortcuts `Ctrl++`, `Ctrl+-`, and `Ctrl+0` are left for the browser.
 
 ## Browser Traffic
 

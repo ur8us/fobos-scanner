@@ -68,6 +68,7 @@
 #define DIRECT_SAMPLING_MAX_HZ 25.0e6
 #define DB_FLOOR            -100.0f
 #define DB_CEIL             -20.0f
+#define FRONTEND_IDLE_STOP_MS 20000LL
 #define MAX_MARKERS         2048
 #define MARKER_NAME_MAX     128
 
@@ -130,6 +131,7 @@ static char g_manufacturer[64] = "unknown";
 static char g_product[64]   = "unknown";
 static double g_sample_rates[MAX_SAMPLE_RATES];
 static unsigned int g_sample_rate_count = 0;
+static long long g_last_frontend_activity_msec = 0;
 
 /* SSE client list */
 static int g_sse_fds[MAX_SSE_CLIENTS];
@@ -147,9 +149,16 @@ static traffic_sample_t g_traffic_samples[TRAFFIC_SAMPLE_COUNT];
 static int g_traffic_sample_pos = 0;
 static pthread_mutex_t g_traffic_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static long long now_msec(void);
+
 /* ------------------------------------------------------------------ */
 /* SSE helpers                                                        */
 /* ------------------------------------------------------------------ */
+static void mark_frontend_activity(void)
+{
+    g_last_frontend_activity_msec = now_msec();
+}
+
 static int write_all(int fd, const char *data, size_t len)
 {
     size_t done = 0;
@@ -160,6 +169,20 @@ static int write_all(int fd, const char *data, size_t len)
         done += (size_t)n;
     }
     return 0;
+}
+
+static int sse_client_count(void)
+{
+    int count = 0;
+
+    pthread_mutex_lock(&g_sse_mutex);
+    for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
+        if (g_sse_fds[i] > 0)
+            count++;
+    }
+    pthread_mutex_unlock(&g_sse_mutex);
+
+    return count;
 }
 
 static void sse_add_client(int fd)
@@ -2861,6 +2884,28 @@ static void stop_scan(void)
     g_scan_thread_joinable = 0;
 }
 
+static void stop_scan_if_frontend_idle(void)
+{
+    long long now;
+    long long idle_ms;
+
+    if (!g_scanning)
+        return;
+    if (sse_client_count() > 0)
+        return;
+    if (g_last_frontend_activity_msec <= 0)
+        return;
+
+    now = now_msec();
+    idle_ms = now - g_last_frontend_activity_msec;
+    if (idle_ms < FRONTEND_IDLE_STOP_MS)
+        return;
+
+    printf("[SDR] No frontend activity for %.1f s; stopping scan\n",
+           (double)idle_ms / 1000.0);
+    stop_scan();
+}
+
 static int apply_gain_settings(void)
 {
     int ret_lna = FOBOS_ERR_OK;
@@ -3435,6 +3480,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         close(client_fd);
         return;
     }
+    mark_frontend_activity();
 
     if (strcmp(http.method, "OPTIONS") == 0) {
         char resp[512];
@@ -4299,6 +4345,7 @@ int main(int argc, char **argv)
         int client_fd;
 
         poll_device_reconnect();
+        stop_scan_if_frontend_idle();
 
         FD_ZERO(&readfds);
         FD_SET(server_fd, &readfds);
