@@ -606,7 +606,7 @@
                     </select>
                 </div>
                 <div class="ctrl-group">
-                    <label>BW Ratio</label>
+                    <label>BW Usage In Auto Scan Mode</label>
                     <select id="bwRatio">
                         <option value="0.1">0.1</option>
                         <option value="0.2">0.2</option>
@@ -614,8 +614,8 @@
                         <option value="0.4">0.4</option>
                         <option value="0.5">0.5</option>
                         <option value="0.7">0.7</option>
-                        <option value="0.8" selected>0.8</option>
-                        <option value="0.9">0.9</option>
+                        <option value="0.8">0.8</option>
+                        <option value="0.9" selected>0.9</option>
                         <option value="1.0">1.0</option>
                     </select>
                 </div>
@@ -694,9 +694,9 @@
                     </div>
                 </div>
                 <div class="ctrl-group check-group">
-                    <label>FQ RESPONSE</label>
+                    <label>IF FQ RESPONSE</label>
                     <label class="check-label">
-                        <input type="checkbox" id="freqComp" />
+                        <input type="checkbox" id="freqComp" checked />
                         Compensate
                     </label>
                 </div>
@@ -1142,6 +1142,27 @@
                 );
             }
 
+            function syncFirstRowControlState() {
+                const locked = scanRunning;
+                const connected = backendOnline;
+                const direct = selectedDirectSampling() !== 0;
+                const disableForDirect = locked || direct;
+
+                document.getElementById("freqStart").disabled =
+                    disableForDirect;
+                document.getElementById("freqEnd").disabled = disableForDirect;
+                document.getElementById("converterFreq").disabled =
+                    disableForDirect;
+                document.getElementById("samplerate").disabled =
+                    disableForDirect;
+                document.getElementById("bwRatio").disabled = disableForDirect;
+                document.getElementById("directSampling").disabled = locked;
+                document.getElementById("clockIn").disabled = locked;
+                document.getElementById("btnStart").disabled =
+                    !connected || locked;
+                document.getElementById("btnStop").disabled = !locked;
+            }
+
             function computedDirectSamplingMaxHz() {
                 const samplerate = selectedDirectSampling()
                     ? 50000000
@@ -1174,11 +1195,6 @@
                 const bwEl = document.getElementById("bwRatio");
                 const lnaEl = document.getElementById("lnaGain");
                 const vgaEl = document.getElementById("vgaGain");
-                startEl.disabled = direct;
-                endEl.disabled = direct;
-                converterEl.disabled = direct;
-                samplerateEl.disabled = direct;
-                bwEl.disabled = direct;
                 lnaEl.disabled = direct;
                 vgaEl.disabled = direct;
                 if (direct || forceValues) {
@@ -1192,6 +1208,7 @@
                     configuredFreq1 = maxHz;
                     currentConverterFreq = 0;
                 }
+                syncFirstRowControlState();
             }
 
             function handleDirectSamplingChanged() {
@@ -4081,8 +4098,7 @@
             function updateUI(running, connected = true) {
                 backendOnline = connected;
                 scanRunning = connected && running;
-                document.getElementById("btnStart").disabled = !connected;
-                document.getElementById("btnStop").disabled = !scanRunning;
+                syncFirstRowControlState();
                 const dot = document.getElementById("statusDot");
                 if (!connected) {
                     dot.className = "status-dot disconnected";

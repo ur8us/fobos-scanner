@@ -337,11 +337,12 @@ Useful options:
 ## Notes
 
 - Default scan start frequency is `50 MHz`.
+- Default software bandwidth usage in auto scan mode is `0.9`; IF frequency-response compensation is enabled by default when `fq_response.txt` is available.
 - The backend listens on port `8080`.
 - The scanner needs access to a connected Fobos SDR supported by the agile firmware/API.
 - Gain sliders update the device live through `POST /api/gain`; LNA accepts `0..3`, VGA accepts `0..31`.
 - FFT size updates live through `POST /api/fft`.
 - Waterfall data is sent as compact `uint8` magnitude rows over Server-Sent Events.
 - FFT magnitudes are Hann-window normalized and compensated to a `1024`-point FFT reference bandwidth so displayed signal levels stay comparable when FFT size changes.
-- Scanner `BW RATIO` does not narrow the Fobos hardware filter; hardware auto bandwidth is set to full passband during scanner starts.
+- Scanner `BW USAGE IN AUTO SCAN MODE` does not narrow the Fobos hardware filter; hardware auto bandwidth is set to full passband during scanner starts.
 - Rate limit options are saved in `fobos-scanner.conf`; the default is `20 lines/s`.

@@ -126,7 +126,7 @@ static double g_visible_start = MIN_FREQ_START_HZ;
 static double g_visible_end   = 2000.0e6;
 static double g_converter_freq = 0.0;
 static double g_samplerate   = 50.0e6;
-static double g_bw_ratio     = 0.1;
+static double g_bw_ratio     = 0.9;
 static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 0;
 static uint32_t g_rate_limit_lps = 20;
@@ -135,7 +135,7 @@ static uint32_t g_lna_gain   = 0;
 static uint32_t g_vga_gain   = 0;
 static uint32_t g_direct_sampling = 0;
 static uint32_t g_clk_source = 0;
-static uint32_t g_freq_comp = 0;
+static uint32_t g_freq_comp = 1;
 
 /* Device info */
 static char g_hw_rev[64]    = "unknown";
