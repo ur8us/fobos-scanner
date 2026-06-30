@@ -69,6 +69,8 @@
 #define DB_FLOOR            -100.0f
 #define DB_CEIL             -20.0f
 #define FRONTEND_IDLE_STOP_MS 20000LL
+#define LNA_GAIN_MAX        3
+#define VGA_GAIN_MAX        31
 #define MAX_MARKERS         2048
 #define MARKER_NAME_MAX     128
 
@@ -426,8 +428,14 @@ static void load_config(void)
         else if (strcmp(key, "bw_ratio") == 0)         g_bw_ratio = val;
         else if (strcmp(key, "visible_start") == 0)   { g_visible_start = val; have_visible_start = 1; }
         else if (strcmp(key, "visible_end") == 0)     { g_visible_end = val; have_visible_end = 1; }
-        else if (strcmp(key, "lna_gain") == 0)        { uval = (unsigned int)val; g_lna_gain = uval; }
-        else if (strcmp(key, "vga_gain") == 0)        { uval = (unsigned int)val; g_vga_gain = uval; }
+        else if (strcmp(key, "lna_gain") == 0) {
+            uval = (unsigned int)val;
+            g_lna_gain = uval > LNA_GAIN_MAX ? LNA_GAIN_MAX : uval;
+        }
+        else if (strcmp(key, "vga_gain") == 0) {
+            uval = (unsigned int)val;
+            g_vga_gain = uval > VGA_GAIN_MAX ? VGA_GAIN_MAX : uval;
+        }
         else if (strcmp(key, "direct_sampling") == 0) { uval = (unsigned int)val; g_direct_sampling = normalize_direct_sampling(uval); }
         else if (strcmp(key, "clk_source") == 0)      { uval = (unsigned int)val; g_clk_source = normalize_clk_source(uval); }
         else if (strcmp(key, "fft_size") == 0) { update_fft_size((int)val); }
@@ -3409,12 +3417,12 @@ static int validate_scan_settings(double freq_start, double freq_end,
         snprintf(err, err_len, "clock source must be internal or external");
         return -1;
     }
-    if (lna_gain > 2) {
-        snprintf(err, err_len, "lna_gain must be 0..2");
+    if (lna_gain > LNA_GAIN_MAX) {
+        snprintf(err, err_len, "lna_gain must be 0..%d", LNA_GAIN_MAX);
         return -1;
     }
-    if (vga_gain > 15) {
-        snprintf(err, err_len, "vga_gain must be 0..15");
+    if (vga_gain > VGA_GAIN_MAX) {
+        snprintf(err, err_len, "vga_gain must be 0..%d", VGA_GAIN_MAX);
         return -1;
     }
     if (!isfinite(samplerate) || samplerate < 1.0 || samplerate > 500.0e6) {
@@ -4047,7 +4055,7 @@ start_bad_json:
             return;
         }
         if (present) {
-            if (value > 2) value = 2;
+            if (value > LNA_GAIN_MAX) value = LNA_GAIN_MAX;
             g_lna_gain = value;
         }
         if (json_get_uint(&json, "vga_gain", &value, &present) != 0) {
@@ -4057,7 +4065,7 @@ start_bad_json:
             return;
         }
         if (present) {
-            if (value > 15) value = 15;
+            if (value > VGA_GAIN_MAX) value = VGA_GAIN_MAX;
             g_vga_gain = value;
         }
 

@@ -14,7 +14,7 @@ The program runs a small C HTTP server on `localhost:8080`, controls the SDR thr
 - Keyboard zoom/pan shortcuts that leave browser `Ctrl++`, `Ctrl+-`, and `Ctrl+0` zoom controls untouched
 - Saved zoom window restored on reload/autostart; pressing Start resets to the full band
 - Hover readout for air frequency, receiver frequency when a converter is set, and spectrum level
-- Adjustable LNA/VGA gain while scanning
+- Adjustable LNA `0..3` and VGA `0..31` gain while scanning
 - Converter frequency offset for upconverter/downconverter use
 - Waterfall brightness window controls up to `400`
 - Configurable frequency range, sample rate, bandwidth ratio, line-rate limit, and direct sampling mode
@@ -274,8 +274,8 @@ Useful options:
 --buf-len complex_samples
 --buf-count N
 --bw-ratio R
---lna N
---vga N
+--lna N        LNA gain, 0..3
+--vga N        VGA gain, 0..31
 --clock internal|external
 ```
 
@@ -284,7 +284,7 @@ Useful options:
 - Default scan start frequency is `50 MHz`.
 - The backend listens on port `8080`.
 - The scanner needs access to a connected Fobos SDR supported by the agile firmware/API.
-- Gain sliders update the device live through `POST /api/gain`.
+- Gain sliders update the device live through `POST /api/gain`; LNA accepts `0..3`, VGA accepts `0..31`.
 - FFT size updates live through `POST /api/fft`.
 - Waterfall data is sent as compact `uint8` magnitude rows over Server-Sent Events.
 - FFT magnitudes are Hann-window normalized and compensated to a `1024`-point FFT reference bandwidth so displayed signal levels stay comparable when FFT size changes.

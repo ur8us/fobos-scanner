@@ -43,6 +43,8 @@ The backend should not auto-start a scan immediately after the server banner. Th
 
 `/api/start` is for hardware scan changes: band, sample rate, bandwidth ratio, converter, direct sampling, and gains. It can restart the hardware scan.
 
+Gain limits must match the Fobos SDR API behavior used by the UI and `fobos-stream-test`: LNA accepts `0..3`, VGA accepts `0..31`.
+
 `/api/fft` is for FFT-size changes only. It must not call `start_scan()`, must not call `fobos_sdr_start_scan()`, and must not reset frontend zoom, waterfall history, or brightness settings. The scan worker notices `g_fft_generation`, swaps FFT buffers, drops the partial mixed-size row, and continues processing the current hardware scan.
 
 The backend HTTP layer intentionally uses a small flat-JSON parser for control endpoints. Keep parsing centralized: do not reintroduce repeated endpoint-local `strstr()` plus `sscanf()` scans. Bad JSON, invalid numeric fields, oversized bodies, unsupported methods, and invalid marker files should return explicit JSON error responses.

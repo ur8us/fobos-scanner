@@ -27,6 +27,8 @@
 #define DEFAULT_BUF_LEN       65536U
 #define DEFAULT_LNA_GAIN      0U
 #define DEFAULT_VGA_GAIN      0U
+#define LNA_GAIN_MAX          3U
+#define VGA_GAIN_MAX          31U
 #define DEFAULT_DIRECT        0U
 #define DEFAULT_CLK_SOURCE    0
 
@@ -109,8 +111,8 @@ static void print_usage(const char *argv0)
         "      --bw-ratio R         auto bandwidth ratio (default %.2f)\n"
         "      --buf-len N          complex samples per async buffer (default %u)\n"
         "      --buf-count N        USB async buffer count (default %u)\n"
-        "      --lna N              LNA gain 0..2 (default %u)\n"
-        "      --vga N              VGA gain 0..15 (default %u)\n"
+        "      --lna N              LNA gain 0..3 (default %u)\n"
+        "      --vga N              VGA gain 0..31 (default %u)\n"
         "      --direct N           direct sampling mode 0/1 (default %u)\n"
         "      --clock internal|external|0|1\n"
         "  -h, --help              show this help\n"
@@ -278,11 +280,11 @@ static int parse_args(int argc, char **argv, test_config_t *cfg)
                 return -1;
             cfg->buf_count = utmp;
         } else if (strcmp(arg, "--lna") == 0) {
-            if (parse_uint_value(value, &utmp) != 0 || utmp > 2)
+            if (parse_uint_value(value, &utmp) != 0 || utmp > LNA_GAIN_MAX)
                 return -1;
             cfg->lna_gain = utmp;
         } else if (strcmp(arg, "--vga") == 0) {
-            if (parse_uint_value(value, &utmp) != 0 || utmp > 15)
+            if (parse_uint_value(value, &utmp) != 0 || utmp > VGA_GAIN_MAX)
                 return -1;
             cfg->vga_gain = utmp;
         } else if (strcmp(arg, "--direct") == 0) {
