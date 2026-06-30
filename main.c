@@ -133,6 +133,7 @@ static uint32_t g_lna_gain   = 0;
 static uint32_t g_vga_gain   = 0;
 static uint32_t g_direct_sampling = 0;
 static uint32_t g_clk_source = 0;
+static uint32_t g_freq_comp = 0;
 
 /* Device info */
 static char g_hw_rev[64]    = "unknown";
@@ -414,6 +415,7 @@ static void save_config(void)
     fprintf(f, "vga_gain = %u\n", g_vga_gain);
     fprintf(f, "direct_sampling = %u\n", g_direct_sampling);
     fprintf(f, "clk_source = %u\n", g_clk_source);
+    fprintf(f, "freq_comp = %u\n", g_freq_comp);
     fprintf(f, "fft_size = %d\n", g_fft_size);
     fprintf(f, "min_rate_lps = %u\n", g_min_rate_lps);
     fprintf(f, "rate_limit_lps = %u\n", g_rate_limit_lps);
@@ -447,6 +449,7 @@ static void load_config(void)
         }
         else if (strcmp(key, "direct_sampling") == 0) { uval = (unsigned int)val; g_direct_sampling = normalize_direct_sampling(uval); }
         else if (strcmp(key, "clk_source") == 0)      { uval = (unsigned int)val; g_clk_source = normalize_clk_source(uval); }
+        else if (strcmp(key, "freq_comp") == 0)       { uval = (unsigned int)val; g_freq_comp = uval ? 1 : 0; }
         else if (strcmp(key, "fft_size") == 0) { update_fft_size((int)val); }
         else if (strcmp(key, "min_rate_lps") == 0) { uval = (unsigned int)val; g_min_rate_lps = normalize_min_rate_lps(uval); }
         else if (strcmp(key, "rate_limit_lps") == 0) { uval = (unsigned int)val; g_rate_limit_lps = normalize_rate_limit_lps(uval); }
@@ -1955,17 +1958,23 @@ static float *build_scan_fq_correction(int fft_size, int bins)
     shifted_start = (fft_size - bins) / 2;
     for (int i = 0; i < bins; i++) {
         int shifted_bin = shifted_start + i;
-        size_t table_index;
-
         if (shifted_bin < 0)
             shifted_bin = 0;
         if (shifted_bin >= fft_size)
             shifted_bin = fft_size - 1;
 
-        table_index = ((size_t)shifted_bin * g_fq_response.count) / (size_t)fft_size;
-        if (table_index >= g_fq_response.count)
-            table_index = g_fq_response.count - 1U;
-        corr[i] = g_fq_response.correction_linear[table_index];
+        if (g_fq_response.count == 0) {
+            corr[i] = 1.0f;
+        } else if (g_fq_response.count == 1) {
+            corr[i] = g_fq_response.correction_linear[0];
+        } else {
+            double pos = (fft_size > 1) ? (double)shifted_bin / (double)(fft_size - 1) : 0.0;
+            double idxd = pos * (double)(g_fq_response.count - 1);
+            size_t table_index = (size_t)floor(idxd + 0.5);
+            if (table_index >= g_fq_response.count)
+                table_index = g_fq_response.count - 1U;
+            corr[i] = g_fq_response.correction_linear[table_index];
+        }
     }
 
     return corr;
@@ -2182,7 +2191,7 @@ static int average_fft_magnitude(float *buf, uint32_t buf_len, int bins_per_step
             float im = local_fft[2*fft_bin+1];
             {
                 float mag = sqrtf(re*re + im*im);
-                if (fq_correction)
+                if (g_freq_comp && fq_correction)
                     mag *= fq_correction[i];
                 out[i] += mag;
             }
@@ -3832,7 +3841,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
             "\"effective_input_samples\":%u,"
             "\"lna_gain\":%u,\"vga_gain\":%u,\"direct_sampling\":%u,"
-            "\"clk_source\":%u,"
+            "\"clk_source\":%u,\"freq_comp\":%u,"
             "\"direct_sampling_max_hz\":%.0f,"
             "\"sample_rates\":%s}",
             g_hw_rev, g_fw_ver, g_serial,
@@ -3851,7 +3860,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             bins_per_step, line_bins, display_bins,
             g_view_id, current_fft_size(), effective_fft,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
-            g_lna_gain, g_vga_gain, g_direct_sampling, g_clk_source,
+            g_lna_gain, g_vga_gain, g_direct_sampling, g_clk_source, g_freq_comp,
             direct_sampling_max_hz(),
             sample_rates);
 
@@ -3893,6 +3902,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         uint32_t vga_tmp = g_vga_gain;
         uint32_t direct_tmp = g_direct_sampling;
         uint32_t clk_tmp = g_clk_source;
+        uint32_t freq_comp_tmp = g_freq_comp;
         uint32_t fft_tmp = (uint32_t)current_fft_size();
         uint32_t display_tmp = (uint32_t)current_display_bins();
         uint32_t min_rate_tmp = g_min_rate_lps;
@@ -3929,6 +3939,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         if (present) clk_tmp = uint_tmp;
         if (json_get_uint(&json, "clock_source", &uint_tmp, &present) != 0) goto start_bad_json;
         if (present) clk_tmp = uint_tmp;
+        if (json_get_uint(&json, "freq_comp", &uint_tmp, &present) != 0) goto start_bad_json;
+        if (present) freq_comp_tmp = uint_tmp ? 1 : 0;
         if (json_get_uint(&json, "fft_size", &uint_tmp, &present) != 0) goto start_bad_json;
         if (present) fft_tmp = uint_tmp;
         if (json_get_uint(&json, "display_bins", &uint_tmp, &present) != 0) goto start_bad_json;
@@ -3977,6 +3989,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         g_vga_gain = vga_tmp;
         g_direct_sampling = normalize_direct_sampling(direct_tmp);
         g_clk_source = normalize_clk_source(clk_tmp);
+        g_freq_comp = freq_comp_tmp ? 1 : 0;
         update_fft_size((int)fft_tmp);
         if (display_tmp > 0)
             g_display_bins = normalize_display_bins((int)display_tmp);
@@ -4262,6 +4275,37 @@ start_bad_json:
         snprintf(json_body, sizeof(json_body),
             "{\"status\":\"%s\",\"lna_gain\":%u,\"vga_gain\":%u}",
             status, g_lna_gain, g_vga_gain);
+        send_json_response(client_fd, 200, "OK", cors, json_body);
+        close(client_fd);
+        return;
+    }
+
+    /* POST /api/freq_comp */
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/freq_comp") == 0) {
+        json_doc_t json;
+        char err[160];
+        uint32_t value;
+        int present = 0;
+
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (json_get_uint(&json, "freq_comp", &value, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed freq_comp");
+            close(client_fd);
+            return;
+        }
+        if (present) {
+            g_freq_comp = value ? 1 : 0;
+            save_config();
+        }
+
+        char json_body[128];
+        snprintf(json_body, sizeof(json_body),
+            "{\"status\":\"ok\",\"freq_comp\":%u}", g_freq_comp);
         send_json_response(client_fd, 200, "OK", cors, json_body);
         close(client_fd);
         return;

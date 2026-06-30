@@ -693,6 +693,13 @@
                         />
                     </div>
                 </div>
+                <div class="ctrl-group check-group">
+                    <label>FQ RESPONSE</label>
+                    <label class="check-label">
+                        <input type="checkbox" id="freqComp" />
+                        Compensate
+                    </label>
+                </div>
                 <div class="ctrl-group dual-group">
                     <label class="dual-label">
                         <span>Waterfall Levels</span>
@@ -2895,7 +2902,10 @@
 
             function scheduleSSEReconnect() {
                 if (!backendOnline || !scanRunning || sseReconnectTimer) return;
-                const delay = Math.min(5000, 500 * Math.max(1, ++sseFailureCount));
+                const delay = Math.min(
+                    5000,
+                    500 * Math.max(1, ++sseFailureCount),
+                );
                 sseReconnectTimer = setTimeout(() => {
                     sseReconnectTimer = 0;
                     if (backendOnline && scanRunning && !eventSource)
@@ -3028,15 +3038,22 @@
             }
 
             function statusDevicePresent(status) {
-                if (!status || status.device_present === undefined)
-                    return true;
+                if (!status || status.device_present === undefined) return true;
                 return !!Number(status.device_present);
             }
 
             function scheduleDesiredScanRestart(status) {
-                if (!desiredScanRunning || autoRestartTimer || autoRestartInFlight)
+                if (
+                    !desiredScanRunning ||
+                    autoRestartTimer ||
+                    autoRestartInFlight
+                )
                     return;
-                if (!backendOnline || scanRunning || !statusDevicePresent(status))
+                if (
+                    !backendOnline ||
+                    scanRunning ||
+                    !statusDevicePresent(status)
+                )
                     return;
 
                 autoRestartTimer = setTimeout(async () => {
@@ -3209,8 +3226,7 @@
                     currentSteps,
                     currentBins ? currentBins.length : displayBins(),
                 );
-                if (axis.right <= axis.left || wfCanvas.width <= 0)
-                    return null;
+                if (axis.right <= axis.left || wfCanvas.width <= 0) return null;
                 const frac = clampNumber(x / wfCanvas.width, 0, 1);
                 return axis.left + frac * (axis.right - axis.left);
             }
@@ -4199,6 +4215,9 @@
                     clk_source: document.getElementById("clockIn").checked
                         ? 1
                         : 0,
+                    freq_comp: document.getElementById("freqComp").checked
+                        ? 1
+                        : 0,
                     min_rate_lps: parseInt(
                         document.getElementById("minRate").value,
                     ),
@@ -4382,11 +4401,19 @@
                     document.getElementById("lnaVal").textContent = this.value;
                     scheduleGainUpdate();
                 });
+            document.getElementById("vgaGain");
             document
                 .getElementById("vgaGain")
                 .addEventListener("input", function () {
                     document.getElementById("vgaVal").textContent = this.value;
                     scheduleGainUpdate();
+                });
+
+            document
+                .getElementById("freqComp")
+                .addEventListener("change", async function () {
+                    const value = this.checked ? 1 : 0;
+                    await apiPost("/api/freq_comp", { freq_comp: value });
                 });
 
             function handleRateSliderInput(changed) {
@@ -4407,14 +4434,10 @@
 
             document
                 .getElementById("rateMinSlider")
-                .addEventListener("input", () =>
-                    handleRateSliderInput("min"),
-                );
+                .addEventListener("input", () => handleRateSliderInput("min"));
             document
                 .getElementById("rateMaxSlider")
-                .addEventListener("input", () =>
-                    handleRateSliderInput("max"),
-                );
+                .addEventListener("input", () => handleRateSliderInput("max"));
             document
                 .getElementById("rateMinSlider")
                 .addEventListener("change", () =>
@@ -4559,6 +4582,10 @@
                     }
                     if (status.clk_source !== undefined) {
                         setClockSourceValue(status.clk_source);
+                    }
+                    if (status.freq_comp !== undefined) {
+                        document.getElementById("freqComp").checked =
+                            status.freq_comp !== 0;
                     }
                     if (status.bw_ratio !== undefined) {
                         const sel = document.getElementById("bwRatio");
