@@ -3247,10 +3247,10 @@ static void *scan_thread_func(void *arg)
      * explicitly to the same full-samplerate value previously requested
      * through auto bandwidth.
      */
-    ret = fobos_sdr_set_auto_bandwidth(g_dev, 0.0);
+    ret = fobos_sdr_set_auto_bandwidth(g_dev, 0.99);
     if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_auto_bandwidth failed: %d\n", ret); device_error = 1; }
-    ret = fobos_sdr_set_bandwidth(g_dev, g_samplerate * HARDWARE_AUTO_BANDWIDTH);
-    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_bandwidth failed: %d\n", ret); device_error = 1; }
+//    ret = fobos_sdr_set_bandwidth(g_dev, g_samplerate * HARDWARE_AUTO_BANDWIDTH);
+//    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_bandwidth failed: %d\n", ret); device_error = 1; }
     if (!direct_sampling_enabled()) {
         ret = fobos_sdr_set_lna_gain(g_dev, g_lna_gain);
         if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_lna_gain failed: %d\n", ret);
