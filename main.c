@@ -72,6 +72,8 @@
 #define PROCESS_QUEUE_LEN   8
 #define DIRECT_SAMPLING_RATE_HZ SCANNER_SAMPLE_RATE_HZ
 #define DIRECT_SAMPLING_MAX_HZ 25.0e6
+#define HARDWARE_AUTO_BANDWIDTH 1.0
+#define PSEUDO_RANDOM_SAMPLE_SOURCE 0
 #define DB_FLOOR            -100.0f
 #define DB_CEIL             -20.0f
 #define FRONTEND_IDLE_STOP_MS 20000LL
@@ -134,7 +136,7 @@ static double g_visible_start = MIN_FREQ_START_HZ;
 static double g_visible_end   = 2000.0e6;
 static double g_converter_freq = 0.0;
 static double g_samplerate   = SCANNER_SAMPLE_RATE_HZ;
-static double g_bw_ratio     = 0.9;
+static double g_bw_ratio     = 0.5;
 static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 10;
 static uint32_t g_rate_limit_lps = 20;
@@ -143,7 +145,7 @@ static uint32_t g_lna_gain   = 0;
 static uint32_t g_vga_gain   = 0;
 static uint32_t g_direct_sampling = 0;
 static uint32_t g_clk_source = 0;
-static uint32_t g_freq_comp = 1;
+static uint32_t g_freq_comp = 0;
 
 /* Device info */
 static char g_hw_rev[64]    = "unknown";
@@ -1134,6 +1136,7 @@ static int http_content_length(const char *req)
     return len;
 }
 
+#if !PSEUDO_RANDOM_SAMPLE_SOURCE
 static void load_sample_rates(struct fobos_sdr_dev_t *dev)
 {
     unsigned int count = 0;
@@ -1146,6 +1149,7 @@ static void load_sample_rates(struct fobos_sdr_dev_t *dev)
         count = MAX_SAMPLE_RATES;
     g_sample_rate_count = count;
 }
+#endif
 
 static void format_sample_rates_json(char *buf, size_t len)
 {
@@ -1179,7 +1183,9 @@ static void raw_visible_band(double *out_start, double *out_end);
 static void active_scan_band(double *out_start, double *out_end);
 static void send_json_response(int client_fd, int code, const char *reason,
                                const char *cors, const char *body);
+#if !PSEUDO_RANDOM_SAMPLE_SOURCE
 static void load_sample_rates(struct fobos_sdr_dev_t *dev);
+#endif
 static long long now_msec(void);
 
 static void reset_async_cancel_request(void)
@@ -1192,9 +1198,12 @@ static void reset_async_cancel_request(void)
 static void request_async_cancel(void)
 {
     pthread_mutex_lock(&g_cancel_mutex);
-    if (g_dev && !g_cancel_requested) {
+    if (!g_cancel_requested) {
         g_cancel_requested = 1;
-        fobos_sdr_cancel_async(g_dev);
+#if !PSEUDO_RANDOM_SAMPLE_SOURCE
+        if (g_dev)
+            fobos_sdr_cancel_async(g_dev);
+#endif
     }
     pthread_mutex_unlock(&g_cancel_mutex);
 }
@@ -1262,6 +1271,19 @@ static void close_device(void)
 
 static int open_first_device(int verbose)
 {
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+    (void)verbose;
+    snprintf(g_hw_rev, sizeof(g_hw_rev), "%s", "pseudo");
+    snprintf(g_fw_ver, sizeof(g_fw_ver), "%s", "pseudo-random");
+    snprintf(g_serial, sizeof(g_serial), "%s", "pseudo");
+    snprintf(g_manufacturer, sizeof(g_manufacturer), "%s", "local");
+    snprintf(g_product, sizeof(g_product), "%s", "pseudo-random source");
+    g_sample_rates[0] = SCANNER_SAMPLE_RATE_HZ;
+    g_sample_rate_count = 1;
+    if (verbose)
+        printf("[SDR] Using pseudo-random sample source instead of Fobos SDR hardware\n");
+    return FOBOS_ERR_OK;
+#else
     int count;
     int ret;
 
@@ -1297,6 +1319,7 @@ static int open_first_device(int verbose)
                g_hw_rev, g_fw_ver, g_serial);
     }
     return FOBOS_ERR_OK;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -2950,6 +2973,7 @@ static int scan_callback_should_process(scan_ctx_t *ctx, int channel)
     return 1;
 }
 
+#if !PSEUDO_RANDOM_SAMPLE_SOURCE
 static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *dev, void *user)
 {
     scan_ctx_t *ctx = (scan_ctx_t *)user;
@@ -2974,6 +2998,81 @@ static void scan_callback(float *buf, uint32_t buf_len, struct fobos_sdr_dev_t *
 
     scan_queue_push(ctx, channel, buf, buf_len);
 }
+#endif
+
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+static uint32_t pseudo_random_next(uint32_t *state)
+{
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x ? x : 0x9e3779b9U;
+    return *state;
+}
+
+static void fill_pseudo_random_samples(float *buf, uint32_t buf_len,
+                                       uint32_t *state)
+{
+    for (uint32_t i = 0; i < buf_len * 2U; i++) {
+        uint8_t byte = (uint8_t)(pseudo_random_next(state) >> 24);
+        buf[i] = ((float)byte - 127.5f) / 128.0f;
+    }
+}
+
+static void sleep_for_sample_count(uint32_t sample_count, double samplerate)
+{
+    struct timespec ts;
+    double seconds;
+
+    if (sample_count == 0 || samplerate <= 0.0)
+        return;
+
+    seconds = (double)sample_count / samplerate;
+    ts.tv_sec = (time_t)seconds;
+    ts.tv_nsec = (long)((seconds - (double)ts.tv_sec) * 1000000000.0);
+    if (ts.tv_nsec < 0)
+        ts.tv_nsec = 0;
+    if (ts.tv_nsec > 999999999L)
+        ts.tv_nsec = 999999999L;
+    nanosleep(&ts, NULL);
+}
+
+static int run_pseudo_random_sample_source(scan_ctx_t *ctx, uint32_t async_len)
+{
+    float *buf;
+    uint32_t state = 0x12345678U;
+    int channel = 0;
+
+    buf = malloc((size_t)async_len * 2U * sizeof(float));
+    if (!buf)
+        return -1;
+
+    printf("[SDR] Pseudo-random sample source running (%u complex samples/buffer)\n",
+           async_len);
+
+    while (g_scanning) {
+        int current_channel = ctx->single_mode ? 0 : channel;
+
+        fill_pseudo_random_samples(buf, async_len, &state);
+        ctx->last_callback_msec = now_msec();
+
+        if (scan_callback_should_process(ctx, current_channel))
+            scan_queue_push(ctx, current_channel, buf, async_len);
+
+        if (!ctx->single_mode) {
+            channel++;
+            if (channel >= ctx->total_steps)
+                channel = 0;
+        }
+
+        sleep_for_sample_count(async_len, g_samplerate);
+    }
+
+    free(buf);
+    return FOBOS_ERR_OK;
+}
+#endif
 
 static void *scan_watchdog_thread(void *arg)
 {
@@ -3137,17 +3236,20 @@ static void *scan_thread_func(void *arg)
     }
     worker_started = 1;
 
+#if !PSEUDO_RANDOM_SAMPLE_SOURCE
     ret = fobos_sdr_set_clk_source(g_dev, (int)g_clk_source);
     if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_clk_source failed: %d\n", ret); device_error = 1; }
     ret = fobos_sdr_set_samplerate(g_dev, g_samplerate);
     if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_samplerate failed: %d\n", ret); device_error = 1; }
     /*
      * UI BW ratio is a scanner/software concept: it controls scan step width
-     * and which centered FFT bins are published. Request the full exact
-     * baseband bandwidth; this disables Fobos auto bandwidth without leaving
-     * the firmware in a stale auto-BW state from device open.
+     * and which centered FFT bins are published. Hardware bandwidth is set
+     * explicitly to the same full-samplerate value previously requested
+     * through auto bandwidth.
      */
-    ret = fobos_sdr_set_bandwidth(g_dev, g_samplerate);
+    ret = fobos_sdr_set_auto_bandwidth(g_dev, 0.0);
+    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_auto_bandwidth failed: %d\n", ret); device_error = 1; }
+    ret = fobos_sdr_set_bandwidth(g_dev, g_samplerate * HARDWARE_AUTO_BANDWIDTH);
     if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_bandwidth failed: %d\n", ret); device_error = 1; }
     if (!direct_sampling_enabled()) {
         ret = fobos_sdr_set_lna_gain(g_dev, g_lna_gain);
@@ -3157,11 +3259,20 @@ static void *scan_thread_func(void *arg)
     }
     ret = fobos_sdr_set_direct_sampling(g_dev, direct_sampling_enabled() ? 1 : 0);
     if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_direct_sampling failed: %d\n", ret); device_error = 1; }
+#else
+    ret = FOBOS_ERR_OK;
+#endif
 
     if (ctx.single_mode) {
+#if !PSEUDO_RANDOM_SAMPLE_SOURCE
         fobos_sdr_stop_scan(g_dev);
+#endif
         if (!direct_sampling_enabled()) {
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+            ret = FOBOS_ERR_OK;
+#else
             ret = fobos_sdr_set_frequency(g_dev, device_center);
+#endif
         } else {
             ret = FOBOS_ERR_OK;
         }
@@ -3204,7 +3315,11 @@ static void *scan_thread_func(void *arg)
                device_freqs[0], device_freqs[total_steps - 1], step, total_steps, MAX_FREQS,
                ctx.estimated_line_rate, ctx.rate_limit_lps, ctx.rate_drop_factor);
 
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+        ret = FOBOS_ERR_OK;
+#else
         ret = fobos_sdr_start_scan(g_dev, device_freqs, (unsigned int)total_steps);
+#endif
         if (ret != FOBOS_ERR_OK) {
             fprintf(stderr, "[SDR] fobos_sdr_start_scan failed: %d\n", ret);
             device_error = 1;
@@ -3222,9 +3337,17 @@ static void *scan_thread_func(void *arg)
         } else {
             fprintf(stderr, "[SDR] Failed to start scan watchdog\n");
         }
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+        ret = run_pseudo_random_sample_source(&ctx, async_len);
+#else
         ret = fobos_sdr_read_async(g_dev, scan_callback, &ctx, 16, async_len);
+#endif
         if (ret != FOBOS_ERR_OK && g_scanning) {
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+            fprintf(stderr, "[SDR] pseudo-random sample source failed: %d\n", ret);
+#else
             fprintf(stderr, "[SDR] fobos_sdr_read_async failed: %d\n", ret);
+#endif
             device_error = 1;
         }
     }
@@ -3236,8 +3359,11 @@ static void *scan_thread_func(void *arg)
             device_error = 1;
     }
 
-    if (!ctx.single_mode)
+    if (!ctx.single_mode) {
+#if !PSEUDO_RANDOM_SAMPLE_SOURCE
         fobos_sdr_stop_scan(g_dev);
+#endif
+    }
     if (worker_started) {
         scan_queue_stop(&ctx);
         pthread_join(ctx.worker_thread, NULL);
@@ -4129,7 +4255,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             build_sw_version(),
             g_hw_rev, g_fw_ver, g_serial,
             g_manufacturer, g_product,
-            g_scanning, g_dev != NULL,
+            g_scanning, g_dev != NULL || PSEUDO_RANDOM_SAMPLE_SOURCE,
             g_freq_start, g_freq_end, g_converter_freq,
             g_freq_start, g_freq_end,
             g_visible_start, g_visible_end,
@@ -4804,6 +4930,9 @@ static long long now_msec(void)
 
 static void poll_device_reconnect(void)
 {
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+    return;
+#else
     static long long last_poll = 0;
     long long now = now_msec();
 
@@ -4816,6 +4945,7 @@ static void poll_device_reconnect(void)
         printf("[SDR]   HW: %s  FW: %s  S/N: %s\n",
                g_hw_rev, g_fw_ver, g_serial);
     }
+#endif
 }
 
 int main(int argc, char **argv)

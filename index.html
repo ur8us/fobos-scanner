@@ -61,6 +61,27 @@
                 box-shadow: 0 0 8px #c0404088;
             }
 
+            .scope-wrap {
+                position: relative;
+                background: #000;
+                border: 1px solid #1a2030;
+                border-radius: 6px;
+                overflow: hidden;
+                margin-bottom: 12px;
+            }
+            #scope {
+                display: block;
+                width: 100%;
+                height: 135px;
+                cursor: crosshair;
+            }
+            body.zoom-mode #waterfall,
+            body.zoom-mode #scope {
+                cursor:
+                    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Ccircle cx='10' cy='10' r='6' fill='none' stroke='%23d8e2ea' stroke-width='2'/%3E%3Cpath d='M15 15 L22 22' stroke='%23d8e2ea' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E")
+                        10 10,
+                    crosshair;
+            }
             .waterfall-wrap {
                 position: relative;
                 background: #000;
@@ -78,18 +99,13 @@
             #waterfall:active {
                 cursor: grabbing;
             }
-            body.zoom-mode #waterfall,
-            body.zoom-mode #scope {
-                cursor:
-                    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Ccircle cx='10' cy='10' r='6' fill='none' stroke='%23d8e2ea' stroke-width='2'/%3E%3Cpath d='M15 15 L22 22' stroke='%23d8e2ea' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E")
-                        10 10,
-                    crosshair;
-            }
             body.panning-mode #waterfall {
                 cursor: grabbing;
             }
             body.ruler-ready #waterfall,
-            body.ruler-mode #waterfall {
+            body.ruler-mode #waterfall,
+            body.ruler-ready #scope,
+            body.ruler-mode #scope {
                 cursor: default;
             }
             #rulerOverlay {
@@ -98,6 +114,15 @@
                 display: block;
                 width: 100%;
                 height: 600px;
+                pointer-events: none;
+                z-index: 2;
+            }
+            #scopeRulerOverlay {
+                position: absolute;
+                inset: 0;
+                display: block;
+                width: 100%;
+                height: 135px;
                 pointer-events: none;
                 z-index: 2;
             }
@@ -439,21 +464,6 @@
                 opacity: 0.35;
                 cursor: not-allowed;
             }
-
-            .scope-wrap {
-                background: #000;
-                border: 1px solid #1a2030;
-                border-radius: 6px;
-                overflow: hidden;
-                margin-bottom: 8px;
-            }
-            #scope {
-                display: block;
-                width: 100%;
-                height: 135px;
-                cursor: crosshair;
-            }
-
             .info-row {
                 text-align: center;
                 font-size: 11px;
@@ -614,16 +624,16 @@
                     </select>
                 </div>
                 <div class="ctrl-group">
-                    <label>BW Usage In Auto Scan Mode</label>
+                    <label>IF Usage In Auto Scan Mode</label>
                     <select id="bwRatio">
                         <option value="0.1">0.1</option>
                         <option value="0.2">0.2</option>
                         <option value="0.3">0.3</option>
                         <option value="0.4">0.4</option>
-                        <option value="0.5">0.5</option>
+                        <option value="0.5" selected>0.5</option>
                         <option value="0.7">0.7</option>
                         <option value="0.8">0.8</option>
-                        <option value="0.9" selected>0.9</option>
+                        <option value="0.9">0.9</option>
                         <option value="1.0">1.0</option>
                     </select>
                 </div>
@@ -676,7 +686,7 @@
                 <div class="ctrl-group check-group">
                     <label>IF FQ RESPONSE</label>
                     <label class="check-label">
-                        <input type="checkbox" id="freqComp" checked />
+                        <input type="checkbox" id="freqComp" disabled />
                         Compensate
                     </label>
                 </div>
@@ -756,6 +766,7 @@
 
             <div class="scope-wrap">
                 <canvas id="scope"></canvas>
+                <canvas id="scopeRulerOverlay"></canvas>
             </div>
 
             <div class="freq-scale" id="freqScale"></div>
@@ -797,6 +808,8 @@
             const rulerCtx = rulerCanvas.getContext("2d");
             const scCanvas = document.getElementById("scope");
             const scCtx = scCanvas.getContext("2d");
+            const scopeRulerCanvas = document.getElementById("scopeRulerOverlay");
+            const scopeRulerCtx = scopeRulerCanvas.getContext("2d");
 
             let wfImageData = null;
             let currentBins = null;
@@ -817,7 +830,7 @@
             let autoRestartInFlight = false;
             let configuredFreq0 = 0;
             let configuredFreq1 = 0;
-            let configuredBwRatio = 0.9;
+            let configuredBwRatio = 0.5;
             let configuredDirectSampling = 0;
             let configuredSampleRate = 50000000;
             let currentFreq0 = 0;
@@ -840,6 +853,7 @@
             let rulerActive = false;
             let rulerStart = null;
             let rulerEnd = null;
+            let rulerCanvasKind = null;
             let lastWaterfallLineMs = 0;
             let lastSseLineMs = 0;
             let sseOpenMs = 0;
@@ -887,6 +901,8 @@
             const AUTO_RESTART_DELAY_MS = 900;
             const SSE_STALL_MIN_MS = 5000;
             const SSE_STALL_MAX_MS = 30000;
+            const SPECTRUM_DB_FLOOR = -100;
+            const SPECTRUM_DB_CEIL = -20;
 
             function hasFrequencyWindow(
                 start = currentFreq0,
@@ -934,6 +950,11 @@
 
                 scCanvas.width = w;
                 scCanvas.height = 135;
+                scopeRulerCanvas.width = w;
+                scopeRulerCanvas.height = 135;
+                clearScopeRulerOverlay();
+                if (rulerCanvasKind === "waterfall") drawRulerOverlay();
+                if (rulerCanvasKind === "scope") drawScopeRulerOverlay();
                 binRangeCache = null;
                 scheduleViewUpdate(currentFreq0, currentFreq1, false);
             }
@@ -948,6 +969,16 @@
             function clearRulerOverlay() {
                 if (!rulerCanvas || !rulerCtx) return;
                 rulerCtx.clearRect(0, 0, rulerCanvas.width, rulerCanvas.height);
+            }
+
+            function clearScopeRulerOverlay() {
+                if (!scopeRulerCanvas || !scopeRulerCtx) return;
+                scopeRulerCtx.clearRect(
+                    0,
+                    0,
+                    scopeRulerCanvas.width,
+                    scopeRulerCanvas.height,
+                );
             }
 
             function clampNumber(value, min, max) {
@@ -3251,21 +3282,21 @@
                 } else {
                     lines.push(formatMHz(freq, decimals));
                 }
-                if (includeLevel && currentBins && currentBins.length) {
+                if (includeLevel) {
                     const rect = canvas.getBoundingClientRect();
-                    const x = Math.max(
+                    const y = Math.max(
                         0,
-                        Math.min(rect.width - 1, evt.clientX - rect.left),
+                        Math.min(rect.height, evt.clientY - rect.top),
                     );
-                    const level = dataPeakForAxis(
-                        currentBins,
-                        x,
-                        rect.width,
-                        axis,
-                        currentSourceStart(),
-                        currentSourceEnd(),
-                    );
-                    lines.push("Level: " + String(level));
+                    const level = scopeDbAboveBottomAtCanvasY(y);
+                    if (level !== null) {
+                        const decimals = level < 10 ? 2 : level < 100 ? 1 : 0;
+                        lines.push(
+                            "Level: " +
+                                formatCompactNumber(level, decimals) +
+                                " dB",
+                        );
+                    }
                 }
 
                 hoverReadout.textContent = lines.join("\n");
@@ -3276,6 +3307,10 @@
 
             function hideHoverReadout() {
                 hoverReadout.style.display = "none";
+            }
+
+            function updateRulerModeCursor() {
+                document.body.classList.toggle("ruler-mode", rulerActive);
             }
 
             function waterfallPointFromEvent(evt) {
@@ -3293,6 +3328,24 @@
                             wfCanvas.height,
                         0,
                         wfCanvas.height,
+                    ),
+                };
+            }
+
+            function scopePointFromEvent(evt) {
+                const rect = scCanvas.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return null;
+                return {
+                    x: clampNumber(
+                        ((evt.clientX - rect.left) / rect.width) * scCanvas.width,
+                        0,
+                        scCanvas.width,
+                    ),
+                    y: clampNumber(
+                        ((evt.clientY - rect.top) / rect.height) *
+                            scCanvas.height,
+                        0,
+                        scCanvas.height,
                     ),
                 };
             }
@@ -3329,6 +3382,78 @@
                 );
             }
 
+            function frequencyAtScopeX(x) {
+                if (!hasFrequencyWindow()) return null;
+                const axis = getZoomedFrequencyAxis(
+                    currentFreq0,
+                    currentFreq1,
+                    currentSteps,
+                    currentBins ? currentBins.length : displayBins(),
+                );
+                if (axis.right <= axis.left || scCanvas.width <= 0) return null;
+                const frac = clampNumber(x / scCanvas.width, 0, 1);
+                return axis.left + frac * (axis.right - axis.left);
+            }
+
+            function packedLevelToDb(value) {
+                return (
+                    SPECTRUM_DB_FLOOR +
+                    (Number(value) / 255) *
+                        (SPECTRUM_DB_CEIL - SPECTRUM_DB_FLOOR)
+                );
+            }
+
+            function scopeDbAtCanvasY(y) {
+                const height = scCanvas.height;
+                if (!Number.isFinite(y) || height <= 0) return null;
+                const span = Math.max(1, waterfallMax - waterfallMin);
+                const normalized = clampNumber(
+                    (height - 5 - y) / Math.max(1, height - 10),
+                    0,
+                    1,
+                );
+                return packedLevelToDb(waterfallMin + normalized * span);
+            }
+
+            function scopeDbAboveBottomAtCanvasY(y) {
+                const height = scCanvas.height;
+                if (!Number.isFinite(y) || height <= 0) return null;
+                const span = Math.max(1, waterfallMax - waterfallMin);
+                const normalized = clampNumber(
+                    (height - 5 - y) / Math.max(1, height - 10),
+                    0,
+                    1,
+                );
+                return (
+                    (normalized * span * (SPECTRUM_DB_CEIL - SPECTRUM_DB_FLOOR)) /
+                    255
+                );
+            }
+
+            function spectrumRulerText() {
+                if (!rulerStart || !rulerEnd) return "";
+                const f0 = frequencyAtScopeX(rulerStart.x);
+                const f1 = frequencyAtScopeX(rulerEnd.x);
+                const level0 = scopeDbAtCanvasY(rulerStart.y);
+                const level1 = scopeDbAtCanvasY(rulerEnd.y);
+                const distanceText =
+                    f0 === null || f1 === null
+                        ? "--"
+                        : formatFrequencyDistance(f1 - f0);
+                if (level0 === null || level1 === null) {
+                    return "Distance: " + distanceText + "\nDelta: -- dB";
+                }
+                const delta = Math.abs(level1 - level0);
+                const decimals = delta < 10 ? 2 : delta < 100 ? 1 : 0;
+                return (
+                    "Distance: " +
+                    distanceText +
+                    "\nDelta: " +
+                    formatCompactNumber(delta, decimals) +
+                    " dB"
+                );
+            }
+
             function drawRulerOverlay() {
                 clearRulerOverlay();
                 if (!rulerActive || !rulerStart || !rulerEnd) return;
@@ -3361,6 +3486,39 @@
                 rulerCtx.restore();
             }
 
+            function drawScopeRulerOverlay() {
+                clearScopeRulerOverlay();
+                if (rulerCanvasKind !== "scope" || !rulerStart || !rulerEnd)
+                    return;
+
+                scopeRulerCtx.save();
+                scopeRulerCtx.lineWidth = 2;
+                scopeRulerCtx.setLineDash([8, 8]);
+                scopeRulerCtx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+                scopeRulerCtx.beginPath();
+                scopeRulerCtx.moveTo(rulerStart.x, rulerStart.y);
+                scopeRulerCtx.lineTo(rulerEnd.x, rulerEnd.y);
+                scopeRulerCtx.stroke();
+                scopeRulerCtx.lineDashOffset = 8;
+                scopeRulerCtx.strokeStyle = "rgba(0, 0, 0, 0.95)";
+                scopeRulerCtx.beginPath();
+                scopeRulerCtx.moveTo(rulerStart.x, rulerStart.y);
+                scopeRulerCtx.lineTo(rulerEnd.x, rulerEnd.y);
+                scopeRulerCtx.stroke();
+                scopeRulerCtx.lineDashOffset = 0;
+
+                scopeRulerCtx.setLineDash([]);
+                scopeRulerCtx.fillStyle = "rgba(64, 160, 224, 0.9)";
+                scopeRulerCtx.strokeStyle = "rgba(5, 8, 12, 0.9)";
+                for (const point of [rulerStart, rulerEnd]) {
+                    scopeRulerCtx.beginPath();
+                    scopeRulerCtx.arc(point.x, point.y, 3.5, 0, Math.PI * 2);
+                    scopeRulerCtx.fill();
+                    scopeRulerCtx.stroke();
+                }
+                scopeRulerCtx.restore();
+            }
+
             function showRulerReadout(evt) {
                 hoverReadout.textContent = rulerText();
                 hoverReadout.style.left = evt.clientX + 12 + "px";
@@ -3368,8 +3526,16 @@
                 hoverReadout.style.display = "block";
             }
 
+            function showScopeRulerReadout(evt) {
+                hoverReadout.textContent = spectrumRulerText();
+                hoverReadout.style.left = evt.clientX + 12 + "px";
+                hoverReadout.style.top = evt.clientY + 12 + "px";
+                hoverReadout.style.display = "block";
+            }
+
             function startRuler(evt) {
                 if (evt.button !== 0 || !evt.ctrlKey) return;
+                if (rulerCanvasKind) return;
                 if (!hasFrequencyWindow()) return;
                 const point = waterfallPointFromEvent(evt);
                 if (!point) return;
@@ -3378,16 +3544,17 @@
                 evt.stopImmediatePropagation();
                 hideHoverReadout();
                 rulerActive = true;
+                rulerCanvasKind = "waterfall";
                 rulerStart = point;
                 rulerEnd = point;
-                document.body.classList.add("ruler-mode");
+                updateRulerModeCursor();
                 wfCanvas.setPointerCapture(evt.pointerId);
                 drawRulerOverlay();
                 showRulerReadout(evt);
             }
 
             function moveRuler(evt) {
-                if (!rulerActive) return;
+                if (!rulerActive || rulerCanvasKind !== "waterfall") return;
                 const point = waterfallPointFromEvent(evt);
                 if (!point) return;
                 evt.preventDefault();
@@ -3398,17 +3565,67 @@
             }
 
             function endRuler(evt) {
-                if (!rulerActive) return;
+                if (!rulerActive || rulerCanvasKind !== "waterfall") return;
                 evt.preventDefault();
                 evt.stopImmediatePropagation();
                 rulerActive = false;
+                rulerCanvasKind = null;
                 rulerStart = null;
                 rulerEnd = null;
-                document.body.classList.remove("ruler-mode");
+                updateRulerModeCursor();
                 clearRulerOverlay();
                 hideHoverReadout();
                 try {
                     wfCanvas.releasePointerCapture(evt.pointerId);
+                } catch (e) {
+                    /* pointer capture may already be gone */
+                }
+            }
+
+            function startScopeRuler(evt) {
+                if (evt.button !== 0 || !evt.ctrlKey) return;
+                if (rulerCanvasKind) return;
+                if (!hasFrequencyWindow()) return;
+                const point = scopePointFromEvent(evt);
+                if (!point) return;
+
+                evt.preventDefault();
+                evt.stopImmediatePropagation();
+                hideHoverReadout();
+                rulerActive = true;
+                rulerCanvasKind = "scope";
+                rulerStart = point;
+                rulerEnd = point;
+                updateRulerModeCursor();
+                scCanvas.setPointerCapture(evt.pointerId);
+                drawScopeRulerOverlay();
+                showScopeRulerReadout(evt);
+            }
+
+            function moveScopeRuler(evt) {
+                if (!rulerActive || rulerCanvasKind !== "scope") return;
+                const point = scopePointFromEvent(evt);
+                if (!point) return;
+                evt.preventDefault();
+                evt.stopImmediatePropagation();
+                rulerEnd = point;
+                drawScopeRulerOverlay();
+                showScopeRulerReadout(evt);
+            }
+
+            function endScopeRuler(evt) {
+                if (!rulerActive || rulerCanvasKind !== "scope") return;
+                evt.preventDefault();
+                evt.stopImmediatePropagation();
+                rulerActive = false;
+                rulerCanvasKind = null;
+                rulerStart = null;
+                rulerEnd = null;
+                updateRulerModeCursor();
+                clearScopeRulerOverlay();
+                hideHoverReadout();
+                try {
+                    scCanvas.releasePointerCapture(evt.pointerId);
                 } catch (e) {
                     /* pointer capture may already be gone */
                 }
@@ -3423,7 +3640,19 @@
             wfCanvas.addEventListener("mouseleave", () => {
                 if (!rulerActive) hideHoverReadout();
             });
-            scCanvas.addEventListener("mouseleave", hideHoverReadout);
+            scCanvas.addEventListener("mouseleave", () => {
+                if (!rulerActive) hideHoverReadout();
+            });
+            wfCanvas.addEventListener("pointerdown", startRuler);
+            wfCanvas.addEventListener("pointermove", moveRuler);
+            wfCanvas.addEventListener("pointerup", endRuler);
+            wfCanvas.addEventListener("pointercancel", endRuler);
+            wfCanvas.addEventListener("lostpointercapture", endRuler);
+            scCanvas.addEventListener("pointerdown", startScopeRuler);
+            scCanvas.addEventListener("pointermove", moveScopeRuler);
+            scCanvas.addEventListener("pointerup", endScopeRuler);
+            scCanvas.addEventListener("pointercancel", endScopeRuler);
+            scCanvas.addEventListener("lostpointercapture", endScopeRuler);
             wfCanvas.addEventListener(
                 "mousedown",
                 (evt) => handleMarkerMouseDown(wfCanvas, evt),
@@ -3835,11 +4064,6 @@
             wfCanvas.addEventListener("wheel", handleZoomWheel, {
                 passive: false,
             });
-            wfCanvas.addEventListener("pointerdown", startRuler);
-            wfCanvas.addEventListener("pointermove", moveRuler);
-            wfCanvas.addEventListener("pointerup", endRuler);
-            wfCanvas.addEventListener("pointercancel", endRuler);
-            wfCanvas.addEventListener("lostpointercapture", endRuler);
             wfCanvas.addEventListener("pointerdown", startPan);
             wfCanvas.addEventListener("pointermove", movePan);
             wfCanvas.addEventListener("pointerup", endPan);

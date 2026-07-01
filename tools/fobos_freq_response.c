@@ -113,7 +113,7 @@ static void print_usage(const char *argv0)
         "Options:\n"
         "  --centers-mhz LIST      comma-separated LO centers in MHz (default %s)\n"
         "  -r, --samplerate HZ     sample rate, suffixes k/m/g accepted (default %.0f)\n"
-        "      --bw-ratio R        exact bandwidth ratio of sample rate (default %.2f)\n"
+        "      --bw-ratio R        hardware auto bandwidth ratio (default %.2f)\n"
         "      --fft-size N        FFT size, power of two (default %u)\n"
         "      --buffers N         FFT buffers averaged per capture (default %u)\n"
         "      --passes N          full passes through the center list (default %u)\n"
@@ -1290,8 +1290,8 @@ int main(int argc, char **argv)
     if (check_ret("fobos_sdr_set_samplerate",
                   fobos_sdr_set_samplerate(dev, cfg.samplerate)) != 0)
         goto done;
-    if (check_ret("fobos_sdr_set_bandwidth",
-                  fobos_sdr_set_bandwidth(dev, cfg.samplerate * cfg.bw_ratio)) != 0)
+    if (check_ret("fobos_sdr_set_auto_bandwidth",
+                  fobos_sdr_set_auto_bandwidth(dev, cfg.bw_ratio)) != 0)
         goto done;
 
     printf("[FQ] Measuring %.3f MHz bandwidth with %u-point FFT\n",

@@ -35,7 +35,7 @@ The scan band is split into hardware scan points with:
 step = samplerate * bw_ratio
 ```
 
-In the scanner, `bw_ratio` is a software scan/display ratio only. The backend requests exact full hardware bandwidth with `fobos_sdr_set_bandwidth(..., samplerate)`, which disables Fobos SDR hardware auto bandwidth without tying the hardware filter to software scan spacing.
+In the scanner, `bw_ratio` is a software scan/display ratio only. The backend first disables Fobos SDR hardware auto bandwidth with `fobos_sdr_set_auto_bandwidth(..., 0.0)`, then requests the current full-rate hardware bandwidth with `fobos_sdr_set_bandwidth(..., samplerate)`, so the hardware filter is not tied to software scan spacing.
 
 The Fobos agile scan list is limited to `256` frequencies. If the requested band needs more points, the backend clamps the effective end frequency to the last covered frequency and returns that value to the frontend.
 
@@ -285,7 +285,7 @@ raw_avg_db          robust averaged response before final smoothing/symmetry
 despurred_db        raw average after narrow upward peak clamping
 ```
 
-When `fq_response.txt` is present in the scanner directory, the backend loads its smoothed `correction_linear` column on startup. The correction is applied only to hardware scan-mode FFT bins; single-frequency fixed/zoom mode is left unchanged. The table is FFT-shifted low-to-high: index `0` is `-Fs/2`, the middle row is DC, and the final row is `+Fs/2`. The backend indexes the table by physical baseband offset, using the calibration sample-rate metadata when present, so `BW ratio = 0.5` at the calibration sample rate uses the centered 50% of a `BW=1.0` calibration instead of compressing the full edge correction into the narrower scan slice. Values are interpolated for smaller FFT sizes and for the shorter final scan step.
+When `fq_response.txt` is present in the scanner directory, the backend can load its smoothed `correction_linear` column on startup, but IF frequency response is not compensated yet in normal scanner use. The frontend IF FQ RESPONSE checkbox is disabled and compensation is off by default. The table is FFT-shifted low-to-high: index `0` is `-Fs/2`, the middle row is DC, and the final row is `+Fs/2`.
 
 Useful options:
 
@@ -344,7 +344,7 @@ Useful options:
 
 - Default scan start frequency is `50 MHz`.
 - The scanner sample rate is fixed at `50 MHz`; the frontend control is disabled and backend start requests ignore any other sample-rate value.
-- Default software bandwidth usage in auto scan mode is `0.9`; IF frequency-response compensation is enabled by default when `fq_response.txt` is available.
+- Default IF usage in auto scan mode is `0.5`; IF frequency response is not compensated yet, and the disabled IF FQ RESPONSE setting is off by default.
 - Auto waterfall levels are enabled by default on first page load.
 - The backend listens on port `8080`.
 - The scanner needs access to a connected Fobos SDR supported by the agile firmware/API.
@@ -352,5 +352,5 @@ Useful options:
 - FFT size updates live through `POST /api/fft`.
 - Waterfall data is sent as compact `uint8` magnitude rows over Server-Sent Events.
 - FFT magnitudes are Hann-window normalized and compensated to a `1024`-point FFT reference bandwidth so displayed signal levels stay comparable when FFT size changes.
-- Scanner `BW USAGE IN AUTO SCAN MODE` does not narrow the Fobos hardware filter; scanner starts request exact full hardware bandwidth and disable hardware auto bandwidth.
+- Scanner `IF USAGE IN AUTO SCAN MODE` does not narrow the Fobos hardware filter; scanner starts by disabling hardware auto bandwidth, then requests full sample-rate hardware bandwidth.
 - Waterfall rate options are saved in `fobos-scanner.conf`; defaults are minimum `10 lines/s` and maximum `20 lines/s`.

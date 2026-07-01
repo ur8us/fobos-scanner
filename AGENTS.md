@@ -28,7 +28,7 @@ The utility intentionally captures at many receiver center frequencies over mult
 
 The text output contains `response_db`, `correction_db`, `correction_linear`, `raw_avg_db`, and `despurred_db`; future scanner compensation should consume the correction values as an inverse frequency-domain window, not as waterfall brightness settings. Do not let narrow spurs become inverse correction notches.
 
-`main.c` loads `fq_response.txt` at startup when present and applies the smoothed `correction_linear` column only in hardware scan mode. The table is FFT-shifted low-to-high: row `0` is `-Fs/2`, the middle row is DC, and the final row is `+Fs/2`; do not index it by unshifted FFT bins. The scanner indexes by physical baseband offset, using calibration sample-rate metadata when present, so lower BW ratios use the centered corresponding slice of a BW=1.0 calibration instead of compressing the full edge correction into the narrower scan slice. Use interpolation for smaller FFT sizes and the centered subset for a shorter final scan slice. Do not apply this table to single-frequency fixed/zoom mode unless that mode gets its own correction design.
+`main.c` can load `fq_response.txt` at startup when present, but IF frequency response is not compensated yet in normal scanner use. The frontend IF FQ RESPONSE checkbox is disabled and compensation is off by default. The table is FFT-shifted low-to-high: row `0` is `-Fs/2`, the middle row is DC, and the final row is `+Fs/2`; do not index it by unshifted FFT bins. Do not apply this table to single-frequency fixed/zoom mode unless that mode gets its own correction design.
 
 ## Scanner Architecture
 
@@ -101,7 +101,7 @@ Frontend frequencies are air/signal frequencies. The backend converts them to re
 
 ## Bandwidth Ratio
 
-`bw_ratio` is a software scanner ratio, labeled `BW USAGE IN AUTO SCAN MODE` in the UI. Its default is `0.9`. It controls scan spacing and displayed FFT width only; do not use it as the Fobos SDR hardware auto bandwidth. Scanner starts should request exact full hardware bandwidth with `fobos_sdr_set_bandwidth(..., samplerate)`, which disables auto bandwidth without leaving stale firmware auto-BW state from device open.
+`bw_ratio` is a software scanner ratio, labeled `IF USAGE IN AUTO SCAN MODE` in the UI. Its default is `0.5`. It controls scan spacing and displayed FFT width only; do not pass this value to the Fobos SDR hardware bandwidth. Scanner starts should first call `fobos_sdr_set_auto_bandwidth(..., 0.0)`, then request the current full-rate hardware bandwidth with `fobos_sdr_set_bandwidth(..., samplerate)`. Exact-bandwidth mode can select a different hardware LPF and imprint a repeated IF shape into scan steps.
 
 - `1.0` means scan in `samplerate` steps and display the full FFT span for each step.
 - `0.5` means scan in `samplerate / 2` steps and display only the centered half of each FFT result.

@@ -13,9 +13,9 @@ LIBDIRS = -L$(FOBOS_BUILD) -L$(FOBOS_LOCAL)/lib
 THREAD_CFLAGS = -pthread
 STD_CFLAGS = -std=c99
 
-TARGETS = fobos-scanner tools/fobos-stream-test tools/fobos-fq-response
+TARGETS = fobos-scanner tools/fobos-stream-test tools/fobos-fq-response tools/fobos-comp-test
 
-.PHONY: all clean run stream-test fq-response check
+.PHONY: all clean run stream-test fq-response comp-test check
 
 all: $(TARGETS)
 
@@ -28,6 +28,9 @@ tools/fobos-stream-test: tools/fobos_stream_test.c
 tools/fobos-fq-response: tools/fobos_freq_response.c
 	$(CC) $(STD_CFLAGS) $(WARN_CFLAGS) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) $(INCS) -o $@ $< $(LDFLAGS) $(LIBDIRS) $(LDLIBS)
 
+tools/fobos-comp-test: tools/fobos_comp_test.c
+	$(CC) $(STD_CFLAGS) $(WARN_CFLAGS) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) $(INCS) -o $@ $< $(LDFLAGS) $(LIBDIRS) $(LDLIBS)
+
 run: fobos-scanner
 	LD_LIBRARY_PATH=$(FOBOS_BUILD):$(FOBOS_LOCAL)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH} ./fobos-scanner
 
@@ -36,6 +39,9 @@ stream-test: tools/fobos-stream-test
 
 fq-response: tools/fobos-fq-response
 	LD_LIBRARY_PATH=$(FOBOS_BUILD):$(FOBOS_LOCAL)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH} ./tools/fobos-fq-response
+
+comp-test: tools/fobos-comp-test
+	LD_LIBRARY_PATH=$(FOBOS_BUILD):$(FOBOS_LOCAL)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH} ./tools/fobos-comp-test
 
 check: all
 	@echo "Build checks passed. Run tools/http_smoke_test.sh against a running backend for HTTP/API checks."

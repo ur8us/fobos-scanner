@@ -1,6 +1,7 @@
 fobos-scanner
 tools/fobos-stream-test
 tools/fobos-fq-response
+tools/fobos-comp-test
 *.o
 *.so
 *.a
@@ -18,3 +19,4 @@ ideas.md
 REPORT.MD
 tools/zoom_sweep.py
 test_results*.txt
+comp_test_out/
