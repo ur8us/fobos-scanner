@@ -684,10 +684,10 @@
                     <label class="dual-label">
                         <span>Waterfall Rate</span>
                         <span class="range-val" id="rateRangeVal"
-                            >Min: As is, Max: 20 lines/s</span
+                            >Min: 10 lines/s, Max: 20 lines/s</span
                         >
                     </label>
-                    <input type="hidden" id="minRate" value="0" />
+                    <input type="hidden" id="minRate" value="10" />
                     <input type="hidden" id="rateLimit" value="20" />
                     <div class="dual-slider rate-slider" id="rateSlider">
                         <input
@@ -696,7 +696,7 @@
                             id="rateMinSlider"
                             min="0"
                             max="7"
-                            value="0"
+                            value="4"
                             step="1"
                             aria-label="Minimum waterfall line rate"
                         />
@@ -856,6 +856,8 @@
             let sseReconnectTimer = 0;
             let sseFailureCount = 0;
             const MAX_ZOOM_FACTOR = 1000000;
+            const MIN_FREQ_START_MHZ = 50;
+            const MIN_SCAN_SPAN_MHZ = 0.1;
             const DIRECT_SAMPLING_HARD_MAX_HZ = 25000000;
             const TICK_MIN_COUNT = 5;
             const TICK_MAX_COUNT = 13;
@@ -1219,6 +1221,26 @@
                     currentConverterFreq = 0;
                 }
                 syncFirstRowControlState();
+            }
+
+            function sanitizeScanFrequencyInputs() {
+                if (selectedDirectSampling() !== 0) return;
+
+                const startEl = document.getElementById("freqStart");
+                const endEl = document.getElementById("freqEnd");
+                let startMhz = parseFloat(startEl.value);
+                let endMhz = parseFloat(endEl.value);
+
+                if (!Number.isFinite(startMhz) || startMhz < MIN_FREQ_START_MHZ)
+                    startMhz = MIN_FREQ_START_MHZ;
+                if (
+                    !Number.isFinite(endMhz) ||
+                    endMhz <= startMhz
+                )
+                    endMhz = startMhz + MIN_SCAN_SPAN_MHZ;
+
+                startEl.value = mhzInputValue(startMhz * 1e6);
+                endEl.value = mhzInputValue(endMhz * 1e6);
             }
 
             function handleDirectSamplingChanged() {
@@ -4201,6 +4223,7 @@
             function buildScanRequest(options = {}) {
                 const direct = selectedDirectSampling();
                 const directMaxHz = direct ? directSamplingMaxHz() : 0;
+                if (!direct) sanitizeScanFrequencyInputs();
                 const request = {
                     freq_start: direct
                         ? 0
@@ -4275,6 +4298,8 @@
                     clearSavedView();
                     if (selectedDirectSampling() !== 0)
                         syncDirectSamplingFields(true);
+                    else
+                        sanitizeScanFrequencyInputs();
                     configuredFreq0 =
                         parseFloat(document.getElementById("freqStart").value) *
                         1e6;

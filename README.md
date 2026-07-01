@@ -353,4 +353,4 @@ Useful options:
 - Waterfall data is sent as compact `uint8` magnitude rows over Server-Sent Events.
 - FFT magnitudes are Hann-window normalized and compensated to a `1024`-point FFT reference bandwidth so displayed signal levels stay comparable when FFT size changes.
 - Scanner `BW USAGE IN AUTO SCAN MODE` does not narrow the Fobos hardware filter; hardware auto bandwidth is set to full passband during scanner starts.
-- Rate limit options are saved in `fobos-scanner.conf`; the default is `20 lines/s`.
+- Waterfall rate options are saved in `fobos-scanner.conf`; defaults are minimum `10 lines/s` and maximum `20 lines/s`.

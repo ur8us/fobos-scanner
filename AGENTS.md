@@ -51,6 +51,8 @@ Single mode distinguishes the visible span from the processed source span. When 
 
 Single mode chooses the smallest power-of-two FFT size that can fill the current display, from `1024` through `65536`. If more frequency resolution is needed, increase decimation instead of using FFT sizes above `65536`. The `Min Rate` setting applies only to decimated single-stream mode and uses FFT-window overlap to meet the requested waterfall line cadence.
 
+Fresh configs default to a minimum waterfall rate of `10 lines/s` and a maximum rate limit of `20 lines/s`; saved `fobos-scanner.conf` values override those defaults.
+
 The backend should not auto-start a scan immediately after the server banner. The web UI starts scanning through `/api/start`, and if a scan is already active the UI should attach to `/api/waterfall` instead of restarting it. This avoids racing Fobos async USB setup during page load or refresh.
 
 `/api/start` is for scan changes: band, software bandwidth ratio, converter, direct sampling, and gains. It can restart the hardware scan. The scanner sample rate is fixed at 50 MHz; the frontend sample-rate control is disabled and the backend ignores incoming sample-rate values for scanner starts.
