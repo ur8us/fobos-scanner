@@ -101,7 +101,7 @@ Frontend frequencies are air/signal frequencies. The backend converts them to re
 
 ## Bandwidth Ratio
 
-`bw_ratio` is a software scanner ratio, labeled `BW USAGE IN AUTO SCAN MODE` in the UI. Its default is `0.9`. It controls scan spacing and displayed FFT width only; do not use it to narrow the Fobos SDR hardware auto bandwidth. Scanner starts should keep the hardware passband full with `fobos_sdr_set_auto_bandwidth(..., 1.0)` so each 50 MHz stream contains the full receiver bandwidth.
+`bw_ratio` is a software scanner ratio, labeled `BW USAGE IN AUTO SCAN MODE` in the UI. Its default is `0.9`. It controls scan spacing and displayed FFT width only; do not use it as the Fobos SDR hardware auto bandwidth. Scanner starts should request exact full hardware bandwidth with `fobos_sdr_set_bandwidth(..., samplerate)`, which disables auto bandwidth without leaving stale firmware auto-BW state from device open.
 
 - `1.0` means scan in `samplerate` steps and display the full FFT span for each step.
 - `0.5` means scan in `samplerate / 2` steps and display only the centered half of each FFT result.

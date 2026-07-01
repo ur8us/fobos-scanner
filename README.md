@@ -35,7 +35,7 @@ The scan band is split into hardware scan points with:
 step = samplerate * bw_ratio
 ```
 
-In the scanner, `bw_ratio` is a software scan/display ratio only. The backend keeps the Fobos SDR hardware auto bandwidth at full bandwidth (`1.0`) so each 50 MHz sample stream contains the full receiver passband.
+In the scanner, `bw_ratio` is a software scan/display ratio only. The backend requests exact full hardware bandwidth with `fobos_sdr_set_bandwidth(..., samplerate)`, which disables Fobos SDR hardware auto bandwidth without tying the hardware filter to software scan spacing.
 
 The Fobos agile scan list is limited to `256` frequencies. If the requested band needs more points, the backend clamps the effective end frequency to the last covered frequency and returns that value to the frontend.
 
@@ -352,5 +352,5 @@ Useful options:
 - FFT size updates live through `POST /api/fft`.
 - Waterfall data is sent as compact `uint8` magnitude rows over Server-Sent Events.
 - FFT magnitudes are Hann-window normalized and compensated to a `1024`-point FFT reference bandwidth so displayed signal levels stay comparable when FFT size changes.
-- Scanner `BW USAGE IN AUTO SCAN MODE` does not narrow the Fobos hardware filter; hardware auto bandwidth is set to full passband during scanner starts.
+- Scanner `BW USAGE IN AUTO SCAN MODE` does not narrow the Fobos hardware filter; scanner starts request exact full hardware bandwidth and disable hardware auto bandwidth.
 - Waterfall rate options are saved in `fobos-scanner.conf`; defaults are minimum `10 lines/s` and maximum `20 lines/s`.

@@ -113,7 +113,7 @@ static void print_usage(const char *argv0)
         "Options:\n"
         "  --centers-mhz LIST      comma-separated LO centers in MHz (default %s)\n"
         "  -r, --samplerate HZ     sample rate, suffixes k/m/g accepted (default %.0f)\n"
-        "      --bw-ratio R        auto bandwidth ratio (default %.2f)\n"
+        "      --bw-ratio R        exact bandwidth ratio of sample rate (default %.2f)\n"
         "      --fft-size N        FFT size, power of two (default %u)\n"
         "      --buffers N         FFT buffers averaged per capture (default %u)\n"
         "      --passes N          full passes through the center list (default %u)\n"
@@ -783,7 +783,7 @@ static int write_response_text(const char *path, const response_config_t *cfg,
     for (int c = 0; c < capture_count; c++)
         fprintf(f, " %llu", (unsigned long long)stats[c].buffers_processed);
     fprintf(f, "\n");
-    fprintf(f, "# columns: bin offset_hz offset_mhz response_db correction_db correction_linear raw_avg_db despurred_db\n");
+    fprintf(f, "# columns: bin offset_hz offset_mhz response_db correction_db correction_linear raw_avg_db corrected_raw_db despurred_db\n");
 
     for (uint32_t i = 0; i < cfg->fft_size; i++) {
         double offset_hz = ((double)i - (double)cfg->fft_size * 0.5) *
@@ -791,10 +791,11 @@ static int write_response_text(const char *path, const response_config_t *cfg,
         double response_db = smoothed[i];
         double correction_db = -response_db;
         double correction_linear = pow(10.0, correction_db / 20.0);
-        fprintf(f, "%u %.6f %.9f %.6f %.6f %.9f %.6f %.6f\n",
+        double corrected_raw_db = raw_avg[i] + correction_db;
+        fprintf(f, "%u %.6f %.9f %.6f %.6f %.9f %.6f %.6f %.6f\n",
                 i, offset_hz, offset_hz / 1.0e6,
                 response_db, correction_db, correction_linear, raw_avg[i],
-                despurred[i]);
+                corrected_raw_db, despurred[i]);
     }
 
     fclose(f);
@@ -867,7 +868,14 @@ static const char *font_pattern(char ch)
     case '-': return "000000000111000000000";
     case '.': return "000000000000000010010";
     case 'M': return "101111111101101101101";
+    case 'A': return "010101101111101101101";
+    case 'C': return "111100100100100100111";
+    case 'E': return "111100100111100100111";
     case 'H': return "101101101111101101101";
+    case 'O': return "111101101101101101111";
+    case 'R': return "110101101110101101101";
+    case 'S': return "111100100111001001111";
+    case 'T': return "111010010010010010010";
     case 'z': case 'Z': return "111001010010010100111";
     case 'd': case 'D': return "110101101101101101110";
     case 'B': return "110101101110101101110";
@@ -1074,10 +1082,19 @@ static int write_response_png(const char *path, const response_config_t *cfg,
     memset(img, 255, (size_t)w * (size_t)h * 3U);
 
     for (uint32_t i = 0; i < cfg->fft_size; i++) {
+        double corrected = raw_avg[i] - response[i];
+        if (raw_avg[i] < ymin)
+            ymin = raw_avg[i];
+        if (raw_avg[i] > ymax)
+            ymax = raw_avg[i];
         if (response[i] < ymin)
             ymin = response[i];
         if (response[i] > ymax)
             ymax = response[i];
+        if (corrected < ymin)
+            ymin = corrected;
+        if (corrected > ymax)
+            ymax = corrected;
     }
     if (ymax - ymin < 1.0) {
         ymax += 0.5;
@@ -1130,12 +1147,31 @@ static int write_response_png(const char *path, const response_config_t *cfg,
         draw_line(img, w, h, x0, y0, x1, y1, 190, 198, 208);
     }
     for (uint32_t i = 1; i < cfg->fft_size; i++) {
+        double c0 = raw_avg[i - 1U] - response[i - 1U];
+        double c1 = raw_avg[i] - response[i];
+        int x0 = left + (int)(((uint64_t)(i - 1U) * (uint64_t)plot_w) / (uint64_t)(cfg->fft_size - 1U));
+        int x1 = left + (int)(((uint64_t)i * (uint64_t)plot_w) / (uint64_t)(cfg->fft_size - 1U));
+        int y0 = top + (int)lrint((ymax - c0) / (ymax - ymin) * plot_h);
+        int y1 = top + (int)lrint((ymax - c1) / (ymax - ymin) * plot_h);
+        draw_line(img, w, h, x0, y0, x1, y1, 218, 122, 35);
+    }
+    for (uint32_t i = 1; i < cfg->fft_size; i++) {
         int x0 = left + (int)(((uint64_t)(i - 1U) * (uint64_t)plot_w) / (uint64_t)(cfg->fft_size - 1U));
         int x1 = left + (int)(((uint64_t)i * (uint64_t)plot_w) / (uint64_t)(cfg->fft_size - 1U));
         int y0 = top + (int)lrint((ymax - response[i - 1U]) / (ymax - ymin) * plot_h);
         int y1 = top + (int)lrint((ymax - response[i]) / (ymax - ymin) * plot_h);
         draw_line(img, w, h, x0, y0, x1, y1, 18, 128, 104);
         draw_line(img, w, h, x0, y0 + 1, x1, y1 + 1, 18, 128, 104);
+    }
+    {
+        const int lx = left + plot_w - 248;
+        const int ly = top + 12;
+        draw_rect(img, w, h, lx, ly + 3, 26, 5, 190, 198, 208);
+        draw_text(img, w, h, lx + 34, ly, "MEAS", 2, 80, 88, 98);
+        draw_rect(img, w, h, lx + 92, ly + 3, 26, 5, 218, 122, 35);
+        draw_text(img, w, h, lx + 126, ly, "CORR", 2, 120, 68, 24);
+        draw_rect(img, w, h, lx + 184, ly + 3, 26, 5, 18, 128, 104);
+        draw_text(img, w, h, lx + 218, ly, "SMOOTH", 2, 18, 128, 104);
     }
 
     if (write_png_rgb(path, img, w, h) != 0) {
@@ -1254,8 +1290,8 @@ int main(int argc, char **argv)
     if (check_ret("fobos_sdr_set_samplerate",
                   fobos_sdr_set_samplerate(dev, cfg.samplerate)) != 0)
         goto done;
-    if (check_ret("fobos_sdr_set_auto_bandwidth",
-                  fobos_sdr_set_auto_bandwidth(dev, cfg.bw_ratio)) != 0)
+    if (check_ret("fobos_sdr_set_bandwidth",
+                  fobos_sdr_set_bandwidth(dev, cfg.samplerate * cfg.bw_ratio)) != 0)
         goto done;
 
     printf("[FQ] Measuring %.3f MHz bandwidth with %u-point FFT\n",

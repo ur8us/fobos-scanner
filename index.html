@@ -817,6 +817,9 @@
             let autoRestartInFlight = false;
             let configuredFreq0 = 0;
             let configuredFreq1 = 0;
+            let configuredBwRatio = 0.9;
+            let configuredDirectSampling = 0;
+            let configuredSampleRate = 50000000;
             let currentFreq0 = 0;
             let currentFreq1 = 0;
             let currentSteps = 0;
@@ -1256,6 +1259,15 @@
 
             function sameStoredFrequency(a, b) {
                 return Math.abs(Number(a) - Number(b)) <= 10;
+            }
+
+            function sameStoredNumber(a, b, tolerance = 1e-9) {
+                return Math.abs(Number(a) - Number(b)) <= tolerance;
+            }
+
+            function inputMhzToHz(id) {
+                const value = parseFloat(document.getElementById(id).value);
+                return Number.isFinite(value) ? value * 1e6 : NaN;
             }
 
             function clampVisibleWindow(left, right, fullStart, fullEnd) {
@@ -3168,6 +3180,12 @@
                     currentFreq0 = Number(status.visible_start_hz);
                 if (status.visible_end_hz !== undefined)
                     currentFreq1 = Number(status.visible_end_hz);
+                if (status.samplerate !== undefined)
+                    configuredSampleRate = Number(status.samplerate);
+                if (status.bw_ratio !== undefined)
+                    configuredBwRatio = Number(status.bw_ratio);
+                if (status.direct_sampling !== undefined)
+                    configuredDirectSampling = Number(status.direct_sampling);
                 updateFFTInfo(status);
                 if (status.scanning) {
                     clearAutoRestartTimer();
@@ -3932,6 +3950,10 @@
                 if (plan.steps !== undefined) {
                     currentSteps = Number(plan.steps);
                 }
+                if (plan.samplerate !== undefined)
+                    configuredSampleRate = Number(plan.samplerate);
+                if (plan.bw_ratio !== undefined)
+                    configuredBwRatio = Number(plan.bw_ratio);
                 if (plan.rate_limit_lps !== undefined) {
                     setRateLimitValue(plan.rate_limit_lps);
                 }
@@ -3947,6 +3969,7 @@
                     );
                 }
                 if (plan.direct_sampling !== undefined) {
+                    configuredDirectSampling = Number(plan.direct_sampling);
                     document.getElementById("directSampling").value = String(
                         plan.direct_sampling,
                     );
@@ -4182,6 +4205,10 @@
                 if (plan.steps !== undefined) {
                     currentSteps = plan.steps;
                 }
+                if (plan.samplerate !== undefined)
+                    configuredSampleRate = Number(plan.samplerate);
+                if (plan.bw_ratio !== undefined)
+                    configuredBwRatio = Number(plan.bw_ratio);
                 if (plan.converter_freq !== undefined) {
                     currentConverterFreq = plan.converter_freq;
                     document.getElementById("converterFreq").value =
@@ -4202,6 +4229,7 @@
                     );
                 }
                 if (plan.direct_sampling !== undefined) {
+                    configuredDirectSampling = Number(plan.direct_sampling);
                     document.getElementById("directSampling").value = String(
                         plan.direct_sampling,
                     );
@@ -4272,6 +4300,32 @@
                 return request;
             }
 
+            function scanControlsMatchAppliedSettings() {
+                const direct = selectedDirectSampling();
+                const samplerate = 50000000;
+                const bwRatio = direct
+                    ? 1.0
+                    : parseFloat(document.getElementById("bwRatio").value);
+                const startHz = direct ? 0 : inputMhzToHz("freqStart");
+                const endHz = direct
+                    ? directSamplingMaxHz()
+                    : inputMhzToHz("freqEnd");
+                const converterHz = direct ? 0 : inputMhzToHz("converterFreq");
+
+                if (direct !== configuredDirectSampling) return false;
+                if (!sameStoredNumber(samplerate, configuredSampleRate, 1))
+                    return false;
+                if (!sameStoredNumber(bwRatio, configuredBwRatio, 1e-9))
+                    return false;
+                if (!sameStoredFrequency(startHz, configuredFreq0))
+                    return false;
+                if (!sameStoredFrequency(endHz, configuredFreq1))
+                    return false;
+                if (!sameStoredFrequency(converterHz, currentConverterFreq))
+                    return false;
+                return hasFrequencyWindow(currentFreq0, currentFreq1);
+            }
+
             function clearScanDisplay() {
                 cancelCurrentViewRedraw();
                 linesCount = 0;
@@ -4284,6 +4338,14 @@
             }
 
             async function startOrRestartScan(options = { resetView: true }) {
+                options = Object.assign({ resetView: true }, options || {});
+                if (
+                    options.resetView !== false &&
+                    scanControlsMatchAppliedSettings()
+                ) {
+                    options.resetView = false;
+                    options.preserveView = true;
+                }
                 desiredScanRunning = true;
                 clearAutoRestartTimer();
                 const serial = ++scanRequestSerial;
@@ -4571,6 +4633,14 @@
                         status.visible_start_hz || status.freq_start || 0;
                     currentFreq1 =
                         status.visible_end_hz || status.freq_end || 0;
+                    if (status.samplerate !== undefined)
+                        configuredSampleRate = Number(status.samplerate);
+                    if (status.bw_ratio !== undefined)
+                        configuredBwRatio = Number(status.bw_ratio);
+                    if (status.direct_sampling !== undefined)
+                        configuredDirectSampling = Number(
+                            status.direct_sampling,
+                        );
                     const savedView =
                         loadHashViewForConfig(
                             configuredFreq0,
@@ -4651,6 +4721,9 @@
                             status.vga_gain;
                     }
                     if (status.direct_sampling !== undefined) {
+                        configuredDirectSampling = Number(
+                            status.direct_sampling,
+                        );
                         document.getElementById("directSampling").value =
                             status.direct_sampling;
                         syncDirectSamplingFields(status.direct_sampling !== 0);
