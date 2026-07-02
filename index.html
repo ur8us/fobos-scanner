@@ -2078,6 +2078,8 @@
                 gotoAnimationToken++;
                 gotoPreviewRetained = true;
                 setGotoAnimationActive(false);
+                if (hasFrequencyWindow())
+                    scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
                 const waiters = gotoLineWaiters;
                 gotoLineWaiters = [];
                 waiters.forEach((waiter) => waiter());
@@ -2220,17 +2222,15 @@
                         : currentCenter + (target - currentCenter) * 0.45;
                     const next = gotoWindowForCenter(nextCenter, nextSpan);
                     if (!next) break;
-                    const beforeLine = gotoLineSerial;
                     if (
                         !applyAnimatedGotoWindow(
                             next.left,
                             next.right,
                             finalStep,
+                            false,
                         )
                     )
                         break;
-                    const rendered = await waitForGotoLine(token, beforeLine);
-                    if (!rendered) break;
                     if (
                         token !== gotoAnimationToken ||
                         !gotoAnimationActive ||
@@ -2249,6 +2249,7 @@
                         applyAnimatedGotoWindow(
                             finalWindow.left,
                             finalWindow.right,
+                            true,
                             true,
                         );
                         await waitForGotoLine(token, beforeLine);
@@ -3712,9 +3713,13 @@
                     configuredFreq0 = Number(status.configured_start_hz);
                 if (status.configured_end_hz !== undefined)
                     configuredFreq1 = Number(status.configured_end_hz);
-                if (status.visible_start_hz !== undefined)
+                const keepLocalView =
+                    gotoAnimationActive ||
+                    gotoPreviewRetained ||
+                    pendingViewChange;
+                if (!keepLocalView && status.visible_start_hz !== undefined)
                     currentFreq0 = Number(status.visible_start_hz);
-                if (status.visible_end_hz !== undefined)
+                if (!keepLocalView && status.visible_end_hz !== undefined)
                     currentFreq1 = Number(status.visible_end_hz);
                 if (status.samplerate !== undefined)
                     configuredSampleRate = Number(status.samplerate);
@@ -4325,7 +4330,12 @@
                 scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
             }
 
-            function applyAnimatedGotoWindow(left, right, force = false) {
+            function applyAnimatedGotoWindow(
+                left,
+                right,
+                force = false,
+                updateBackend = false,
+            ) {
                 if (!hasFrequencyWindow()) return false;
                 hideHoverReadout();
                 const full = primaryFrequencyWindow();
@@ -4343,6 +4353,8 @@
                 ) {
                     return false;
                 }
+                const prevFreq0 = currentFreq0;
+                const prevFreq1 = currentFreq1;
                 gotoPreviewRetained = false;
                 zoomLeft = 0;
                 zoomRight = 1;
@@ -4350,12 +4362,20 @@
                 currentFreq1 = clamped.right;
                 pendingViewChange = true;
                 binRangeCache = null;
+                transformVisibleDisplay(
+                    prevFreq0,
+                    prevFreq1,
+                    currentFreq0,
+                    currentFreq1,
+                );
+                scheduleCurrentViewRedraw();
                 updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
                 document.getElementById("infoRange").textContent =
                     formatScanRange(currentFreq0, currentFreq1);
                 updateZoomIndicator();
                 saveVisibleView();
-                scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
+                if (updateBackend)
+                    scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
                 return true;
             }
 
