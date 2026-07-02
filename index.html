@@ -997,8 +997,12 @@
             let gotoDelayS = 2;
             let gotoAnimationActive = false;
             let gotoPreviewRetained = false;
+            let gotoLocalViewActive = false;
+            let gotoLocalFreq0 = 0;
+            let gotoLocalFreq1 = 0;
             let gotoAnimationToken = 0;
             let gotoLineSerial = 0;
+            let gotoLastLine = null;
             let gotoLineWaiters = [];
             let visibleViewSaveTimer = 0;
             let visibleViewLastWriteMs = 0;
@@ -2077,6 +2081,7 @@
                 if (!gotoAnimationActive) return;
                 gotoAnimationToken++;
                 gotoPreviewRetained = true;
+                gotoLocalViewActive = false;
                 setGotoAnimationActive(false);
                 if (hasFrequencyWindow())
                     scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
@@ -2117,18 +2122,66 @@
                 return true;
             }
 
-            function notifyGotoLineDrawn() {
+            function gotoLineMatches(line, expectedView, expectedStart, expectedEnd) {
+                if (!line) return false;
+                if (
+                    expectedView !== null &&
+                    expectedView !== undefined &&
+                    line.view !== Number(expectedView)
+                ) {
+                    return false;
+                }
+                if (
+                    expectedStart === null ||
+                    expectedStart === undefined ||
+                    expectedEnd === null ||
+                    expectedEnd === undefined
+                ) {
+                    return true;
+                }
+                const start = Number(expectedStart);
+                const end = Number(expectedEnd);
+                if (!Number.isFinite(start) || !Number.isFinite(end)) return true;
+                const tol = Math.max(2, Math.abs(end - start) * 1e-6);
+                return (
+                    Math.abs(line.f0 - start) <= tol &&
+                    Math.abs(line.f1 - end) <= tol
+                );
+            }
+
+            function notifyGotoLineDrawn(view, f0, f1) {
                 gotoLineSerial++;
+                gotoLastLine = {
+                    serial: gotoLineSerial,
+                    view: Number(view),
+                    f0: Number(f0),
+                    f1: Number(f1),
+                };
                 if (!gotoLineWaiters.length) return;
-                const waiters = gotoLineWaiters;
-                gotoLineWaiters = [];
+                const waiters = gotoLineWaiters.slice();
                 waiters.forEach((waiter) => waiter());
             }
 
-            function waitForGotoLine(token, previousSerial) {
+            function waitForGotoLine(
+                token,
+                previousSerial,
+                expectedView = null,
+                expectedStart = null,
+                expectedEnd = null,
+            ) {
                 if (token !== gotoAnimationToken || !gotoAnimationActive)
                     return Promise.resolve(false);
-                if (gotoLineSerial > previousSerial) return Promise.resolve(true);
+                if (
+                    gotoLineSerial > previousSerial &&
+                    gotoLineMatches(
+                        gotoLastLine,
+                        expectedView,
+                        expectedStart,
+                        expectedEnd,
+                    )
+                ) {
+                    return Promise.resolve(true);
+                }
                 return new Promise((resolve) => {
                     let done = false;
                     const finish = (ok) => {
@@ -2141,11 +2194,24 @@
                         resolve(ok);
                     };
                     const onLine = () => {
-                        finish(
-                            token === gotoAnimationToken &&
-                                gotoAnimationActive &&
-                                gotoLineSerial > previousSerial,
-                        );
+                        if (
+                            token !== gotoAnimationToken ||
+                            !gotoAnimationActive
+                        ) {
+                            finish(false);
+                            return;
+                        }
+                        if (
+                            gotoLineSerial > previousSerial &&
+                            gotoLineMatches(
+                                gotoLastLine,
+                                expectedView,
+                                expectedStart,
+                                expectedEnd,
+                            )
+                        ) {
+                            finish(true);
+                        }
                     };
                     const timer = setTimeout(() => finish(false), 15000);
                     gotoLineWaiters.push(onLine);
@@ -2192,28 +2258,66 @@
                 return Math.max(0.001, span * 1e-6);
             }
 
+            function gotoNeedsBackendViewUpdate(finalStep) {
+                if (finalStep) return true;
+                if (!currentBins || !currentBins.length) return true;
+                if (!hasFrequencyWindow(currentBinsFreq0, currentBinsFreq1))
+                    return true;
+                if (
+                    currentFreq0 < currentBinsFreq0 ||
+                    currentFreq1 > currentBinsFreq1
+                ) {
+                    return true;
+                }
+                const backendSpan = currentBinsFreq1 - currentBinsFreq0;
+                const visibleSpan = currentFreq1 - currentFreq0;
+                if (backendSpan <= 0 || visibleSpan <= 0) return true;
+                return backendSpan / visibleSpan > 2.0;
+            }
+
             async function runGotoAnimation(freqHz, targetZoom) {
                 cancelGotoAnimation();
                 const token = ++gotoAnimationToken;
                 const target = normalizeGotoFrequency(freqHz);
                 const targetSpan = gotoSpanForZoom(targetZoom);
+                let renderedTarget = false;
+                let animFreq0 = currentFreq0;
+                let animFreq1 = currentFreq1;
                 setGotoAnimationActive(true);
 
                 while (token === gotoAnimationToken && gotoAnimationActive) {
                     if (!hasFrequencyWindow()) break;
-                    const currentSpan = currentFreq1 - currentFreq0;
-                    const currentCenter = (currentFreq0 + currentFreq1) * 0.5;
+                    currentFreq0 = animFreq0;
+                    currentFreq1 = animFreq1;
+                    const currentSpan = animFreq1 - animFreq0;
+                    const currentCenter = (animFreq0 + animFreq1) * 0.5;
                     const tolerance = gotoToleranceForSpan(targetSpan);
                     if (
                         Math.abs(currentSpan - targetSpan) <= tolerance &&
                         Math.abs(currentCenter - target) <= tolerance
                     ) {
+                        renderedTarget = true;
                         break;
                     }
-                    const nextSpan =
+                    let nextSpan =
                         currentSpan > targetSpan
                             ? Math.max(targetSpan, currentSpan / 1.3)
                             : Math.min(targetSpan, currentSpan * 1.3);
+                    const singleModeSpan =
+                        configuredDirectSampling !== 0
+                            ? currentDirectSamplingMaxHz
+                            : configuredSampleRate;
+                    if (
+                        currentSpan > targetSpan &&
+                        targetSpan < singleModeSpan &&
+                        nextSpan > singleModeSpan &&
+                        currentSpan / (1.3 * 1.3) <= singleModeSpan
+                    ) {
+                        nextSpan = Math.max(
+                            targetSpan,
+                            currentSpan / (1.3 * 1.3),
+                        );
+                    }
                     const finalStep =
                         Math.abs(nextSpan - targetSpan) <= tolerance &&
                         Math.abs(currentCenter - target) <= targetSpan;
@@ -2222,6 +2326,7 @@
                         : currentCenter + (target - currentCenter) * 0.45;
                     const next = gotoWindowForCenter(nextCenter, nextSpan);
                     if (!next) break;
+                    const beforeLine = gotoLineSerial;
                     if (
                         !applyAnimatedGotoWindow(
                             next.left,
@@ -2231,6 +2336,37 @@
                         )
                     )
                         break;
+                    animFreq0 = currentFreq0;
+                    animFreq1 = currentFreq1;
+                    let rendered = false;
+                    const updateBackend = gotoNeedsBackendViewUpdate(finalStep);
+                    if (!updateBackend) pendingViewChange = false;
+                    if (updateBackend) {
+                        const plan = await sendImmediateViewUpdate(
+                            currentFreq0,
+                            currentFreq1,
+                            true,
+                        );
+                        if (
+                            token !== gotoAnimationToken ||
+                            !gotoAnimationActive ||
+                            !plan ||
+                            plan.status !== "ok"
+                        ) {
+                            break;
+                        }
+                        rendered = await waitForGotoLine(
+                            token,
+                            beforeLine,
+                            currentViewId,
+                            currentFreq0,
+                            currentFreq1,
+                        );
+                    } else {
+                        rendered = await waitForGotoLine(token, beforeLine);
+                    }
+                    if (!rendered) break;
+                    if (finalStep) renderedTarget = true;
                     if (
                         token !== gotoAnimationToken ||
                         !gotoAnimationActive ||
@@ -2242,7 +2378,11 @@
                     if (!keepGoing) break;
                 }
 
-                if (token === gotoAnimationToken && gotoAnimationActive) {
+                if (
+                    token === gotoAnimationToken &&
+                    gotoAnimationActive &&
+                    !renderedTarget
+                ) {
                     const finalWindow = gotoWindowForCenter(target, targetSpan);
                     if (finalWindow) {
                         const beforeLine = gotoLineSerial;
@@ -2250,10 +2390,23 @@
                             finalWindow.left,
                             finalWindow.right,
                             true,
+                            false,
+                        );
+                        await sendImmediateViewUpdate(
+                            currentFreq0,
+                            currentFreq1,
                             true,
                         );
-                        await waitForGotoLine(token, beforeLine);
+                        await waitForGotoLine(
+                            token,
+                            beforeLine,
+                            currentViewId,
+                            currentFreq0,
+                            currentFreq1,
+                        );
                     }
+                }
+                if (token === gotoAnimationToken && gotoAnimationActive) {
                     setGotoAnimationActive(false);
                 }
             }
@@ -3519,7 +3672,19 @@
                             data.view !== undefined
                                 ? Number(data.view)
                                 : currentViewId;
-                        if (pendingViewChange && rowView === currentViewId)
+                        const rowFreq0 =
+                            data.f0 !== undefined
+                                ? Number(data.f0)
+                                : currentFreq0;
+                        const rowFreq1 =
+                            data.f1 !== undefined
+                                ? Number(data.f1)
+                                : currentFreq1;
+                        if (
+                            pendingViewChange &&
+                            !gotoLocalViewActive &&
+                            rowView === currentViewId
+                        )
                             return;
                         if (
                             currentViewId &&
@@ -3534,10 +3699,18 @@
                             configuredFreq0 = Number(data.full_f0);
                         if (data.full_f1 !== undefined)
                             configuredFreq1 = Number(data.full_f1);
-                        if (data.f0 !== undefined)
-                            currentFreq0 = Number(data.f0);
-                        if (data.f1 !== undefined)
-                            currentFreq1 = Number(data.f1);
+                        const preserveGotoView =
+                            gotoAnimationActive &&
+                            gotoLocalViewActive &&
+                            !pendingViewChange;
+                        if (!preserveGotoView && data.f0 !== undefined)
+                            currentFreq0 = rowFreq0;
+                        if (!preserveGotoView && data.f1 !== undefined)
+                            currentFreq1 = rowFreq1;
+                        if (preserveGotoView) {
+                            currentFreq0 = gotoLocalFreq0;
+                            currentFreq1 = gotoLocalFreq1;
+                        }
                         if (data.b) currentSteps = data.b;
                         updateFFTInfo(data);
                         if (
@@ -3550,23 +3723,27 @@
                         if (pendingViewChange) gotoPreviewRetained = false;
                         pendingViewChange = false;
                         currentBins = bins;
-                        currentBinsFreq0 = currentFreq0;
-                        currentBinsFreq1 = currentFreq1;
+                        currentBinsFreq0 = rowFreq0;
+                        currentBinsFreq1 = rowFreq1;
                         recordWaterfallLineArrival();
 
                         drawWaterfallLine(
                             bins,
-                            currentFreq0,
-                            currentFreq1,
+                            rowFreq0,
+                            rowFreq1,
                             currentSteps,
                         );
                         drawScope(
                             bins,
-                            currentFreq0,
-                            currentFreq1,
+                            rowFreq0,
+                            rowFreq1,
                             currentSteps,
                         );
-                        notifyGotoLineDrawn();
+                        notifyGotoLineDrawn(
+                            rowView,
+                            rowFreq0,
+                            rowFreq1,
+                        );
 
                         document.getElementById("infoRange").textContent =
                             formatScanRange(currentFreq0, currentFreq1);
@@ -4314,6 +4491,11 @@
                 zoomRight = 1;
                 currentFreq0 = clamped.left;
                 currentFreq1 = clamped.right;
+                gotoLocalViewActive = !updateBackend;
+                if (gotoLocalViewActive) {
+                    gotoLocalFreq0 = currentFreq0;
+                    gotoLocalFreq1 = currentFreq1;
+                }
                 pendingViewChange = true;
                 binRangeCache = null;
                 transformVisibleDisplay(
@@ -4873,34 +5055,58 @@
                 }
             }
 
-            async function sendViewUpdate() {
-                const request = pendingView;
-                if (!request) return;
+            async function sendImmediateViewUpdate(
+                visibleStart,
+                visibleEnd,
+                visibleChanged,
+                clearGotoLocal = true,
+            ) {
+                if (!backendOnline || !scanRunning) return null;
+                if (!hasFrequencyWindow(visibleStart, visibleEnd)) return null;
+                if (viewUpdateTimer) {
+                    clearTimeout(viewUpdateTimer);
+                    viewUpdateTimer = null;
+                }
                 pendingView = null;
-                viewUpdateTimer = null;
+                if (clearGotoLocal) gotoLocalViewActive = false;
 
                 const serial = ++viewRequestSerial;
                 const result = await apiPost("/api/view", {
-                    visible_start_hz: request.visible_start_hz,
-                    visible_end_hz: request.visible_end_hz,
-                    display_bins: request.display_bins,
+                    visible_start_hz: visibleStart,
+                    visible_end_hz: visibleEnd,
+                    display_bins: displayBins(),
                     view_id: currentViewId,
                 });
-                if (serial !== viewRequestSerial) return;
+                if (serial !== viewRequestSerial) return null;
 
                 if (!result) {
                     updateUI(false, false);
                     disconnectSSE();
-                    return;
+                    return null;
                 }
                 if (result.status === "ok") {
-                    applyViewPlan(result, request.visible_changed);
+                    applyViewPlan(result, !!visibleChanged);
                     updateUI(!!result.scanning, true);
                     if (result.scanning && !eventSource) connectSSE();
                 } else {
                     pendingViewChange = false;
                     updateUI(false, true);
                 }
+                return result;
+            }
+
+            async function sendViewUpdate() {
+                const request = pendingView;
+                if (!request) return;
+                pendingView = null;
+                viewUpdateTimer = null;
+
+                await sendImmediateViewUpdate(
+                    request.visible_start_hz,
+                    request.visible_end_hz,
+                    request.visible_changed,
+                    !gotoAnimationActive,
+                );
             }
 
             function sampleRateLabel(rate) {
