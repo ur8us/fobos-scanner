@@ -258,6 +258,24 @@
                 color: #8098b0;
                 text-align: right;
             }
+            .gain-group.lna-hot label,
+            .gain-group.lna-hot .range-val {
+                color: #ff5a5a;
+            }
+            .gain-group.lna-hot input[type="range"] {
+                accent-color: #ff5a5a;
+                background: #5a1f28;
+            }
+            .gain-group.lna-hot input[type="range"]::-webkit-slider-thumb {
+                background: #ff5a5a;
+            }
+            .gain-group.lna-hot input[type="range"]::-moz-range-track {
+                background: #5a1f28;
+            }
+            .gain-group.lna-hot input[type="range"]::-moz-range-thumb {
+                background: #ff5a5a;
+                border-color: #ff5a5a;
+            }
             .dual-group {
                 flex: 1 0 250px;
                 min-width: 230px;
@@ -720,9 +738,9 @@
             </div>
 
             <div class="controls">
-                <div class="ctrl-group gain-group">
+                <div class="ctrl-group gain-group" id="lnaGroup">
                     <label>
-                        LNA <span class="range-val" id="lnaVal">0</span>
+                        LNA <span class="range-val" id="lnaVal">1</span>
                     </label>
                     <div class="single-slider-row">
                         <input
@@ -730,7 +748,7 @@
                             id="lnaGain"
                             min="0"
                             max="3"
-                            value="0"
+                            value="1"
                             step="1"
                         />
                     </div>
@@ -966,6 +984,7 @@
             let redrawFrame = 0;
             let waterfallRenderToken = 0;
             let waterfallRenderActiveToken = 0;
+            let currentViewRedrawWaiters = [];
             let binRangeCache = null;
             let zoomWheelFrame = 0;
             let zoomWheelSteps = 0;
@@ -1295,6 +1314,15 @@
                 updateDualSliderFill("wfLevelSlider", minVal, maxVal, 400);
                 if (levelSlider)
                     levelSlider.classList.toggle("disabled", waterfallAuto);
+            }
+
+            function setLnaValue(value) {
+                const normalized = clampNumber(parseInt(value, 10) || 0, 0, 3);
+                document.getElementById("lnaGain").value = String(normalized);
+                document.getElementById("lnaVal").textContent =
+                    String(normalized);
+                const group = document.getElementById("lnaGroup");
+                if (group) group.classList.toggle("lna-hot", normalized === 3);
             }
 
             function selectedDirectSampling() {
@@ -1868,6 +1896,31 @@
                 });
             }
 
+            function resolveCurrentViewRedrawWaiters() {
+                if (!currentViewRedrawWaiters.length) return;
+                const waiters = currentViewRedrawWaiters;
+                currentViewRedrawWaiters = [];
+                waiters.forEach((resolve) => resolve(true));
+            }
+
+            function waitForCurrentViewRedraw(timeoutMs = 2000) {
+                return new Promise((resolve) => {
+                    let done = false;
+                    const finish = (ok) => {
+                        if (done) return;
+                        done = true;
+                        clearTimeout(timer);
+                        currentViewRedrawWaiters =
+                            currentViewRedrawWaiters.filter(
+                                (waiter) => waiter !== finish,
+                            );
+                        resolve(ok);
+                    };
+                    const timer = setTimeout(() => finish(false), timeoutMs);
+                    currentViewRedrawWaiters.push(finish);
+                });
+            }
+
             function capturePanPreviewBase() {
                 panPreviewBaseData = null;
                 panPreviewBaseWidth = 0;
@@ -1893,6 +1946,8 @@
                         currentSourceEnd(),
                         currentSteps,
                     );
+                } else {
+                    resolveCurrentViewRedrawWaiters();
                 }
                 if (hasFrequencyWindow() && currentSteps) {
                     updateFrequencyLabels(
@@ -2189,6 +2244,7 @@
                         )
                     )
                         break;
+                    await waitForCurrentViewRedraw();
                     if (
                         token !== gotoAnimationToken ||
                         !gotoAnimationActive ||
@@ -3117,7 +3173,10 @@
             }
 
             function redrawWaterfallHistory(renderToken) {
-                if (!wfImageData) return;
+                if (!wfImageData) {
+                    resolveCurrentViewRedrawWaiters();
+                    return;
+                }
 
                 const w = wfImageData.width;
                 const h = wfImageData.height;
@@ -3135,6 +3194,8 @@
                     if (waterfallRenderActiveToken === renderToken) {
                         waterfallRenderActiveToken = 0;
                     }
+                    if (renderToken === waterfallRenderToken)
+                        resolveCurrentViewRedrawWaiters();
                 }
 
                 function drawChunk() {
@@ -5168,10 +5229,7 @@
                         ),
                     });
                     if (result && result.status === "ok") {
-                        document.getElementById("lnaGain").value =
-                            result.lna_gain;
-                        document.getElementById("lnaVal").textContent =
-                            result.lna_gain;
+                        setLnaValue(result.lna_gain);
                         document.getElementById("vgaGain").value =
                             result.vga_gain;
                         document.getElementById("vgaVal").textContent =
@@ -5261,7 +5319,7 @@
             document
                 .getElementById("lnaGain")
                 .addEventListener("input", function () {
-                    document.getElementById("lnaVal").textContent = this.value;
+                    setLnaValue(this.value);
                     scheduleGainUpdate();
                 });
             document.getElementById("vgaGain");
@@ -5479,10 +5537,7 @@
                             }
                     }
                     if (status.lna_gain !== undefined) {
-                        document.getElementById("lnaGain").value =
-                            status.lna_gain;
-                        document.getElementById("lnaVal").textContent =
-                            status.lna_gain;
+                        setLnaValue(status.lna_gain);
                     }
                     if (status.vga_gain !== undefined) {
                         document.getElementById("vgaGain").value =

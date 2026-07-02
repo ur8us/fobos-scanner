@@ -74,7 +74,7 @@
 #define PROCESS_QUEUE_LEN   8
 #define DIRECT_SAMPLING_RATE_HZ SCANNER_SAMPLE_RATE_HZ
 #define DIRECT_SAMPLING_MAX_HZ 25.0e6
-#define HARDWARE_AUTO_BANDWIDTH 1.0
+// #define HARDWARE_AUTO_BANDWIDTH 1.0
 #define PSEUDO_RANDOM_SAMPLE_SOURCE 0
 #define DB_FLOOR            -100.0f
 #define DB_CEIL             -20.0f
@@ -143,7 +143,7 @@ static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 10;
 static uint32_t g_rate_limit_lps = 20;
 static uint32_t g_view_id    = 1;
-static uint32_t g_lna_gain   = 0;
+static uint32_t g_lna_gain   = 1;
 static uint32_t g_vga_gain   = 0;
 static uint32_t g_direct_sampling = 0;
 static uint32_t g_clk_source = 0;
@@ -3282,10 +3282,11 @@ static void *scan_thread_func(void *arg)
      * explicitly to the same full-samplerate value previously requested
      * through auto bandwidth.
      */
-    ret = fobos_sdr_set_auto_bandwidth(g_dev, 0.99);
-    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_auto_bandwidth failed: %d\n", ret); device_error = 1; }
-//    ret = fobos_sdr_set_bandwidth(g_dev, g_samplerate * HARDWARE_AUTO_BANDWIDTH);
-//    if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_bandwidth failed: %d\n", ret); device_error = 1; }
+    // ret = fobos_sdr_set_auto_bandwidth(g_dev, 0.99);
+    // if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_auto_bandwidth failed: %d\n", ret); device_error = 1; }
+   ret = fobos_sdr_set_bandwidth(g_dev, 50e6 );
+//   ret = fobos_sdr_set_bandwidth(g_dev, g_samplerate/* HARDWARE_AUTO_BANDWIDTH*/);
+   if (ret != FOBOS_ERR_OK) { fprintf(stderr, "[SDR] set_bandwidth failed: %d\n", ret); device_error = 1; }
     if (!direct_sampling_enabled()) {
         ret = fobos_sdr_set_lna_gain(g_dev, g_lna_gain);
         if (ret != FOBOS_ERR_OK) fprintf(stderr, "[SDR] set_lna_gain failed: %d\n", ret);
