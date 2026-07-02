@@ -2195,24 +2195,12 @@
                 const token = ++gotoAnimationToken;
                 const target = normalizeGotoFrequency(freqHz);
                 const targetSpan = gotoSpanForZoom(targetZoom);
-                const baseLeft = currentFreq0;
-                const baseRight = currentFreq1;
                 setGotoAnimationActive(true);
 
                 while (token === gotoAnimationToken && gotoAnimationActive) {
                     if (!hasFrequencyWindow()) break;
-                    const baseSpan = baseRight - baseLeft;
-                    if (
-                        baseSpan <= 0 ||
-                        target < baseLeft ||
-                        target > baseRight
-                    ) {
-                        break;
-                    }
-                    const visibleLeft = baseLeft + baseSpan * zoomLeft;
-                    const visibleRight = baseLeft + baseSpan * zoomRight;
-                    const currentSpan = visibleRight - visibleLeft;
-                    const currentCenter = (visibleLeft + visibleRight) * 0.5;
+                    const currentSpan = currentFreq1 - currentFreq0;
+                    const currentCenter = (currentFreq0 + currentFreq1) * 0.5;
                     const tolerance = gotoToleranceForSpan(targetSpan);
                     if (
                         Math.abs(currentSpan - targetSpan) <= tolerance &&
@@ -2230,21 +2218,19 @@
                     const nextCenter = finalStep
                         ? target
                         : currentCenter + (target - currentCenter) * 0.45;
-                    const next = gotoWindowForCenter(
-                        clampNumber(nextCenter, baseLeft, baseRight),
-                        nextSpan,
-                    );
+                    const next = gotoWindowForCenter(nextCenter, nextSpan);
                     if (!next) break;
+                    const beforeLine = gotoLineSerial;
                     if (
-                        !previewGotoWindow(
+                        !applyAnimatedGotoWindow(
                             next.left,
                             next.right,
-                            baseLeft,
-                            baseRight,
+                            finalStep,
                         )
                     )
                         break;
-                    await waitForCurrentViewRedraw();
+                    const rendered = await waitForGotoLine(token, beforeLine);
+                    if (!rendered) break;
                     if (
                         token !== gotoAnimationToken ||
                         !gotoAnimationActive ||
@@ -2260,7 +2246,7 @@
                     const finalWindow = gotoWindowForCenter(target, targetSpan);
                     if (finalWindow) {
                         const beforeLine = gotoLineSerial;
-                        applyVisibleWindow(
+                        applyAnimatedGotoWindow(
                             finalWindow.left,
                             finalWindow.right,
                             true,
@@ -4337,6 +4323,40 @@
                     formatScanRange(currentFreq0, currentFreq1);
                 saveVisibleView();
                 scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
+            }
+
+            function applyAnimatedGotoWindow(left, right, force = false) {
+                if (!hasFrequencyWindow()) return false;
+                hideHoverReadout();
+                const full = primaryFrequencyWindow();
+                const clamped = clampVisibleWindow(
+                    left,
+                    right,
+                    full.left,
+                    full.right,
+                );
+                if (!clamped) return false;
+                if (
+                    !force &&
+                    Math.abs(clamped.left - currentFreq0) < 1 &&
+                    Math.abs(clamped.right - currentFreq1) < 1
+                ) {
+                    return false;
+                }
+                gotoPreviewRetained = false;
+                zoomLeft = 0;
+                zoomRight = 1;
+                currentFreq0 = clamped.left;
+                currentFreq1 = clamped.right;
+                pendingViewChange = true;
+                binRangeCache = null;
+                updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
+                document.getElementById("infoRange").textContent =
+                    formatScanRange(currentFreq0, currentFreq1);
+                updateZoomIndicator();
+                saveVisibleView();
+                scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
+                return true;
             }
 
             function zoomByFactor(factor, anchorFraction = 0.5) {
