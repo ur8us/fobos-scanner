@@ -35,6 +35,22 @@
                 align-items: center;
                 gap: 10px;
             }
+            h1 .title-main {
+                display: inline-flex;
+                align-items: center;
+                gap: 10px;
+                min-width: 0;
+            }
+            h1 .title-zoom {
+                margin-left: auto;
+                padding-right: 16px;
+                color: inherit;
+                font-size: inherit;
+                font-weight: inherit;
+                letter-spacing: inherit;
+                text-transform: inherit;
+                white-space: nowrap;
+            }
             h1 small {
                 font-size: 0.8rem;
                 color: #607080;
@@ -484,6 +500,7 @@
                 font: 11px/1.2 monospace;
                 white-space: pre-line;
             }
+            .dialog-panel,
             .marker-dialog {
                 position: fixed;
                 z-index: 20;
@@ -495,9 +512,16 @@
                 background: rgba(12, 16, 24, 0.96);
                 box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
             }
+            .dialog-panel.centered {
+                left: 50%;
+                top: 50%;
+                transform: translate(-50%, -50%);
+            }
+            .dialog-panel.open,
             .marker-dialog.open {
                 display: block;
             }
+            .dialog-panel-title,
             .marker-dialog-title {
                 margin: 0 0 10px 0;
                 color: #d8e0e8;
@@ -505,6 +529,7 @@
                 font-weight: 500;
                 letter-spacing: 0.5px;
             }
+            .dialog-panel label,
             .marker-dialog label {
                 display: block;
                 margin: 0 0 7px 0;
@@ -513,6 +538,8 @@
                 letter-spacing: 1px;
                 color: #7088a0;
             }
+            .dialog-panel input,
+            .dialog-panel select,
             .marker-dialog input,
             .marker-dialog select {
                 width: 100%;
@@ -524,6 +551,37 @@
                 color: #d8e0e8;
                 font-size: 12px;
             }
+            .dialog-panel input[type="checkbox"] {
+                width: auto;
+                margin: 0 6px 0 0;
+                vertical-align: middle;
+            }
+            .dialog-panel input:disabled,
+            .dialog-panel select:disabled {
+                opacity: 0.55;
+            }
+            .dialog-panel .dialog-inline-row {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin: 0 0 7px 0;
+            }
+            .dialog-panel .dialog-inline-row label {
+                margin: 0;
+            }
+            .dialog-panel .dialog-inline-row .dialog-check-label {
+                flex: 0 0 auto;
+                white-space: nowrap;
+            }
+            .dialog-panel .dialog-inline-row .dialog-delay-label {
+                flex: 1 1 auto;
+            }
+            .mini-btn.active {
+                border-color: #2f86ff;
+                background: #14345c;
+                color: #e5f0ff;
+            }
+            .dialog-panel .dialog-actions,
             .marker-dialog .dialog-actions {
                 display: flex;
                 gap: 6px;
@@ -535,9 +593,14 @@
     <body>
         <div class="container">
             <h1>
-                <span class="status-dot idle" id="statusDot"></span>
-                Fobos SDR Scanner with a million times zoom
-                <small id="statusText">disconnected</small>
+                <span class="title-main">
+                    <span class="status-dot idle" id="statusDot"></span>
+                    Fobos SDR Scanner with a million times zoom
+                    <small id="statusText">disconnected</small>
+                </span>
+                <span class="title-zoom"
+                    >Current zoom: <span id="infoZoom">1.00x</span></span
+                >
             </h1>
 
             <div class="info-bar">
@@ -545,10 +608,6 @@
                 <span>HW: <span class="val" id="infoHw">---</span></span>
                 <span>FW: <span class="val" id="infoFw">---</span></span>
                 <span>S/N: <span class="val" id="infoSn">---</span></span>
-                <span
-                    >Zoom (SHIFT+wheel):
-                    <span class="val" id="infoZoom">1.00x</span></span
-                >
                 <span
                     >Markers (SHIFT+click):
                     <span class="val" id="infoMarkers">0</span></span
@@ -569,6 +628,14 @@
                     </button>
                     <button class="mini-btn" id="zoomReset" title="Reset zoom">
                         1x
+                    </button>
+                    <button
+                        class="mini-btn"
+                        id="gotoButton"
+                        title="Go to frequency"
+                        disabled
+                    >
+                        Go to
                     </button>
                     <button class="mini-btn" id="zoomIn" title="Zoom in">
                         +
@@ -776,6 +843,44 @@
                 <canvas id="rulerOverlay"></canvas>
             </div>
             <div class="hover-readout" id="hoverReadout"></div>
+            <div class="dialog-panel centered" id="gotoDialog">
+                <div class="dialog-panel-title">Go to</div>
+                <label>
+                    Target frequency (MHz)
+                    <input type="number" id="gotoFreq" step="0.000001" />
+                </label>
+                <label>
+                    Target zoom
+                    <input
+                        type="number"
+                        id="gotoTargetZoom"
+                        min="1"
+                        max="1000000"
+                        step="0.01"
+                    />
+                </label>
+                <div class="dialog-inline-row">
+                    <label class="dialog-check-label">
+                        <input type="checkbox" id="gotoAnimate" />
+                        Animate
+                    </label>
+                    <label class="dialog-delay-label">
+                        Delay
+                        <select id="gotoDelay" disabled>
+                            <option value="0.2">0.2s</option>
+                            <option value="0.5">0.5s</option>
+                            <option value="1">1s</option>
+                            <option value="2" selected>2s</option>
+                            <option value="3">3s</option>
+                            <option value="5">5s</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="dialog-actions">
+                    <button class="mini-btn" id="gotoCancel">Cancel</button>
+                    <button class="mini-btn" id="gotoOk">OK</button>
+                </div>
+            </div>
             <div class="marker-dialog" id="markerDialog">
                 <div class="marker-dialog-title">Add/edit marker</div>
                 <label>
@@ -867,6 +972,15 @@
             let zoomWheelDirection = 0;
             let zoomWheelCanvas = null;
             let zoomWheelClientX = 0;
+            let gotoFreqHz = 1000e6;
+            let gotoTargetZoom = 1000000;
+            let gotoAnimate = false;
+            let gotoDelayS = 2;
+            let gotoAnimationActive = false;
+            let gotoPreviewRetained = false;
+            let gotoAnimationToken = 0;
+            let gotoLineSerial = 0;
+            let gotoLineWaiters = [];
             let visibleViewSaveTimer = 0;
             let visibleViewLastWriteMs = 0;
             let visibleViewLastSerialized = "";
@@ -1208,6 +1322,8 @@
                 document.getElementById("btnStart").disabled =
                     !connected || locked;
                 document.getElementById("btnStop").disabled = !locked;
+                document.getElementById("gotoButton").disabled = !locked;
+                if (!locked) cancelGotoAnimation();
             }
 
             function computedDirectSamplingMaxHz() {
@@ -1497,8 +1613,7 @@
             }
 
             function minZoomSpan(binCount) {
-                if (!binCount || binCount <= 0) return 1 / MAX_ZOOM_FACTOR;
-                return Math.min(1, Math.max(1 / binCount, 1 / MAX_ZOOM_FACTOR));
+                return 1 / MAX_ZOOM_FACTOR;
             }
 
             function clampZoomRange(binCount) {
@@ -1819,6 +1934,337 @@
                     .toFixed(decimals)
                     .replace(/0+$/, "")
                     .replace(/\.$/, "");
+            }
+
+            function normalizeGotoFrequency(freqHz) {
+                const full = primaryFrequencyWindow();
+                if (!hasFrequencyWindow(full.left, full.right))
+                    return 1000e6;
+                if (
+                    !Number.isFinite(freqHz) ||
+                    freqHz < full.left ||
+                    freqHz > full.right
+                ) {
+                    return (full.left + full.right) * 0.5;
+                }
+                return freqHz;
+            }
+
+            function normalizeGotoDelay(delay) {
+                const value = Number(delay);
+                return [0.2, 0.5, 1, 2, 3, 5].includes(value) ? value : 2;
+            }
+
+            function normalizeGotoTargetZoom(zoom) {
+                const value = Number(zoom);
+                if (!Number.isFinite(value)) return MAX_ZOOM_FACTOR;
+                return clampNumber(value, 1, MAX_ZOOM_FACTOR);
+            }
+
+            function formatZoomInputValue(zoom) {
+                const value = normalizeGotoTargetZoom(zoom);
+                return value < 10
+                    ? value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")
+                    : value.toFixed(1).replace(/0+$/, "").replace(/\.$/, "");
+            }
+
+            function gotoSpanForZoom(zoom) {
+                const full = primaryFrequencyWindow();
+                const fullSpan = full.right - full.left;
+                if (fullSpan <= 0) return 0;
+                return fullSpan / normalizeGotoTargetZoom(zoom);
+            }
+
+            function gotoWindowForCenter(center, span) {
+                const full = primaryFrequencyWindow();
+                const half = Math.max(Number.EPSILON, span * 0.5);
+                return clampVisibleWindow(
+                    center - half,
+                    center + half,
+                    full.left,
+                    full.right,
+                );
+            }
+
+            function previewGotoWindow(left, right, baseLeft, baseRight) {
+                const baseSpan = baseRight - baseLeft;
+                if (baseSpan <= 0 || right <= left) return false;
+                zoomLeft = clampNumber((left - baseLeft) / baseSpan, 0, 1);
+                zoomRight = clampNumber((right - baseLeft) / baseSpan, 0, 1);
+                if (zoomRight <= zoomLeft) {
+                    const center = clampNumber(
+                        ((left + right) * 0.5 - baseLeft) / baseSpan,
+                        0,
+                        1,
+                    );
+                    const half = (1 / MAX_ZOOM_FACTOR) * 0.5;
+                    zoomLeft = clampNumber(center - half, 0, 1);
+                    zoomRight = clampNumber(center + half, 0, 1);
+                }
+                gotoPreviewRetained = true;
+                binRangeCache = null;
+                scheduleCurrentViewRedraw();
+                updateFrequencyLabels(baseLeft, baseRight, currentSteps);
+                document.getElementById("infoRange").textContent =
+                    formatScanRange(left, right);
+                updateZoomIndicator();
+                return true;
+            }
+
+            function setGotoAnimationActive(active) {
+                gotoAnimationActive = active;
+                document
+                    .getElementById("gotoButton")
+                    .classList.toggle("active", active);
+            }
+
+            function cancelGotoAnimation() {
+                if (!gotoAnimationActive) return;
+                gotoAnimationToken++;
+                gotoPreviewRetained = true;
+                setGotoAnimationActive(false);
+                const waiters = gotoLineWaiters;
+                gotoLineWaiters = [];
+                waiters.forEach((waiter) => waiter());
+            }
+
+            function materializeGotoPreview() {
+                if (!gotoPreviewRetained) return false;
+                if (!hasFrequencyWindow()) {
+                    gotoPreviewRetained = false;
+                    return false;
+                }
+                const baseLeft = currentFreq0;
+                const baseRight = currentFreq1;
+                const baseSpan = baseRight - baseLeft;
+                if (baseSpan <= 0) {
+                    gotoPreviewRetained = false;
+                    return false;
+                }
+                const nextLeft = baseLeft + baseSpan * zoomLeft;
+                const nextRight = baseLeft + baseSpan * zoomRight;
+                if (nextRight <= nextLeft) {
+                    gotoPreviewRetained = false;
+                    return false;
+                }
+                currentFreq0 = nextLeft;
+                currentFreq1 = nextRight;
+                zoomLeft = 0;
+                zoomRight = 1;
+                gotoPreviewRetained = false;
+                binRangeCache = null;
+                updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
+                document.getElementById("infoRange").textContent =
+                    formatScanRange(currentFreq0, currentFreq1);
+                updateZoomIndicator();
+                return true;
+            }
+
+            function notifyGotoLineDrawn() {
+                gotoLineSerial++;
+                if (!gotoLineWaiters.length) return;
+                const waiters = gotoLineWaiters;
+                gotoLineWaiters = [];
+                waiters.forEach((waiter) => waiter());
+            }
+
+            function waitForGotoLine(token, previousSerial) {
+                if (token !== gotoAnimationToken || !gotoAnimationActive)
+                    return Promise.resolve(false);
+                if (gotoLineSerial > previousSerial) return Promise.resolve(true);
+                return new Promise((resolve) => {
+                    let done = false;
+                    const finish = (ok) => {
+                        if (done) return;
+                        done = true;
+                        clearTimeout(timer);
+                        gotoLineWaiters = gotoLineWaiters.filter(
+                            (waiter) => waiter !== onLine,
+                        );
+                        resolve(ok);
+                    };
+                    const onLine = () => {
+                        finish(
+                            token === gotoAnimationToken &&
+                                gotoAnimationActive &&
+                                gotoLineSerial > previousSerial,
+                        );
+                    };
+                    const timer = setTimeout(() => finish(false), 15000);
+                    gotoLineWaiters.push(onLine);
+                });
+            }
+
+            function gotoDelay(token) {
+                const delayMs = Math.round(normalizeGotoDelay(gotoDelayS) * 1000);
+                return new Promise((resolve) => {
+                    setTimeout(() => {
+                        resolve(
+                            token === gotoAnimationToken &&
+                                gotoAnimationActive,
+                        );
+                    }, delayMs);
+                });
+            }
+
+            async function saveGotoSettings(freqHz, targetZoom, animate, delayS) {
+                const result = await apiPost("/api/goto", {
+                    goto_freq_hz: freqHz,
+                    goto_target_zoom: targetZoom,
+                    goto_animate: animate ? 1 : 0,
+                    goto_delay_s: delayS,
+                });
+                if (!result || result.status !== "ok") return false;
+                gotoFreqHz = Number(result.goto_freq_hz);
+                gotoTargetZoom = normalizeGotoTargetZoom(
+                    result.goto_target_zoom,
+                );
+                gotoAnimate = !!result.goto_animate;
+                gotoDelayS = normalizeGotoDelay(result.goto_delay_s);
+                return true;
+            }
+
+            function applyGotoTargetNow(freqHz, targetZoom) {
+                const target = normalizeGotoFrequency(freqHz);
+                const span = gotoSpanForZoom(targetZoom);
+                const next = gotoWindowForCenter(target, span);
+                if (next) applyVisibleWindow(next.left, next.right, true);
+            }
+
+            function gotoToleranceForSpan(span) {
+                return Math.max(0.001, span * 1e-6);
+            }
+
+            async function runGotoAnimation(freqHz, targetZoom) {
+                cancelGotoAnimation();
+                const token = ++gotoAnimationToken;
+                const target = normalizeGotoFrequency(freqHz);
+                const targetSpan = gotoSpanForZoom(targetZoom);
+                const baseLeft = currentFreq0;
+                const baseRight = currentFreq1;
+                setGotoAnimationActive(true);
+
+                while (token === gotoAnimationToken && gotoAnimationActive) {
+                    if (!hasFrequencyWindow()) break;
+                    const baseSpan = baseRight - baseLeft;
+                    if (
+                        baseSpan <= 0 ||
+                        target < baseLeft ||
+                        target > baseRight
+                    ) {
+                        break;
+                    }
+                    const visibleLeft = baseLeft + baseSpan * zoomLeft;
+                    const visibleRight = baseLeft + baseSpan * zoomRight;
+                    const currentSpan = visibleRight - visibleLeft;
+                    const currentCenter = (visibleLeft + visibleRight) * 0.5;
+                    const tolerance = gotoToleranceForSpan(targetSpan);
+                    if (
+                        Math.abs(currentSpan - targetSpan) <= tolerance &&
+                        Math.abs(currentCenter - target) <= tolerance
+                    ) {
+                        break;
+                    }
+                    const nextSpan =
+                        currentSpan > targetSpan
+                            ? Math.max(targetSpan, currentSpan / 1.3)
+                            : Math.min(targetSpan, currentSpan * 1.3);
+                    const finalStep =
+                        Math.abs(nextSpan - targetSpan) <= tolerance &&
+                        Math.abs(currentCenter - target) <= targetSpan;
+                    const nextCenter = finalStep
+                        ? target
+                        : currentCenter + (target - currentCenter) * 0.45;
+                    const next = gotoWindowForCenter(
+                        clampNumber(nextCenter, baseLeft, baseRight),
+                        nextSpan,
+                    );
+                    if (!next) break;
+                    if (
+                        !previewGotoWindow(
+                            next.left,
+                            next.right,
+                            baseLeft,
+                            baseRight,
+                        )
+                    )
+                        break;
+                    if (
+                        token !== gotoAnimationToken ||
+                        !gotoAnimationActive ||
+                        finalStep
+                    ) {
+                        break;
+                    }
+                    const keepGoing = await gotoDelay(token);
+                    if (!keepGoing) break;
+                }
+
+                if (token === gotoAnimationToken && gotoAnimationActive) {
+                    const finalWindow = gotoWindowForCenter(target, targetSpan);
+                    if (finalWindow) {
+                        const beforeLine = gotoLineSerial;
+                        applyVisibleWindow(
+                            finalWindow.left,
+                            finalWindow.right,
+                            true,
+                        );
+                        await waitForGotoLine(token, beforeLine);
+                    }
+                    setGotoAnimationActive(false);
+                }
+            }
+
+            function syncGotoDelayState() {
+                document.getElementById("gotoDelay").disabled =
+                    !document.getElementById("gotoAnimate").checked;
+            }
+
+            function closeGotoDialog() {
+                document.getElementById("gotoDialog").classList.remove("open");
+            }
+
+            function openGotoDialog() {
+                if (!scanRunning) return;
+                const freq = normalizeGotoFrequency(gotoFreqHz);
+                gotoFreqHz = freq;
+                document.getElementById("gotoFreq").value = mhzInputValue(freq);
+                document.getElementById("gotoTargetZoom").value =
+                    formatZoomInputValue(gotoTargetZoom);
+                document.getElementById("gotoAnimate").checked = gotoAnimate;
+                document.getElementById("gotoDelay").value = String(
+                    normalizeGotoDelay(gotoDelayS),
+                );
+                syncGotoDelayState();
+                document.getElementById("gotoDialog").classList.add("open");
+                document.getElementById("gotoFreq").focus();
+                document.getElementById("gotoFreq").select();
+            }
+
+            async function applyGotoDialog() {
+                const freqInput =
+                    Number(document.getElementById("gotoFreq").value) * 1e6;
+                const freqHz = normalizeGotoFrequency(freqInput);
+                const targetZoom = normalizeGotoTargetZoom(
+                    document.getElementById("gotoTargetZoom").value,
+                );
+                const animate =
+                    document.getElementById("gotoAnimate").checked;
+                const delayS = normalizeGotoDelay(
+                    document.getElementById("gotoDelay").value,
+                );
+                if (
+                    !(await saveGotoSettings(
+                        freqHz,
+                        targetZoom,
+                        animate,
+                        delayS,
+                    ))
+                )
+                    return;
+                closeGotoDialog();
+                if (animate) runGotoAnimation(freqHz, targetZoom);
+                else applyGotoTargetNow(freqHz, targetZoom);
             }
 
             function tickTargetCount(width) {
@@ -2443,10 +2889,15 @@
 
             function updateZoomIndicator() {
                 const fullSpan = configuredFreq1 - configuredFreq0;
-                const viewSpan = currentFreq1 - currentFreq0;
+                const viewSpan =
+                    (currentFreq1 - currentFreq0) *
+                    Math.max(1 / MAX_ZOOM_FACTOR, zoomRight - zoomLeft);
                 let zoom = 1;
                 if (fullSpan > 0 && viewSpan > 0)
                     zoom = Math.max(1, fullSpan / viewSpan);
+                if (Math.abs(zoom - 1) <= 1e-6) zoom = 1;
+                if (Math.abs(zoom - MAX_ZOOM_FACTOR) <= MAX_ZOOM_FACTOR * 1e-3)
+                    zoom = MAX_ZOOM_FACTOR;
                 document.getElementById("infoZoom").textContent =
                     zoom < 10 ? zoom.toFixed(2) + "x" : zoom.toFixed(1) + "x";
             }
@@ -3041,8 +3492,14 @@
                             currentFreq1 = Number(data.f1);
                         if (data.b) currentSteps = data.b;
                         updateFFTInfo(data);
-                        zoomLeft = 0;
-                        zoomRight = 1;
+                        if (
+                            (!gotoAnimationActive && !gotoPreviewRetained) ||
+                            pendingViewChange
+                        ) {
+                            zoomLeft = 0;
+                            zoomRight = 1;
+                        }
+                        if (pendingViewChange) gotoPreviewRetained = false;
                         pendingViewChange = false;
                         currentBins = bins;
                         currentBinsFreq0 = currentFreq0;
@@ -3061,6 +3518,7 @@
                             currentFreq1,
                             currentSteps,
                         );
+                        notifyGotoLineDrawn();
 
                         document.getElementById("infoRange").textContent =
                             formatScanRange(currentFreq0, currentFreq1);
@@ -3217,6 +3675,16 @@
                     configuredBwRatio = Number(status.bw_ratio);
                 if (status.direct_sampling !== undefined)
                     configuredDirectSampling = Number(status.direct_sampling);
+                if (status.goto_freq_hz !== undefined)
+                    gotoFreqHz = Number(status.goto_freq_hz);
+                if (status.goto_target_zoom !== undefined)
+                    gotoTargetZoom = normalizeGotoTargetZoom(
+                        status.goto_target_zoom,
+                    );
+                if (status.goto_animate !== undefined)
+                    gotoAnimate = !!Number(status.goto_animate);
+                if (status.goto_delay_s !== undefined)
+                    gotoDelayS = normalizeGotoDelay(status.goto_delay_s);
                 updateFFTInfo(status);
                 if (status.scanning) {
                     clearAutoRestartTimer();
@@ -3375,9 +3843,9 @@
                         ? "--"
                         : formatFrequencyDistance(f1 - f0);
                 return (
-                    "Distance: " +
+                    "Width: " +
                     frequencyText +
-                    "\nTime: " +
+                    "\nHeight: " +
                     formatSecondsDistance(seconds)
                 );
             }
@@ -3441,14 +3909,14 @@
                         ? "--"
                         : formatFrequencyDistance(f1 - f0);
                 if (level0 === null || level1 === null) {
-                    return "Distance: " + distanceText + "\nDelta: -- dB";
+                    return "Width: " + distanceText + "\nHeight: -- dB";
                 }
                 const delta = Math.abs(level1 - level0);
                 const decimals = delta < 10 ? 2 : delta < 100 ? 1 : 0;
                 return (
-                    "Distance: " +
+                    "Width: " +
                     distanceText +
-                    "\nDelta: " +
+                    "\nHeight: " +
                     formatCompactNumber(delta, decimals) +
                     " dB"
                 );
@@ -3687,6 +4155,7 @@
 
             function applyZoomStepsAtCursor(canvas, clientX, signedSteps) {
                 if (!canvas || !hasFrequencyWindow()) return;
+                materializeGotoPreview();
 
                 const rect = canvas.getBoundingClientRect();
                 if (rect.width <= 0) return;
@@ -3732,6 +4201,7 @@
 
                 const prevFreq0 = currentFreq0;
                 const prevFreq1 = currentFreq1;
+                gotoPreviewRetained = false;
                 zoomLeft = 0;
                 zoomRight = 1;
                 currentFreq0 = left;
@@ -3767,7 +4237,7 @@
                 return (delta < 0 ? -1 : 1) * steps;
             }
 
-            function applyVisibleWindow(left, right) {
+            function applyVisibleWindow(left, right, force = false) {
                 if (!hasFrequencyWindow()) return;
                 hideHoverReadout();
                 const full = primaryFrequencyWindow();
@@ -3779,6 +4249,7 @@
                 );
                 if (!clamped) return;
                 if (
+                    !force &&
                     Math.abs(clamped.left - currentFreq0) < 1 &&
                     Math.abs(clamped.right - currentFreq1) < 1
                 ) {
@@ -3786,6 +4257,7 @@
                 }
                 const prevFreq0 = currentFreq0;
                 const prevFreq1 = currentFreq1;
+                gotoPreviewRetained = false;
                 zoomLeft = 0;
                 zoomRight = 1;
                 currentFreq0 = clamped.left;
@@ -3803,11 +4275,12 @@
                 document.getElementById("infoRange").textContent =
                     formatScanRange(currentFreq0, currentFreq1);
                 saveVisibleView();
-                scheduleViewUpdate(currentFreq0, currentFreq1, true);
+                scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
             }
 
             function zoomByFactor(factor, anchorFraction = 0.5) {
                 if (!hasFrequencyWindow()) return;
+                materializeGotoPreview();
                 const full = primaryFrequencyWindow();
                 const fullSpan = full.right - full.left;
                 const currentSpan = currentFreq1 - currentFreq0;
@@ -3825,12 +4298,14 @@
 
             function panByFraction(fraction) {
                 if (!hasFrequencyWindow()) return;
+                materializeGotoPreview();
                 const span = currentFreq1 - currentFreq0;
                 const delta = span * fraction;
                 applyVisibleWindow(currentFreq0 + delta, currentFreq1 + delta);
             }
 
             function resetZoomView() {
+                materializeGotoPreview();
                 const full = primaryFrequencyWindow();
                 applyVisibleWindow(full.left, full.right);
             }
@@ -4010,15 +4485,52 @@
                 );
             }
 
+            function shouldCancelGotoAnimationForKey(evt) {
+                if (!evt || !evt.key) return false;
+                if (evt.key === "Escape") return true;
+                if (evt.key.length === 1) return true;
+                return false;
+            }
+
             window.addEventListener("keydown", (evt) => {
                 const markerDialog = document.getElementById("markerDialog");
+                const gotoDialog = document.getElementById("gotoDialog");
+                const markerOpen =
+                    markerDialog && markerDialog.classList.contains("open");
+                const gotoOpen =
+                    gotoDialog && gotoDialog.classList.contains("open");
+                if (
+                    gotoAnimationActive &&
+                    shouldCancelGotoAnimationForKey(evt)
+                )
+                    cancelGotoAnimation();
                 if (
                     evt.key === "Escape" &&
-                    markerDialog &&
-                    markerDialog.classList.contains("open")
+                    gotoOpen
                 ) {
                     evt.preventDefault();
+                    closeGotoDialog();
+                    return;
+                }
+                if (evt.key === "Escape" && markerOpen) {
+                    evt.preventDefault();
                     closeMarkerDialog();
+                    return;
+                }
+                if (evt.key === "Enter" && gotoOpen) {
+                    evt.preventDefault();
+                    applyGotoDialog();
+                    return;
+                }
+                if (
+                    evt.key === "Enter" &&
+                    markerOpen &&
+                    evt.target &&
+                    evt.target.id !== "markerDelete" &&
+                    evt.target.id !== "markerCancel"
+                ) {
+                    evt.preventDefault();
+                    applyMarkerDialog();
                     return;
                 }
                 if (evt.key === "Shift") setZoomCursor(true);
@@ -4060,6 +4572,13 @@
             window.addEventListener("beforeunload", () => {
                 saveVisibleView(true);
             });
+            window.addEventListener(
+                "pointerdown",
+                () => {
+                    if (gotoAnimationActive) cancelGotoAnimation();
+                },
+                true,
+            );
 
             wfCanvas.addEventListener("wheel", handleZoomWheel, {
                 passive: false,
@@ -4091,6 +4610,18 @@
                 .addEventListener("click", () => {
                     resetZoomView();
                 });
+            document
+                .getElementById("gotoButton")
+                .addEventListener("click", openGotoDialog);
+            document
+                .getElementById("gotoOk")
+                .addEventListener("click", applyGotoDialog);
+            document
+                .getElementById("gotoCancel")
+                .addEventListener("click", closeGotoDialog);
+            document
+                .getElementById("gotoAnimate")
+                .addEventListener("change", syncGotoDelayState);
 
             // ===================================================================
             //  API calls
@@ -4222,6 +4753,7 @@
                 visibleStart,
                 visibleEnd,
                 visibleChanged,
+                immediate = false,
             ) {
                 if (!backendOnline || !scanRunning) return;
                 if (!hasFrequencyWindow(visibleStart, visibleEnd)) return;
@@ -4233,7 +4765,11 @@
                     visible_changed: !!visibleChanged,
                 };
                 if (viewUpdateTimer) clearTimeout(viewUpdateTimer);
-                viewUpdateTimer = setTimeout(sendViewUpdate, 220);
+                if (immediate) {
+                    sendViewUpdate();
+                } else {
+                    viewUpdateTimer = setTimeout(sendViewUpdate, 220);
+                }
             }
 
             async function sendViewUpdate() {
@@ -4865,6 +5401,16 @@
                         configuredDirectSampling = Number(
                             status.direct_sampling,
                         );
+                    if (status.goto_freq_hz !== undefined)
+                        gotoFreqHz = Number(status.goto_freq_hz);
+                    if (status.goto_target_zoom !== undefined)
+                        gotoTargetZoom = normalizeGotoTargetZoom(
+                            status.goto_target_zoom,
+                        );
+                    if (status.goto_animate !== undefined)
+                        gotoAnimate = !!Number(status.goto_animate);
+                    if (status.goto_delay_s !== undefined)
+                        gotoDelayS = normalizeGotoDelay(status.goto_delay_s);
                     const savedView =
                         loadHashViewForConfig(
                             configuredFreq0,

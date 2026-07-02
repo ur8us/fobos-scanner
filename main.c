@@ -48,6 +48,8 @@
 #define HTML_PATH           "index.html"
 #define BANDS_PATH          "bands.ini"
 #define MARKERS_PATH        "markers.ini"
+#define GOTO_TARGET_ZOOM_MIN 1.0
+#define GOTO_TARGET_ZOOM_MAX 1000000.0
 #define FQ_RESPONSE_PATH    "fq_response.txt"
 #define MIN_FREQ_START_HZ   50.0e6
 #define RF_RECEIVER_MIN_HZ  50.0e6
@@ -146,6 +148,10 @@ static uint32_t g_vga_gain   = 0;
 static uint32_t g_direct_sampling = 0;
 static uint32_t g_clk_source = 0;
 static uint32_t g_freq_comp = 0;
+static double g_goto_freq = 1000.0e6;
+static double g_goto_target_zoom = GOTO_TARGET_ZOOM_MAX;
+static uint32_t g_goto_animate = 0;
+static double g_goto_delay_s = 2.0;
 
 /* Device info */
 static char g_hw_rev[64]    = "unknown";
@@ -415,6 +421,27 @@ static int clamp_configured_band_to_receiver_limits(void);
 static void clamp_scan_end_to_hardware_limit(void);
 static int receiver_frequency_valid(double rx_freq);
 
+static double normalize_goto_delay_s(double value)
+{
+    static const double allowed[] = {0.2, 0.5, 1.0, 2.0, 3.0, 5.0};
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (fabs(value - allowed[i]) < 1e-9)
+            return allowed[i];
+    }
+    return 2.0;
+}
+
+static double normalize_goto_target_zoom(double value)
+{
+    if (!isfinite(value))
+        return GOTO_TARGET_ZOOM_MAX;
+    if (value < GOTO_TARGET_ZOOM_MIN)
+        return GOTO_TARGET_ZOOM_MIN;
+    if (value > GOTO_TARGET_ZOOM_MAX)
+        return GOTO_TARGET_ZOOM_MAX;
+    return value;
+}
+
 static void save_config(void)
 {
     FILE *f = fopen(CONFIG_FILE, "w");
@@ -434,6 +461,10 @@ static void save_config(void)
     fprintf(f, "fft_size = %d\n", g_fft_size);
     fprintf(f, "min_rate_lps = %u\n", g_min_rate_lps);
     fprintf(f, "rate_limit_lps = %u\n", g_rate_limit_lps);
+    fprintf(f, "goto_freq = %.0f\n", g_goto_freq);
+    fprintf(f, "goto_target_zoom = %.6g\n", g_goto_target_zoom);
+    fprintf(f, "goto_animate = %u\n", g_goto_animate);
+    fprintf(f, "goto_delay_s = %g\n", g_goto_delay_s);
     fclose(f);
 }
 
@@ -468,6 +499,10 @@ static void load_config(void)
         else if (strcmp(key, "fft_size") == 0) { update_fft_size((int)val); }
         else if (strcmp(key, "min_rate_lps") == 0) { uval = (unsigned int)val; g_min_rate_lps = normalize_min_rate_lps(uval); }
         else if (strcmp(key, "rate_limit_lps") == 0) { uval = (unsigned int)val; g_rate_limit_lps = normalize_rate_limit_lps(uval); }
+        else if (strcmp(key, "goto_freq") == 0)      { if (val > 0.0) g_goto_freq = val; }
+        else if (strcmp(key, "goto_target_zoom") == 0) { g_goto_target_zoom = normalize_goto_target_zoom(val); }
+        else if (strcmp(key, "goto_animate") == 0)   { uval = (unsigned int)val; g_goto_animate = uval ? 1 : 0; }
+        else if (strcmp(key, "goto_delay_s") == 0)   { g_goto_delay_s = normalize_goto_delay_s(val); }
     }
     fclose(f);
     if (!have_visible_start || !have_visible_end) {
@@ -3077,7 +3112,7 @@ static int run_pseudo_random_sample_source(scan_ctx_t *ctx, uint32_t async_len)
 static void *scan_watchdog_thread(void *arg)
 {
     scan_ctx_t *ctx = (scan_ctx_t *)arg;
-    const long long startup_timeout_ms = 2500;
+    const long long startup_timeout_ms = 8000;
     const long long stall_timeout_ms = 5000;
     const struct timespec sleep_time = { 0, 100000000L };
 
@@ -4251,6 +4286,9 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"lna_gain\":%u,\"vga_gain\":%u,\"direct_sampling\":%u,"
             "\"clk_source\":%u,\"freq_comp\":%u,"
             "\"direct_sampling_max_hz\":%.0f,"
+            "\"goto_freq_hz\":%.0f,\"goto_target_zoom\":%.6g,"
+            "\"goto_animate\":%u,"
+            "\"goto_delay_s\":%.1f,"
             "\"sample_rates\":%s}",
             build_sw_version(),
             g_hw_rev, g_fw_ver, g_serial,
@@ -4271,6 +4309,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
             g_lna_gain, g_vga_gain, g_direct_sampling, g_clk_source, g_freq_comp,
             direct_sampling_max_hz(),
+            g_goto_freq, g_goto_target_zoom, g_goto_animate, g_goto_delay_s,
             sample_rates);
 
         char resp[4096];
@@ -4279,6 +4318,98 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n%s\r\n%s", n, cors, body);
         WRITE(client_fd, resp, (size_t)m);
+        close(client_fd);
+        return;
+    }
+
+    /* POST /api/goto */
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/goto") == 0) {
+        json_doc_t json;
+        char err[160];
+        double freq_tmp = g_goto_freq;
+        double target_zoom_tmp = g_goto_target_zoom;
+        double delay_tmp = g_goto_delay_s;
+        uint32_t animate_tmp = g_goto_animate;
+        double number_tmp;
+        uint32_t uint_tmp;
+        int present = 0;
+
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (json_get_double(&json, "goto_freq_hz", &number_tmp, &present) != 0 ||
+            !present) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "goto_freq_hz is required");
+            close(client_fd);
+            return;
+        }
+        freq_tmp = number_tmp;
+        if (json_get_double(&json, "goto_target_zoom", &number_tmp, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed goto_target_zoom");
+            close(client_fd);
+            return;
+        }
+        if (present)
+            target_zoom_tmp = number_tmp;
+        if (json_get_uint(&json, "goto_animate", &uint_tmp, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed goto_animate");
+            close(client_fd);
+            return;
+        }
+        if (present)
+            animate_tmp = uint_tmp ? 1 : 0;
+        if (json_get_double(&json, "goto_delay_s", &number_tmp, &present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed goto_delay_s");
+            close(client_fd);
+            return;
+        }
+        if (present)
+            delay_tmp = number_tmp;
+
+        if (!isfinite(freq_tmp) || freq_tmp <= 0.0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "goto_freq_hz is out of range");
+            close(client_fd);
+            return;
+        }
+        if (!isfinite(target_zoom_tmp) ||
+            target_zoom_tmp < GOTO_TARGET_ZOOM_MIN ||
+            target_zoom_tmp > GOTO_TARGET_ZOOM_MAX) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "goto_target_zoom is out of range");
+            close(client_fd);
+            return;
+        }
+        delay_tmp = normalize_goto_delay_s(delay_tmp);
+        if (present && fabs(delay_tmp - number_tmp) >= 1e-9) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "goto_delay_s is unsupported");
+            close(client_fd);
+            return;
+        }
+
+        g_goto_freq = freq_tmp;
+        g_goto_target_zoom = target_zoom_tmp;
+        g_goto_animate = animate_tmp ? 1 : 0;
+        g_goto_delay_s = delay_tmp;
+        save_config();
+
+        {
+            char json_body[256];
+            snprintf(json_body, sizeof(json_body),
+                "{\"status\":\"ok\",\"goto_freq_hz\":%.0f,"
+                "\"goto_target_zoom\":%.6g,"
+                "\"goto_animate\":%u,\"goto_delay_s\":%.1f}",
+                g_goto_freq, g_goto_target_zoom,
+                g_goto_animate, g_goto_delay_s);
+            send_json_response(client_fd, 200, "OK", cors, json_body);
+        }
         close(client_fd);
         return;
     }
