@@ -997,9 +997,6 @@
             let gotoDelayS = 2;
             let gotoAnimationActive = false;
             let gotoPreviewRetained = false;
-            let gotoLocalViewActive = false;
-            let gotoLocalFreq0 = 0;
-            let gotoLocalFreq1 = 0;
             let gotoAnimationToken = 0;
             let gotoLineSerial = 0;
             let gotoLastLine = null;
@@ -2081,7 +2078,6 @@
                 if (!gotoAnimationActive) return;
                 gotoAnimationToken++;
                 gotoPreviewRetained = true;
-                gotoLocalViewActive = false;
                 setGotoAnimationActive(false);
                 if (hasFrequencyWindow())
                     scheduleViewUpdate(currentFreq0, currentFreq1, true, true);
@@ -2258,7 +2254,7 @@
                 return Math.max(0.001, span * 1e-6);
             }
 
-            function gotoNeedsBackendViewUpdate(finalStep) {
+            function gotoNeedsBackendDetailUpdate(finalStep) {
                 if (finalStep) return true;
                 if (!currentBins || !currentBins.length) return true;
                 if (!hasFrequencyWindow(currentBinsFreq0, currentBinsFreq1))
@@ -2269,20 +2265,26 @@
                 ) {
                     return true;
                 }
-                const backendSpan = currentBinsFreq1 - currentBinsFreq0;
+                const sourceSpan = currentBinsFreq1 - currentBinsFreq0;
                 const visibleSpan = currentFreq1 - currentFreq0;
-                if (backendSpan <= 0 || visibleSpan <= 0) return true;
-                return backendSpan / visibleSpan > 2.0;
+                if (sourceSpan <= 0 || visibleSpan <= 0) return true;
+                return sourceSpan / visibleSpan > 3.0;
             }
 
             async function runGotoAnimation(freqHz, targetZoom) {
                 cancelGotoAnimation();
                 const token = ++gotoAnimationToken;
+                if (viewUpdateTimer) {
+                    clearTimeout(viewUpdateTimer);
+                    viewUpdateTimer = null;
+                }
+                pendingView = null;
+                viewRequestSerial++;
                 const target = normalizeGotoFrequency(freqHz);
                 const targetSpan = gotoSpanForZoom(targetZoom);
-                let renderedTarget = false;
                 let animFreq0 = currentFreq0;
                 let animFreq1 = currentFreq1;
+                let renderedTarget = false;
                 setGotoAnimationActive(true);
 
                 while (token === gotoAnimationToken && gotoAnimationActive) {
@@ -2299,25 +2301,10 @@
                         renderedTarget = true;
                         break;
                     }
-                    let nextSpan =
+                    const nextSpan =
                         currentSpan > targetSpan
                             ? Math.max(targetSpan, currentSpan / 1.3)
                             : Math.min(targetSpan, currentSpan * 1.3);
-                    const singleModeSpan =
-                        configuredDirectSampling !== 0
-                            ? currentDirectSamplingMaxHz
-                            : configuredSampleRate;
-                    if (
-                        currentSpan > targetSpan &&
-                        targetSpan < singleModeSpan &&
-                        nextSpan > singleModeSpan &&
-                        currentSpan / (1.3 * 1.3) <= singleModeSpan
-                    ) {
-                        nextSpan = Math.max(
-                            targetSpan,
-                            currentSpan / (1.3 * 1.3),
-                        );
-                    }
                     const finalStep =
                         Math.abs(nextSpan - targetSpan) <= tolerance &&
                         Math.abs(currentCenter - target) <= targetSpan;
@@ -2338,9 +2325,9 @@
                         break;
                     animFreq0 = currentFreq0;
                     animFreq1 = currentFreq1;
+                    const updateBackend =
+                        gotoNeedsBackendDetailUpdate(finalStep);
                     let rendered = false;
-                    const updateBackend = gotoNeedsBackendViewUpdate(finalStep);
-                    if (!updateBackend) pendingViewChange = false;
                     if (updateBackend) {
                         const plan = await sendImmediateViewUpdate(
                             currentFreq0,
@@ -2363,9 +2350,12 @@
                             currentFreq1,
                         );
                     } else {
+                        pendingViewChange = false;
                         rendered = await waitForGotoLine(token, beforeLine);
                     }
                     if (!rendered) break;
+                    animFreq0 = currentFreq0;
+                    animFreq1 = currentFreq1;
                     if (finalStep) renderedTarget = true;
                     if (
                         token !== gotoAnimationToken ||
@@ -3680,11 +3670,7 @@
                             data.f1 !== undefined
                                 ? Number(data.f1)
                                 : currentFreq1;
-                        if (
-                            pendingViewChange &&
-                            !gotoLocalViewActive &&
-                            rowView === currentViewId
-                        )
+                        if (pendingViewChange && rowView === currentViewId)
                             return;
                         if (
                             currentViewId &&
@@ -3699,18 +3685,10 @@
                             configuredFreq0 = Number(data.full_f0);
                         if (data.full_f1 !== undefined)
                             configuredFreq1 = Number(data.full_f1);
-                        const preserveGotoView =
-                            gotoAnimationActive &&
-                            gotoLocalViewActive &&
-                            !pendingViewChange;
-                        if (!preserveGotoView && data.f0 !== undefined)
+                        if (!gotoAnimationActive && data.f0 !== undefined)
                             currentFreq0 = rowFreq0;
-                        if (!preserveGotoView && data.f1 !== undefined)
+                        if (!gotoAnimationActive && data.f1 !== undefined)
                             currentFreq1 = rowFreq1;
-                        if (preserveGotoView) {
-                            currentFreq0 = gotoLocalFreq0;
-                            currentFreq1 = gotoLocalFreq1;
-                        }
                         if (data.b) currentSteps = data.b;
                         updateFFTInfo(data);
                         if (
@@ -3884,7 +3862,7 @@
                 if (status.serial !== undefined)
                     document.getElementById("infoSn").textContent =
                         status.serial || "---";
-                if (status.view_id !== undefined)
+                if (!gotoAnimationActive && status.view_id !== undefined)
                     currentViewId = Number(status.view_id);
                 if (status.configured_start_hz !== undefined)
                     configuredFreq0 = Number(status.configured_start_hz);
@@ -4491,11 +4469,6 @@
                 zoomRight = 1;
                 currentFreq0 = clamped.left;
                 currentFreq1 = clamped.right;
-                gotoLocalViewActive = !updateBackend;
-                if (gotoLocalViewActive) {
-                    gotoLocalFreq0 = currentFreq0;
-                    gotoLocalFreq1 = currentFreq1;
-                }
                 pendingViewChange = true;
                 binRangeCache = null;
                 transformVisibleDisplay(
@@ -5039,6 +5012,7 @@
                 immediate = false,
             ) {
                 if (!backendOnline || !scanRunning) return;
+                if (gotoAnimationActive) return;
                 if (!hasFrequencyWindow(visibleStart, visibleEnd)) return;
 
                 pendingView = {
@@ -5059,7 +5033,6 @@
                 visibleStart,
                 visibleEnd,
                 visibleChanged,
-                clearGotoLocal = true,
             ) {
                 if (!backendOnline || !scanRunning) return null;
                 if (!hasFrequencyWindow(visibleStart, visibleEnd)) return null;
@@ -5068,8 +5041,6 @@
                     viewUpdateTimer = null;
                 }
                 pendingView = null;
-                if (clearGotoLocal) gotoLocalViewActive = false;
-
                 const serial = ++viewRequestSerial;
                 const result = await apiPost("/api/view", {
                     visible_start_hz: visibleStart,
@@ -5105,7 +5076,6 @@
                     request.visible_start_hz,
                     request.visible_end_hz,
                     request.visible_changed,
-                    !gotoAnimationActive,
                 );
             }
 

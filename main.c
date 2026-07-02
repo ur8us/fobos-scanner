@@ -1803,13 +1803,7 @@ static int planned_required_points(void)
 
 static run_mode_t planned_run_mode(void)
 {
-    double start;
-    double end;
-
     if (direct_sampling_enabled())
-        return RUN_MODE_SINGLE;
-    raw_visible_band(&start, &end);
-    if (end > start && (end - start) <= g_samplerate)
         return RUN_MODE_SINGLE;
     return (planned_required_points() <= 1) ? RUN_MODE_SINGLE : RUN_MODE_SCAN;
 }
@@ -1826,8 +1820,7 @@ static single_fft_plan_t single_fft_plan_for_span(double span)
         bw_ratio = 1.0;
     if (bw_ratio > 1.0)
         bw_ratio = 1.0;
-    sample_span = g_samplerate;
-    bw_ratio = 1.0;
+    sample_span = g_samplerate * bw_ratio;
 
     if (direct_sampling_enabled()) {
         sample_span = direct_sampling_max_hz();
