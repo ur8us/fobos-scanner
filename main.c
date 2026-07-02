@@ -61,6 +61,7 @@
 /* FFT: powers of 2 from 1024 to 65536 */
 #define FFT_SIZE_MIN        1024
 #define FFT_SIZE_MAX        65536
+#define SINGLE_RAW_FFT_MIN  8192
 #define SINGLE_FFT_SIZE_MAX FFT_SIZE_MAX
 #define SINGLE_DECIM_MAX    4096
 #define SINGLE_ZERO_SHIFT_HZ 2000.0
@@ -1853,6 +1854,8 @@ static single_fft_plan_t single_fft_plan_for_span(double span)
         int effective = next_power_of_two_int((int)needed_product);
         if (effective < FFT_SIZE_MIN)
             effective = FFT_SIZE_MIN;
+        if (effective < SINGLE_RAW_FFT_MIN)
+            effective = SINGLE_RAW_FFT_MIN;
         if (effective > FFT_SIZE_MAX)
             effective = FFT_SIZE_MAX;
         plan.fft_size = effective;

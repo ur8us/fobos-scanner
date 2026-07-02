@@ -1323,7 +1323,7 @@
                 document.getElementById("lnaVal").textContent =
                     String(normalized);
                 const group = document.getElementById("lnaGroup");
-                if (group) group.classList.toggle("lna-hot", normalized === 3);
+                if (group) group.classList.toggle("lna-hot", normalized >= 2);
             }
 
             function selectedDirectSampling() {
